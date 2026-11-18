@@ -221,29 +221,23 @@ pub fn check_syndrome(cw: &[u8; N_BITS]) -> bool {
     true
 }
 
-/// Reusable scratch for normalized min-sum belief propagation (`894 bytes`).
-pub struct BpScratch {
-    c2v: [i8; N_EDGES],
-    post: [i16; N_BITS],
-}
-
-impl BpScratch {
-    pub const fn new() -> Self {
-        Self { c2v: [0; N_EDGES], post: [0; N_BITS] }
-    }
-}
-
-/// Normalized min-sum belief propagation decoder (`llr > 0` favors bit `0`, `llr < 0` favors bit `1`).
+/// Normalized min-sum belief propagation decoder (`llr > 0` favors bit `0`, `llr < 0` favors bit `1`) using
+/// caller-supplied `post` (`184 x i16`) and `c2v` (`525 x i16`) scratch slices (zero stack scratch).
 /// Returns the 78 systematic bits once all 106 parity checks are satisfied.
-pub fn decode_bp(llr: &[i8; N_BITS], scratch: &mut BpScratch, max_iter: usize) -> Option<[u8; K_BITS]> {
-    scratch.c2v.fill(0);
+pub fn decode_bp_with_slices(
+    llr: &[i8; N_BITS],
+    post: &mut [i16; N_BITS],
+    c2v: &mut [i16; N_EDGES],
+    max_iter: usize,
+) -> Option<[u8; K_BITS]> {
+    c2v.fill(0);
     for (i, &v) in llr.iter().enumerate() {
-        scratch.post[i] = v as i16;
+        post[i] = v as i16;
     }
 
     let mut hard = [0u8; N_BITS];
     for _ in 0..max_iter {
-        for (i, &p) in scratch.post.iter().enumerate() {
+        for (i, &p) in post.iter().enumerate() {
             hard[i] = (p < 0) as u8;
         }
         if check_syndrome(&hard) {
@@ -265,7 +259,7 @@ pub fn decode_bp(llr: &[i8; N_BITS], scratch: &mut BpScratch, max_iter: usize) -
 
             for (idx, e) in (start..end).enumerate() {
                 let col = GRAPH.cols[e] as usize;
-                let m = scratch.post[col] - scratch.c2v[e] as i16;
+                let m = post[col] - c2v[e];
                 v2c[idx] = m;
                 if m < 0 {
                     sign_neg ^= 1;
@@ -284,16 +278,15 @@ pub fn decode_bp(llr: &[i8; N_BITS], scratch: &mut BpScratch, max_iter: usize) -
                 let col = GRAPH.cols[e] as usize;
                 let neg = sign_neg ^ ((v2c[idx] < 0) as u8);
                 let raw_mag = if idx == min1_idx { min2 } else { min1 };
-                // Normalized min-sum scale = 3/4, clamped to i8 range [-96, +96] to prevent posterior overflow.
                 let mag = ((raw_mag * 3 + 2) >> 2).min(96);
-                let new_c2v = if neg != 0 { -mag } else { mag } as i8;
-                scratch.post[col] = (scratch.post[col] + (new_c2v as i16 - scratch.c2v[e] as i16)).clamp(-2048, 2047);
-                scratch.c2v[e] = new_c2v;
+                let new_c2v = if neg != 0 { -mag } else { mag };
+                post[col] = (post[col] + (new_c2v - c2v[e])).clamp(-2048, 2047);
+                c2v[e] = new_c2v;
             }
         }
     }
 
-    for (i, &p) in scratch.post.iter().enumerate() {
+    for (i, &p) in post.iter().enumerate() {
         hard[i] = (p < 0) as u8;
     }
     if check_syndrome(&hard) {
@@ -303,4 +296,21 @@ pub fn decode_bp(llr: &[i8; N_BITS], scratch: &mut BpScratch, max_iter: usize) -
     } else {
         None
     }
+}
+
+/// Reusable scratch for normalized min-sum belief propagation (`1,418 bytes`).
+pub struct BpScratch {
+    c2v: [i16; N_EDGES],
+    post: [i16; N_BITS],
+}
+
+impl BpScratch {
+    pub const fn new() -> Self {
+        Self { c2v: [0; N_EDGES], post: [0; N_BITS] }
+    }
+}
+
+/// Convenience wrapper around [`decode_bp_with_slices`] using a [`BpScratch`] struct.
+pub fn decode_bp(llr: &[i8; N_BITS], scratch: &mut BpScratch, max_iter: usize) -> Option<[u8; K_BITS]> {
+    decode_bp_with_slices(llr, &mut scratch.post, &mut scratch.c2v, max_iter)
 }

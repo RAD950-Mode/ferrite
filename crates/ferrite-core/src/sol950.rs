@@ -80,14 +80,15 @@ struct PeerSession {
     last_heard_snr: i8,
     rcvd_snr: Option<i8>,
     last_seen_slot: u32,
-    /// Timestamp (slot) when a valid `RX` addressed to `my_call` was decoded from `peer`.
-    rx_report_at: Option<u32>,
-    /// Whether any decoded `RX` addressed to `my_call` carried `ack == true` (`R+RX`).
-    rx_ack_seen: bool,
-    /// Timestamp (slot) when our `RX` or `R+RX` addressed to `peer` finished transmitting and unkeyed.
-    tx_report_done_at: Option<u32>,
-    /// Whether we have completed transmitting `ack == true` (`R+RX`) to `peer`.
-    tx_ack_done: bool,
+    /// Timestamp (slot) when a valid `RX(..., ack = false)` addressed to `my_call` was decoded from `peer`.
+    rx_r0_at: Option<u32>,
+    /// Timestamp (slot) when a valid `R+RX(..., ack = true)` addressed to `my_call` was decoded from `peer`
+    /// *after* our own `tx_r0_done_at`.
+    rx_r1_at: Option<u32>,
+    /// Timestamp (slot) when our initial `RX(..., ack = false)` addressed to `peer` finished TX and unkeyed.
+    tx_r0_done_at: Option<u32>,
+    /// Timestamp (slot) when our confirmed `R+RX(..., ack = true)` addressed to `peer` finished TX and unkeyed.
+    tx_r1_done_at: Option<u32>,
     /// Slot of our most recent completed TX to `peer` (for retry pacing).
     last_tx_slot: Option<u32>,
     /// Slot when this QSO was logged (write-once per cooldown window).
@@ -108,10 +109,10 @@ impl PeerSession {
             last_heard_snr: 0,
             rcvd_snr: None,
             last_seen_slot: 0,
-            rx_report_at: None,
-            rx_ack_seen: false,
-            tx_report_done_at: None,
-            tx_ack_done: false,
+            rx_r0_at: None,
+            rx_r1_at: None,
+            tx_r0_done_at: None,
+            tx_r1_done_at: None,
             last_tx_slot: None,
             logged_at: None,
             tries: 0,
@@ -265,14 +266,14 @@ impl Engine {
             return None;
         }
 
-        p.tx_report_done_at = Some(slot);
         p.tries = p.tries.saturating_add(1);
         if ack {
-            p.tx_ack_done = true;
+            p.tx_r1_done_at = Some(slot);
             // Mandatory 2-slot Post-Completion Linger on this window so if Slot `slot` faded, we are still here
             // on `slot + 1` to hear the peer's retry!
             self.linger_until = Some(slot + LINGER_SLOTS);
         } else {
+            p.tx_r0_done_at = Some(slot);
             self.lock_until = Some(slot + EXPIRY_SLOTS);
         }
 
@@ -295,8 +296,8 @@ impl Engine {
                     p.last_heard_snr = d.snr_db;
                     p.last_seen_slot = slot;
                     if self.cfg.mode != OpMode::Monitor && p.logged_at.is_none() && p.tries < MAX_TRIES {
-                        // Queue initial `RX(ACK=0)` if we don't already owe `ACK=1`.
-                        if p.owed_reply != Some(true) && p.tx_report_done_at.is_none() {
+                        // Queue initial `RX(ACK=0)` if we haven't already sent a report or queued `ACK=1`.
+                        if p.owed_reply != Some(true) && p.tx_r0_done_at.is_none() && p.tx_r1_done_at.is_none() {
                             p.owed_reply = Some(false);
                         }
                         self.lock_until = Some(slot + 6);
@@ -307,7 +308,6 @@ impl Engine {
                         continue;
                     }
                     if recipient != self.cfg.my_call {
-                        // Overheard someone else's report: record presence in Heard Table without replying.
                         let idx = self.upsert_peer(slot, window, sender);
                         self.peers[idx].last_heard_snr = d.snr_db;
                         self.peers[idx].last_seen_slot = slot;
@@ -318,7 +318,6 @@ impl Engine {
                     let p = &mut self.peers[idx];
                     p.last_heard_snr = d.snr_db;
                     p.last_seen_slot = slot;
-                    p.rcvd_snr = Some(snr_db);
 
                     if p.logged_at.is_some() {
                         // Already logged within cooldown: if peer is still sending `ACK=0`, our `ACK=1` faded!
@@ -329,22 +328,28 @@ impl Engine {
                         continue;
                     }
 
-                    p.rx_report_at = Some(slot);
                     if ack {
-                        p.rx_ack_seen = true;
-                    }
-                    if self.cfg.mode != OpMode::Monitor {
-                        // If we haven't completed `ACK=1` yet and peer sent `ACK=0` (or peer sent `ACK=1` before we
-                        // ever sent a report), owe `ACK=1`.
-                        if !ack || p.tx_report_done_at.is_none() {
+                        // An `ACK=1` (`R+RX`) is valid ONLY if it causally follows a completed `RX(ACK=0)` we sent
+                        // to `sender` within `EXPIRY_SLOTS`. A cold or stale `ACK=1` arriving without a prior
+                        // `tx_r0_done_at` is ignored so it can never fabricate a log or trigger a reply loop.
+                        let valid_r1 = p
+                            .tx_r0_done_at
+                            .is_some_and(|t0| slot > t0 && slot.saturating_sub(t0) <= EXPIRY_SLOTS);
+                        if !valid_r1 {
+                            continue;
+                        }
+                        p.rcvd_snr = Some(snr_db);
+                        p.rx_r1_at = Some(slot);
+                    } else {
+                        p.rcvd_snr = Some(snr_db);
+                        p.rx_r0_at = Some(slot);
+                        if self.cfg.mode != OpMode::Monitor {
                             p.owed_reply = Some(true);
                             self.lock_until = Some(slot + 6);
                         }
                     }
 
                     if let Some(rec) = self.try_complete_log(idx, slot) {
-                        // If we just completed by RECEIVING `ACK=1` (meaning peer already got our report and sent
-                        // the final frame), clear lock so we can resume scanning unless another peer is pending.
                         if ack && self.peers[idx].owed_reply.is_none() {
                             self.lock_until = None;
                         }
@@ -364,15 +369,22 @@ impl Engine {
         if p.logged_at.is_some() {
             return None;
         }
-        let rx_at = p.rx_report_at?;
-        let tx_at = p.tx_report_done_at?;
-        if slot.saturating_sub(rx_at) > EXPIRY_SLOTS || slot.saturating_sub(tx_at) > EXPIRY_SLOTS {
-            return None;
-        }
-        // Valid two-way confirmation: either we heard peer's `ACK=1` (`rx_ack_seen`) after sending our report, or we
-        // heard peer's `RX` and subsequently completed sending `ACK=1` (`tx_ack_done`).
-        let confirmed = (p.rx_ack_seen && rx_at >= tx_at) || (p.tx_ack_done && tx_at >= rx_at);
-        if !confirmed {
+        // Two valid causal completion chains within `EXPIRY_SLOTS`:
+        // 1. Responder chain: we completed `RX(ACK=0)` at `t0`, then decoded `R+RX(ACK=1)` at `r1 > t0`.
+        let responder_ok = match (p.tx_r0_done_at, p.rx_r1_at) {
+            (Some(t0), Some(r1)) => {
+                r1 > t0 && slot.saturating_sub(t0) <= EXPIRY_SLOTS && slot.saturating_sub(r1) <= EXPIRY_SLOTS
+            }
+            _ => false,
+        };
+        // 2. Caller chain: we decoded `RX(ACK=0)` at `r0`, then completed `R+RX(ACK=1)` at `t1 > r0`.
+        let caller_ok = match (p.rx_r0_at, p.tx_r1_done_at) {
+            (Some(r0), Some(t1)) => {
+                t1 > r0 && slot.saturating_sub(r0) <= EXPIRY_SLOTS && slot.saturating_sub(t1) <= EXPIRY_SLOTS
+            }
+            _ => false,
+        };
+        if !responder_ok && !caller_ok {
             return None;
         }
 
@@ -432,7 +444,10 @@ impl Engine {
             p.active
                 && p.window == w
                 && (p.owed_reply.is_some()
-                    || (p.logged_at.is_none() && p.tx_report_done_at.is_some() && p.tries < MAX_TRIES && slot.saturating_sub(p.last_seen_slot) < EXPIRY_SLOTS))
+                    || (p.logged_at.is_none()
+                        && (p.tx_r0_done_at.is_some() || p.tx_r1_done_at.is_some())
+                        && p.tries < MAX_TRIES
+                        && slot.saturating_sub(p.last_seen_slot) < EXPIRY_SLOTS))
         })
     }
 
@@ -481,7 +496,7 @@ impl Engine {
                 && p.last_tx_slot.is_some_and(|t| slot >= t + 2)
             {
                 // 2. Retry after a missed peer response (`slot >= last_tx_slot + 2`).
-                let ack = p.rx_report_at.is_some();
+                let ack = p.rx_r0_at.is_some();
                 if best.is_none_or(|(_, _, bp, bsnr)| (0, p.last_heard_snr) > (bp, bsnr)) {
                     best = Some((i, ack, 0, p.last_heard_snr));
                 }
@@ -748,5 +763,40 @@ mod tests {
         let (_, tx_b2) = sim_pair(&mut a2, &mut b2, 25, None, Some(1));
         assert_eq!((a2.total_logged(), b2.total_logged()), (0, 0));
         assert_eq!(tx_b2, MAX_TRIES as u32, "B must cap unanswered retries at MAX_TRIES and go quiet");
+    }
+
+    #[test]
+    fn unsolicited_or_stale_ack1_never_logs_or_replies() {
+        let mut pouncer = make_engine(b"W1AW", b"FN31", OpMode::Pounce, &[W0, W1]);
+        let mut caller = make_engine(b"W1AW", b"FN31", OpMode::AutoCq { parity: 0 }, &[W0]);
+        let w1aw = Callsign::encode(b"W1AW").unwrap();
+        let k1abc = Callsign::encode(b"K1ABC").unwrap();
+        let cold_ack1 = [Decoded {
+            frame: Frame::Rx { sender: k1abc, recipient: w1aw, snr_db: -12, ack: true, reserved: false },
+            audio_hz: 1050,
+            time_offset_ms: 0,
+            snr_db: -12,
+        }];
+
+        // Case 1: Fresh Pounce station receives a cold/stale `ACK=1` addressed to it -> must neither reply nor log.
+        assert_eq!(pouncer.begin_slot(0, true), SlotPlan::Rx { window: W0 });
+        let mut logs = [None; 2];
+        assert_eq!(pouncer.on_rx_frames(0, W0, &cold_ack1, &mut logs), 0);
+        assert_eq!(pouncer.begin_slot(1, true), SlotPlan::Rx { window: W0 }, "cold ACK=1 must not queue a reply");
+        assert_eq!(pouncer.total_logged(), 0);
+
+        // Case 2: AutoCq station sent `CQ` in Slot 0 (not `RX(ACK=0)`!), then receives an unsolicited `ACK=1` in Slot 1
+        // -> must not queue `ACK=1` or log a QSO, because `tx_r0_done_at` was never set!
+        assert!(matches!(caller.begin_slot(0, true), SlotPlan::Tx { frame: Frame::Cq { .. }, .. }));
+        caller.confirm_tx_completed(0);
+        assert_eq!(caller.begin_slot(1, true), SlotPlan::Rx { window: W0 });
+        assert_eq!(caller.on_rx_frames(1, W0, &cold_ack1, &mut logs), 0);
+        let slot2 = caller.begin_slot(2, true);
+        assert!(
+            matches!(slot2, SlotPlan::Tx { frame: Frame::Cq { .. }, .. }),
+            "unsolicited ACK=1 after CQ must not queue an R+RX reply: got {slot2:?}"
+        );
+        caller.confirm_tx_completed(2);
+        assert_eq!(caller.total_logged(), 0);
     }
 }

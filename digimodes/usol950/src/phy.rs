@@ -110,6 +110,8 @@ pub struct Modulator {
     ramp_samples: u32,
     f_off_mhz: u64,
     spacing_mhz: u64,
+    /// Optional linear carrier drift across the 110-symbol burst in millihertz (for swept-carrier receiver tests).
+    total_drift_mhz: i64,
     amp: i16,
     phase: u32,
     sym: usize,
@@ -120,6 +122,19 @@ impl Modulator {
     /// Create a modulator for `tones` at `rate_hz` (`24_000` or `48_000`), lowest-tone offset `f_off_hz`
     /// (e.g. `1050`), tone spacing `spacing_hz` (e.g. `50`), and peak amplitude `amp` (`<= 32767`).
     pub const fn new(tones: [u8; N_SYMBOLS], rate_hz: u32, f_off_hz: u32, spacing_hz: u32, amp: i16) -> Self {
+        Self::with_drift_mhz(tones, rate_hz, f_off_hz, spacing_hz, 0, amp)
+    }
+
+    /// Create a modulator with linear carrier frequency sweep `total_drift_mhz` (in mHz, e.g. `+10_000` = `+10 Hz`
+    /// from symbol 0 to symbol 110) for receiver drift-tracking verification.
+    pub const fn with_drift_mhz(
+        tones: [u8; N_SYMBOLS],
+        rate_hz: u32,
+        f_off_hz: u32,
+        spacing_hz: u32,
+        total_drift_mhz: i64,
+        amp: i16,
+    ) -> Self {
         let sym_samples = (rate_hz * SYMBOL_MS) / 1000;
         let ramp_samples = (rate_hz * RAMP_MS) / 1000;
         Self {
@@ -129,6 +144,7 @@ impl Modulator {
             ramp_samples,
             f_off_mhz: f_off_hz as u64 * 1000,
             spacing_mhz: spacing_hz as u64 * 1000,
+            total_drift_mhz,
             amp,
             phase: 0,
             sym: 0,
@@ -150,18 +166,23 @@ impl Modulator {
         if self.sym >= N_SYMBOLS {
             return self.f_off_mhz;
         }
+        let total_n = self.sym_samples as i64 * N_SYMBOLS as i64;
+        let cur_n = self.sym as i64 * self.sym_samples as i64 + self.sample_in_sym as i64;
+        let drift = if total_n > 0 { (self.total_drift_mhz * cur_n) / total_n } else { 0 };
+        let f_base = (self.f_off_mhz as i64 + drift).max(0) as u64;
+
         let t_cur = (self.tones[self.sym] & 3) as i64;
         if self.sym == 0 || self.sample_in_sym >= self.ramp_samples {
-            return self.f_off_mhz + (t_cur as u64) * self.spacing_mhz;
+            return f_base + (t_cur as u64) * self.spacing_mhz;
         }
         let t_prev = (self.tones[self.sym - 1] & 3) as i64;
         if t_prev == t_cur {
-            return self.f_off_mhz + (t_cur as u64) * self.spacing_mhz;
+            return f_base + (t_cur as u64) * self.spacing_mhz;
         }
         let w = raised_cosine_q15(self.sample_in_sym as usize, self.ramp_samples as usize) as i64;
-        let base_prev = self.f_off_mhz as i64 + t_prev * self.spacing_mhz as i64;
+        let base_prev = f_base as i64 + t_prev * self.spacing_mhz as i64;
         let df = (t_cur - t_prev) * self.spacing_mhz as i64;
-        (base_prev + ((df * w + 16_384) >> 15)) as u64
+        (base_prev + ((df * w + 16_384) >> 15)).max(0) as u64
     }
 
     /// Advance one sample, returning complex `(I, Q)` scaled by `amp`, or `None` after all 110 symbols finish.

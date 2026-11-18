@@ -390,6 +390,98 @@ mod tests {
         assert_eq!(false_frames, 0, "unexpected false frames on pure noise");
     }
 
+    #[test]
+    fn snr_calibration_regression_across_levels() {
+        let w1aw = Callsign::encode(b"W1AW").unwrap();
+        let fn31 = encode_grid4(b"FN31").unwrap();
+        let frame = Frame::Cq { sender: w1aw, grid4: fn31, tx_pwr: 10, reserved: 0 };
+        let tones = encode_tones(frame);
+
+        let sigma = 1_200.0;
+        let p_n_2500 = sigma * sigma * (2500.0 / 12000.0);
+        let mut rng = Rng(0xACE1_2468_1357_9BDF);
+        let mut rx = Receiver::new();
+
+        // Average estimated SNR across 6 realizations at -15, -10, -5, and +3 dB (referenced to 2,500 Hz).
+        // Verify monotonic scaling and accuracy within +/- 3.0 dB (never saturating at +20 dB on weak signals).
+        for &want_db in &[-15i32, -10, -5, 3] {
+            let amp = (2.0 * p_n_2500 * libm_pow10(want_db as f64 / 10.0)).sqrt() as i16;
+            let mut sum_db = 0i32;
+            let mut cnt = 0i32;
+            for _ in 0..6 {
+                let mut pcm = std::vec![0i16; INPUT_RATE_HZ as usize * 10];
+                for s in &mut pcm {
+                    *s = rng.gauss(sigma).clamp(-32_000.0, 32_000.0) as i16;
+                }
+                let start_idx = (400 * INPUT_RATE_HZ as usize) / 1000;
+                let mut m = Modulator::new(tones, INPUT_RATE_HZ, 1050, DEFAULT_SPACING_HZ, amp);
+                let mut idx = start_idx;
+                while let Some(v) = m.next_sample() {
+                    pcm[idx] = pcm[idx].saturating_add(v);
+                    idx += 1;
+                }
+                rx.reset();
+                for chunk in pcm.chunks(192) {
+                    rx.push_samples(chunk);
+                }
+                let mut out = [Decoded { frame, audio_hz: 0, time_offset_ms: 0, snr_db: 0 }; MAX_DECODED];
+                let n = rx.finish_slot(&mut out);
+                if n > 0 && out[0].frame == frame {
+                    sum_db += out[0].snr_db as i32;
+                    cnt += 1;
+                }
+            }
+            assert!(cnt >= 5, "expected decodes at {want_db} dB, got {cnt}/6");
+            let mean_db = sum_db as f64 / cnt as f64;
+            assert!(
+                (mean_db - want_db as f64).abs() <= 3.0,
+                "SNR readout {mean_db:.1} dB out of +/-3 dB tolerance for injected {want_db} dB"
+            );
+        }
+    }
+
+    #[test]
+    fn swept_carrier_drift_uses_s2_branch() {
+        let k1abc = Callsign::encode(b"K1ABC").unwrap();
+        let w1aw = Callsign::encode(b"W1AW").unwrap();
+        let frame = Frame::Rx { sender: k1abc, recipient: w1aw, snr_db: -12, ack: false, reserved: false };
+        let tones = encode_tones(frame);
+
+        let sigma = 1_000.0;
+        let p_n_2500 = sigma * sigma * (2500.0 / 12000.0);
+        let amp = (2.0 * p_n_2500 * libm_pow10(-13.0 / 10.0)).sqrt() as i16; // -13 dB SNR_2500
+        let mut rng = Rng(0x55AA_7733_9911_CCEE);
+        let mut rx = Receiver::new();
+
+        // Test both +11.5 Hz and -11.5 Hz linear sweeps across the 8.8 s burst (~1 full FFT bin of drift!).
+        for &drift_mhz in &[11_500i64, -11_500i64] {
+            let mut ok = 0usize;
+            for _ in 0..8 {
+                let mut pcm = std::vec![0i16; INPUT_RATE_HZ as usize * 10];
+                for s in &mut pcm {
+                    *s = rng.gauss(sigma).clamp(-32_000.0, 32_000.0) as i16;
+                }
+                let start_idx = ((400 + 80) * INPUT_RATE_HZ as usize) / 1000;
+                let mut m = Modulator::with_drift_mhz(tones, INPUT_RATE_HZ, 1275, DEFAULT_SPACING_HZ, drift_mhz, amp);
+                let mut idx = start_idx;
+                while let Some(v) = m.next_sample() {
+                    pcm[idx] = pcm[idx].saturating_add(v);
+                    idx += 1;
+                }
+                rx.reset();
+                for chunk in pcm.chunks(192) {
+                    rx.push_samples(chunk);
+                }
+                let mut out = [Decoded { frame, audio_hz: 0, time_offset_ms: 0, snr_db: 0 }; MAX_DECODED];
+                let n = rx.finish_slot(&mut out);
+                if out[..n].iter().any(|d| d.frame == frame) {
+                    ok += 1;
+                }
+            }
+            assert!(ok >= 7, "swept carrier ({drift_mhz} mHz) decode rate too low: {ok}/8");
+        }
+    }
+
     fn libm_pow10(x: f64) -> f64 {
         (x * core::f64::consts::LN_10).exp()
     }

@@ -1,19 +1,21 @@
-//! SOL950 streaming receiver fitting strictly inside `ferrite_core::decoders::BUDGET` (`13,312` bytes).
+//! SOL950 streaming receiver fitting strictly inside `ferrite_core::decoders::BUDGET` (`13,312` bytes),
+//! including internal LDPC belief-propagation scratch (`work` shared with the early-acquisition ring buffer).
 //!
 //! Pipeline:
 //! 1. `24,000 Hz -> 6,000 Hz` 4:1 low-pass FIR decimator (`udsp::fir::Decimator<31>`).
 //! 2. Sliding 480-sample (`80 ms`) Hann-windowed 512-point real FFT (`udsp::fft`) evaluated every `240` samples
 //!    (`40 ms` half-symbol phase `0` and `1`), with block-exponent (`1 << shift`) log-power normalization.
-//! 3. `32-symbol x 2-phase x 156-bin` magnitude ring buffer (`9,984 B`) holding `539..2,355 Hz` across all arrival
-//!    skews `start_sym in 1..=9` (`[-320 ms, +360 ms]` relative to nominal `+400 ms` start).
-//! 4. Clamped contrast `S0 + S1` 2D acquisition at slot symbol `32` (`t = 2.64 s`) admitting `K = 8` tracks with
-//!    frequency non-maximum suppression and separated-peak fairness reservation, backfilling `data[0..12]` (and
-//!    any early `data[12..]` symbols already in the ring) and streaming the remaining symbols + `S2` drift check.
-//! 5. Serial normalized min-sum `(184, 78)` LDPC + CRC-14 decoding at end of slot.
+//! 3. `32-symbol x 2-phase x 150-bin` packed ring buffer (`9,600 B` in `work`) holding `586..2,344 Hz` across all
+//!    arrival skews `start_sym in 1..=9` (`[-320 ms, +360 ms]` relative to nominal `+400 ms` start).
+//! 4. Clamped contrast `S0 + S1` 2D acquisition at slot symbol `32` (`t = 2.64 s`) admitting `K = 6` tracks with
+//!    frequency non-maximum suppression and separated-peak fairness reservation, backfilling `data[0..12]` and
+//!    streaming `data[12..92]` across 3 linear drift branches (`-11.7 Hz, 0 Hz, +11.7 Hz` over the burst) selected
+//!    at end-of-burst by `S2` (`104..110`) tail-sync scores.
+//! 5. Serial normalized min-sum `(184, 78)` LDPC + CRC-14 decoding at end of slot reusing `work` for BP scratch.
 
 use crate::frame::Frame;
-use crate::ldpc::{self, BpScratch, N_BITS};
-use crate::phy::{data_sym_pos, interleave_idx, DEFAULT_SPACING_HZ, N_DATA_SYMS, N_SYMBOLS, S0, S1, S2};
+use crate::ldpc::{self, N_BITS, N_EDGES};
+use crate::phy::{interleave_idx, DEFAULT_SPACING_HZ, N_DATA_SYMS, N_SYMBOLS, S0, S1, S2};
 use udsp::fft::{cfft, real_power};
 use udsp::fir::Decimator;
 use udsp::log::log2_q8;
@@ -28,9 +30,9 @@ pub const HALF_SAMPLES: usize = 240; // 40 ms @ 6,000 Hz
 pub const FFT_N: usize = 512;
 pub const FFT_M: usize = FFT_N / 2; // 256 complex points
 
-/// First FFT bin stored (`46 * 6000 / 512 = 539.06 Hz`) and number of bins (`46..202`, up to `2,355.5 Hz`).
-pub const FIRST_BIN: usize = 46;
-pub const N_BINS: usize = 156;
+/// First FFT bin stored (`50 * 6000 / 512 = 585.9 Hz`) and number of bins (`50..200`, up to `2,332.0 Hz`).
+pub const FIRST_BIN: usize = 50;
+pub const N_BINS: usize = 150;
 
 /// Ring depth in whole symbols (`1..=32` covers `start_sym in 1..=9` through `S1` end `9 + 23 = 32`).
 pub const RING_SYMS: usize = 32;
@@ -43,8 +45,20 @@ pub const MAX_TRACKS: usize = 8;
 pub const MAX_DECODED: usize = 8;
 pub const LDPC_MAX_ITER: usize = 35;
 
+/// Data-symbol index (`62..92`, i.e. `rel_sym >= 74`, where linear drift exceeds half a bin) from which
+/// negative/positive linear drift branches diverge.
+const DRIFT_START_DATA: usize = 66;
+const TAIL_DATA_BITS: usize = (N_DATA_SYMS - DRIFT_START_DATA) * 2; // 52 bits
+
+/// Packed `i16` length holding `RING_SYMS * 2 * N_BINS = 9,600` bytes during capture, and reused at `finish_slot`
+/// for `post: [i16; 184]` + `c2v: [i8; 525]` LDPC belief-propagation scratch (`447` `i16` words < `4,800`).
+const WORK_BYTES: usize = RING_SYMS * 2 * N_BINS; // 9,600
+const WORK_I16: usize = WORK_BYTES / 2; // 4,800
+
 static DECIM_TAPS: [i16; 31] = lowpass::<31>(2500.0 / 24000.0);
 static HANN_480: [i16; SYM_SAMPLES] = hann_table();
+/// `2^(k/8) * 256` for `k = 0..8`, used to reconstruct unbiased linear power from `1/8`-octave log bins.
+static EXP8: [u32; 8] = [256, 279, 304, 332, 362, 395, 431, 470];
 
 const fn hann_table() -> [i16; SYM_SAMPLES] {
     let mut w = [0i16; SYM_SAMPLES];
@@ -58,11 +72,19 @@ const fn hann_table() -> [i16; SYM_SAMPLES] {
     w
 }
 
+/// Reconstruct scaled linear power (`u64`) from a quantized `1/8`-octave log-power byte `lp`.
+#[inline]
+fn lin_power(lp: u8) -> u64 {
+    let oct = (lp >> 3).min(31) as u32;
+    let frac = (lp & 7) as usize;
+    (EXP8[frac] as u64) << oct
+}
+
 /// Decoded frame together with its measured physical-layer metadata.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Decoded {
     pub frame: Frame,
-    /// Estimated lowest-tone audio frequency offset in Hz above USB dial.
+    /// Estimated lowest-tone audio frequency offset in Hz above USB dial (at start of burst).
     pub audio_hz: u16,
     /// Arrival offset in milliseconds relative to nominal `+400 ms` start (`[-320, +360]`).
     pub time_offset_ms: i16,
@@ -76,10 +98,18 @@ struct Track {
     start_sym: u8,
     phase: u8,
     q0: u16, // half-bin index relative to FIRST_BIN
-    sig_accum: i32,
-    noise_accum: i32,
-    s2_drift: i8, // -1, 0, +1 half-bin shift on second half if S2 prefers it
-    llr: [i8; N_BITS],
+    /// Sum of linear power on the 18 active sync tones (`S0 + S1 + S2`, evaluated along winning drift).
+    on_pwr_sum: u64,
+    /// Sum of linear power across the `18 * 3 = 54` inactive sync tones (`3 x` noise per bin).
+    off_pwr_sum: u64,
+    /// `S2` (`104..110`) contrast scores for end-of-burst drift offsets `[-2, 0, +2]` half-bins (`-11.7, 0, +11.7 Hz`).
+    s2_scores: [i16; 3],
+    /// Zero-drift LLRs across all 92 data symbols (`184` bits).
+    llr_zero: [i8; N_BITS],
+    /// Second-half (`d = 40..92`) LLRs along negative linear drift (`-2` half-bins by `S2`).
+    llr_neg_tail: [i8; TAIL_DATA_BITS],
+    /// Second-half (`d = 40..92`) LLRs along positive linear drift (`+2` half-bins by `S2`).
+    llr_pos_tail: [i8; TAIL_DATA_BITS],
 }
 
 impl Track {
@@ -89,23 +119,24 @@ impl Track {
             start_sym: 0,
             phase: 0,
             q0: 0,
-            sig_accum: 0,
-            noise_accum: 0,
-            s2_drift: 0,
-            llr: [0; N_BITS],
+            on_pwr_sum: 0,
+            off_pwr_sum: 0,
+            s2_scores: [0; 3],
+            llr_zero: [0; N_BITS],
+            llr_neg_tail: [0; TAIL_DATA_BITS],
+            llr_pos_tail: [0; TAIL_DATA_BITS],
         }
     }
 }
 
-/// Streaming SOL950 slot receiver (`<= 13,312` bytes, zero heap allocation).
+/// Streaming SOL950 slot receiver (`<= 13,312` bytes including internal LDPC scratch, zero heap allocation).
 pub struct Receiver {
     decim: Decimator<31>,
     pcm_ring: [i16; SYM_SAMPLES],
     pcm_pos: usize,
     decim_count: u32,
-    spacing_hz: u32,
     tone_q_off: [u16; 4],
-    mag_ring: [[[u8; N_BINS]; 2]; RING_SYMS],
+    work: [i16; WORK_I16],
     tracks: [Track; MAX_TRACKS],
     acquired: bool,
 }
@@ -122,9 +153,8 @@ impl Receiver {
             pcm_ring: [0; SYM_SAMPLES],
             pcm_pos: 0,
             decim_count: 0,
-            spacing_hz,
             tone_q_off,
-            mag_ring: [[[0; N_BINS]; 2]; RING_SYMS],
+            work: [0; WORK_I16],
             tracks: [Track::empty(); MAX_TRACKS],
             acquired: false,
         }
@@ -136,8 +166,34 @@ impl Receiver {
         self.pcm_ring = [0; SYM_SAMPLES];
         self.pcm_pos = 0;
         self.decim_count = 0;
+        self.work.fill(0);
         self.tracks = [Track::empty(); MAX_TRACKS];
         self.acquired = false;
+    }
+
+    #[inline]
+    fn ring_offset(sym_mod: usize, phase: usize, bin: usize) -> usize {
+        (sym_mod * 2 + phase) * N_BINS + bin
+    }
+
+    #[inline]
+    fn write_ring_bins(&mut self, sym_mod: usize, phase: usize, bins: &[u8; N_BINS]) {
+        let base = Self::ring_offset(sym_mod, phase, 0) >> 1;
+        for i in 0..(N_BINS / 2) {
+            self.work[base + i] = i16::from_le_bytes([bins[2 * i], bins[2 * i + 1]]);
+        }
+    }
+
+    #[inline]
+    fn read_ring_bins(&self, sym_mod: usize, phase: usize) -> [u8; N_BINS] {
+        let base = Self::ring_offset(sym_mod, phase, 0) >> 1;
+        let mut out = [0u8; N_BINS];
+        for i in 0..(N_BINS / 2) {
+            let [lo, hi] = self.work[base + i].to_le_bytes();
+            out[2 * i] = lo;
+            out[2 * i + 1] = hi;
+        }
+        out
     }
 
     /// Feed signed 16-bit PCM samples at `24,000 Hz` (e.g. `192`-sample `8 ms` DSP blocks).
@@ -161,9 +217,8 @@ impl Receiver {
     }
 
     fn on_half_symbol(&mut self, sym: usize, phase: usize) {
-        // Compute 480-sample Hann-windowed 512-pt real FFT on the stack (~1 KB stack).
         let mut z = [0i16; FFT_N];
-        let mut idx = self.pcm_pos; // oldest sample in pcm_ring
+        let mut idx = self.pcm_pos;
         for (n, &w) in HANN_480.iter().enumerate() {
             let s = self.pcm_ring[idx] as i32;
             idx = if idx + 1 == SYM_SAMPLES { 0 } else { idx + 1 };
@@ -174,16 +229,13 @@ impl Receiver {
         let mut cur_bins = [0u8; N_BINS];
         let mut out_i = 0usize;
         real_power(&z, FFT_M, FIRST_BIN, 1, N_BINS, |_, pwr| {
-            // Exact shift-compensated log2 power in 1/8-octave (0.376 dB) steps across [2^13 .. 2^45] (~96 dB
-            // up to a full-scale 32767 sine wave without u8 clipping).
             let lp = (log2_q8(pwr.max(1)) + ((2 * shift as i32 - 13) << 8)) >> 5;
             cur_bins[out_i] = lp.clamp(0, 255) as u8;
             out_i += 1;
         });
 
-        // Store in circular buffer while in acquisition range.
         if !self.acquired {
-            self.mag_ring[sym % RING_SYMS][phase] = cur_bins;
+            self.write_ring_bins(sym % RING_SYMS, phase, &cur_bins);
             if sym == ACQUIRE_AT_SYM && phase == 1 {
                 self.acquire_candidates();
                 self.acquired = true;
@@ -191,7 +243,6 @@ impl Receiver {
             return;
         }
 
-        // Stream symbols post-acquisition into active tracks matching `phase`.
         for tr_i in 0..MAX_TRACKS {
             if !self.tracks[tr_i].active || self.tracks[tr_i].phase as usize != phase {
                 continue;
@@ -221,35 +272,33 @@ impl Receiver {
         }
     }
 
-    /// Global 2D `(start_sym in 1..=9, phase in 0..1, half-bin q0)` search over `S0 + S1`.
     fn acquire_candidates(&mut self) {
         let max_q0 = ((N_BINS - 2) * 2).saturating_sub(self.tone_q_off[3] as usize) as u16;
+        let mut best_score = [i16::MIN; 300];
+        let mut best_sp = [0u8; 300];
+        let n_q = (max_q0 as usize + 1).min(300);
 
-        // First find the best `(start_sym, phase, score)` at every frequency `q0` (1D profile over frequency).
-        // Stack usage: `max_q0 <= 300`, so `300 * 4 = 1,200 bytes` on stack.
-        let mut best_score = [i16::MIN; 312];
-        let mut best_sp = [0u8; 312]; // (start_sym << 1) | phase
-
-        let n_q = (max_q0 as usize + 1).min(312);
         for s in MIN_START_SYM..=MAX_START_SYM {
             for phase in 0..2usize {
+                let mut s0_bins = [[0u8; N_BINS]; 6];
+                let mut s1_bins = [[0u8; N_BINS]; 6];
+                for k in 0..6 {
+                    s0_bins[k] = self.read_ring_bins((s + k) % RING_SYMS, phase);
+                    s1_bins[k] = self.read_ring_bins((s + 18 + k) % RING_SYMS, phase);
+                }
                 for q0 in 0..n_q {
                     let mut contrast = 0i32;
                     let mut raw_sum = 0i32;
                     for (k, &w) in S0.iter().enumerate() {
-                        let bins = &self.mag_ring[(s + k) % RING_SYMS][phase];
-                        let (c, rw) = Self::contrast_sym(bins, q0 as u16, &self.tone_q_off, w as usize);
+                        let (c, rw) = Self::contrast_sym(&s0_bins[k], q0 as u16, &self.tone_q_off, w as usize);
                         contrast += c;
                         raw_sum += rw;
                     }
                     for (k, &w) in S1.iter().enumerate() {
-                        let bins = &self.mag_ring[(s + 18 + k) % RING_SYMS][phase];
-                        let (c, rw) = Self::contrast_sym(bins, q0 as u16, &self.tone_q_off, w as usize);
+                        let (c, rw) = Self::contrast_sym(&s1_bins[k], q0 as u16, &self.tone_q_off, w as usize);
                         contrast += c;
                         raw_sum += rw;
                     }
-                    // Primary score is clamped contrast (rejects +40 dB off-tone sidelobes); minor tie-breaker
-                    // (`raw_sum >> 4`) breaks any high-SNR saturation plateau cleanly at the exact tone center.
                     let score = contrast * 8 + (raw_sum >> 4);
                     let sc = score.clamp(i16::MIN as i32 + 1, i16::MAX as i32) as i16;
                     if sc > best_score[q0] {
@@ -260,20 +309,16 @@ impl Receiver {
             }
         }
 
-        // Pick up to `MAX_TRACKS` local maxima with >= 8 half-bins (~46.9 Hz, < 1 tone spacing) NMS radius so
-        // even a caller displaced by 1 tone spacing (50 Hz) can be tracked independently, while reserving the
-        // last 2 tracks for peaks >= 32 half-bins (~187 Hz) away.
         let mut chosen_n = 0usize;
         for slot in 0..MAX_TRACKS {
             let min_sep: usize = if slot < MAX_TRACKS - 2 { 8 } else { 32 };
             let mut pick_q = None;
-            let mut pick_sc = 288i16; // minimum positive contrast threshold above pure noise (36 * 8)
+            let mut pick_sc = 288i16;
             for q0 in 0..n_q {
                 let sc = best_score[q0];
                 if sc <= pick_sc {
                     continue;
                 }
-                // Local maximum check (+/- 1 half-bin)
                 if q0 > 0 && best_score[q0 - 1] > sc {
                     continue;
                 }
@@ -303,18 +348,14 @@ impl Receiver {
                 start_sym,
                 phase,
                 q0: q0 as u16,
-                sig_accum: 0,
-                noise_accum: 0,
-                s2_drift: 0,
-                llr: [0; N_BITS],
+                ..Track::empty()
             };
-            // Backfill all symbols `[start_sym ..= ACQUIRE_AT_SYM]` already sitting in `mag_ring`.
             let s_usize = start_sym as usize;
             let ph_usize = phase as usize;
             for sym in s_usize..=ACQUIRE_AT_SYM {
                 let rel = sym - s_usize;
                 if rel < N_SYMBOLS {
-                    let bins = self.mag_ring[sym % RING_SYMS][ph_usize];
+                    let bins = self.read_ring_bins(sym % RING_SYMS, ph_usize);
                     self.feed_track_symbol(chosen_n, rel, &bins);
                 }
             }
@@ -322,9 +363,6 @@ impl Receiver {
         }
     }
 
-    /// Clamped per-symbol contrast score `(clamped_contrast, raw_expected_energy)`:
-    /// `3 * e[expected] - sum(other 3 tones)` clamped to `[-48, +48]` rejects +40 dB off-tone sidelobes, while
-    /// `want` breaks high-SNR plateaus cleanly at the exact tone center.
     #[inline]
     fn contrast_sym(bins: &[u8; N_BINS], q0: u16, tone_q_off: &[u16; 4], expected: usize) -> (i32, i32) {
         let e0 = Self::sample_tone(bins, q0, tone_q_off, 0);
@@ -337,106 +375,172 @@ impl Receiver {
         ((4 * want - sum).clamp(-48, 48), want)
     }
 
+    #[inline]
+    fn extract_dibit_llr(bins: &[u8; N_BINS], q: u16, tone_q_off: &[u16; 4]) -> (i8, i8) {
+        let e0 = Self::sample_tone(bins, q, tone_q_off, 0);
+        let e1 = Self::sample_tone(bins, q, tone_q_off, 1);
+        let e2 = Self::sample_tone(bins, q, tone_q_off, 2);
+        let e3 = Self::sample_tone(bins, q, tone_q_off, 3);
+        let b0 = (e0.max(e1) - e2.max(e3)).clamp(-24, 24) as i8;
+        let b1 = (e0.max(e3) - e1.max(e2)).clamp(-24, 24) as i8;
+        (b0, b1)
+    }
+
     fn feed_track_symbol(&mut self, tr_i: usize, rel_sym: usize, bins: &[u8; N_BINS]) {
         let q0 = self.tracks[tr_i].q0;
-        // Tail sync S2 (`104..110`): evaluate -1, 0, +1 half-bin drift (`+/- 5.86 Hz`) and adjust late symbols if needed.
+
+        // Tail sync S2 (`104..110`): score the 3 drift endpoints `[-2, 0, +2]` half-bins (`-11.7, 0, +11.7 Hz`).
         if rel_sym >= 104 {
             let k = rel_sym - 104;
             let w = S2[k] as usize;
-            let c_neg = if q0 > 0 { Self::contrast_sym(bins, q0 - 1, &self.tone_q_off, w).0 } else { -48 };
-            let c_zero = Self::contrast_sym(bins, q0, &self.tone_q_off, w).0;
-            let c_pos = Self::contrast_sym(bins, q0 + 1, &self.tone_q_off, w).0;
-            if c_pos > c_zero + 8 && c_pos >= c_neg {
-                self.tracks[tr_i].s2_drift = self.tracks[tr_i].s2_drift.saturating_add(1);
-            } else if c_neg > c_zero + 8 && c_neg > c_pos {
-                self.tracks[tr_i].s2_drift = self.tracks[tr_i].s2_drift.saturating_sub(1);
-            }
-            return;
-        }
-        if rel_sym < 6 || (18..24).contains(&rel_sym) {
-            // Sync symbols: accumulate signal vs noise estimate for SNR reporting.
-            let w = if rel_sym < 6 { S0[rel_sym] } else { S1[rel_sym - 18] } as usize;
-            let mut e = [0i32; 4];
-            for (t, slot) in e.iter_mut().enumerate() {
-                *slot = Self::sample_tone(bins, q0, &self.tone_q_off, t);
-            }
-            let sig = e[w];
-            let noise = (e[0] + e[1] + e[2] + e[3] - sig) / 3;
-            self.tracks[tr_i].sig_accum += sig;
-            self.tracks[tr_i].noise_accum += noise;
+            let q_neg = q0.saturating_sub(2);
+            let q_pos = q0.saturating_add(2);
+            let c_neg = Self::contrast_sym(bins, q_neg, &self.tone_q_off, w).0 as i16;
+            let c_zero = Self::contrast_sym(bins, q0, &self.tone_q_off, w).0 as i16;
+            let c_pos = Self::contrast_sym(bins, q_pos, &self.tone_q_off, w).0 as i16;
+            self.tracks[tr_i].s2_scores[0] = self.tracks[tr_i].s2_scores[0].saturating_add(c_neg);
+            self.tracks[tr_i].s2_scores[1] = self.tracks[tr_i].s2_scores[1].saturating_add(c_zero);
+            self.tracks[tr_i].s2_scores[2] = self.tracks[tr_i].s2_scores[2].saturating_add(c_pos);
             return;
         }
 
-        // Data symbol index `d in 0..92`
+        // Early sync symbols `S0` (`0..6`) and `S1` (`18..24`): accumulate unbiased linear power on active vs
+        // inactive sync tones for calibrated 2,500 Hz SNR estimation.
+        if rel_sym < 6 || (18..24).contains(&rel_sym) {
+            let w = if rel_sym < 6 { S0[rel_sym] } else { S1[rel_sym - 18] } as usize;
+            for t in 0..4 {
+                let lp = Self::sample_tone(bins, q0, &self.tone_q_off, t).clamp(0, 255) as u8;
+                let p = lin_power(lp);
+                if t == w {
+                    self.tracks[tr_i].on_pwr_sum = self.tracks[tr_i].on_pwr_sum.saturating_add(p);
+                } else {
+                    self.tracks[tr_i].off_pwr_sum = self.tracks[tr_i].off_pwr_sum.saturating_add(p);
+                }
+            }
+            return;
+        }
+
         let d = if rel_sym < 18 { rel_sym - 6 } else { 12 + (rel_sym - 24) };
         if d >= N_DATA_SYMS {
             return;
         }
 
-        let e0 = Self::sample_tone(bins, q0, &self.tone_q_off, 0);
-        let e1 = Self::sample_tone(bins, q0, &self.tone_q_off, 1);
-        let e2 = Self::sample_tone(bins, q0, &self.tone_q_off, 2);
-        let e3 = Self::sample_tone(bins, q0, &self.tone_q_off, 3);
+        let (b0, b1) = Self::extract_dibit_llr(bins, q0, &self.tone_q_off);
+        self.tracks[tr_i].llr_zero[2 * d] = b0;
+        self.tracks[tr_i].llr_zero[2 * d + 1] = b1;
 
-        // Gray map:
-        // tone 0 -> (b0=0, b1=0)
-        // tone 1 -> (b0=0, b1=1)
-        // tone 2 -> (b0=1, b1=1)
-        // tone 3 -> (b0=1, b1=0)
-        // Positive LLR favors bit 0; negative LLR favors bit 1.
-        // Clamp per-symbol LLR to [-24, +24] so a loud tone collision on a single symbol acts as a soft erasure
-        // rather than overwhelming the LDPC belief propagation!
-        let llr_b0 = (e0.max(e1) - e2.max(e3)).clamp(-24, 24) as i8;
-        let llr_b1 = (e0.max(e3) - e1.max(e2)).clamp(-24, 24) as i8;
-
-        self.tracks[tr_i].llr[2 * d] = llr_b0;
-        self.tracks[tr_i].llr[2 * d + 1] = llr_b1;
+        // Second half (`d = 40..92`, `rel_sym = 52..104`): also record negative and positive linear drift trajectories:
+        // `-1` / `+1` half-bin over `rel_sym = 52..78`, ramping to `-2` / `+2` half-bins over `rel_sym = 78..104`.
+        if d >= DRIFT_START_DATA {
+            let step = if rel_sym < 78 { 1u16 } else { 2u16 };
+            let (nb0, nb1) = Self::extract_dibit_llr(bins, q0.saturating_sub(step), &self.tone_q_off);
+            let (pb0, pb1) = Self::extract_dibit_llr(bins, q0.saturating_add(step), &self.tone_q_off);
+            let ti = (d - DRIFT_START_DATA) * 2;
+            self.tracks[tr_i].llr_neg_tail[ti] = nb0;
+            self.tracks[tr_i].llr_neg_tail[ti + 1] = nb1;
+            self.tracks[tr_i].llr_pos_tail[ti] = pb0;
+            self.tracks[tr_i].llr_pos_tail[ti + 1] = pb1;
+        }
     }
 
-    /// Run serial normalized min-sum LDPC + CRC-14 decoding across all admitted tracks at end of slot, writing unique
-    /// valid frames into `out` and returning the count decoded.
-    pub fn finish_slot(&self, out: &mut [Decoded; MAX_DECODED]) -> usize {
-        let mut scratch = BpScratch::new();
+    /// Run serial normalized min-sum LDPC + CRC-14 decoding across all admitted tracks at end of slot, reusing
+    /// `self.work` (`[i16; 4800]`) for both `post` (`184`) and `c2v` (`525`) scratch (`0` bytes of BP stack scratch)
+    /// and ranking drift branches by `S2`.
+    pub fn finish_slot(&mut self, out: &mut [Decoded; MAX_DECODED]) -> usize {
+        let (post_slice, rest) = self.work.split_at_mut(N_BITS);
+        let post: &mut [i16; N_BITS] = post_slice.try_into().unwrap();
+        let c2v: &mut [i16; N_EDGES] = (&mut rest[..N_EDGES]).try_into().unwrap();
+
+        let mut raw_llr = [0i8; N_BITS];
         let mut deinter = [0i8; N_BITS];
         let mut n_out = 0usize;
 
-        for tr in &self.tracks {
-            if !tr.active || n_out >= MAX_DECODED {
+        for tr_i in 0..MAX_TRACKS {
+            if !self.tracks[tr_i].active || n_out >= MAX_DECODED {
                 continue;
             }
-            for code_i in 0..N_BITS {
-                deinter[code_i] = tr.llr[interleave_idx(code_i)];
+            // Rank the 3 drift branches `0 = neg (-2), 1 = zero (0), 2 = pos (+2)` by measured `S2` tail-sync score
+            // (with small +6 tie-break bias toward zero drift when stationary).
+            let sc = [
+                self.tracks[tr_i].s2_scores[0],
+                self.tracks[tr_i].s2_scores[1].saturating_add(6),
+                self.tracks[tr_i].s2_scores[2],
+            ];
+            let mut order = [1usize, 0, 2];
+            if sc[order[1]] > sc[order[0]] {
+                order.swap(0, 1);
             }
-            let Some(bits78) = ldpc::decode_bp(&deinter, &mut scratch, LDPC_MAX_ITER) else {
-                continue;
-            };
-            let Some(frame) = Frame::from_bits78(&bits78) else {
-                continue;
-            };
+            if sc[order[2]] > sc[order[1]] {
+                order.swap(1, 2);
+                if sc[order[1]] > sc[order[0]] {
+                    order.swap(0, 1);
+                }
+            }
 
-            // Deduplicate if two adjacent half-bin / half-symbol tracks converged to the same frame.
+            let mut decoded_frame = None;
+            for &branch in &order {
+                raw_llr.copy_from_slice(&self.tracks[tr_i].llr_zero);
+                if branch == 0 {
+                    raw_llr[DRIFT_START_DATA * 2..].copy_from_slice(&self.tracks[tr_i].llr_neg_tail);
+                } else if branch == 2 {
+                    raw_llr[DRIFT_START_DATA * 2..].copy_from_slice(&self.tracks[tr_i].llr_pos_tail);
+                }
+                for code_i in 0..N_BITS {
+                    deinter[code_i] = raw_llr[interleave_idx(code_i)];
+                }
+                if let Some(bits78) = ldpc::decode_bp_with_slices(&deinter, post, c2v, LDPC_MAX_ITER) {
+                    if let Some(f) = Frame::from_bits78(&bits78) {
+                        decoded_frame = Some(f);
+                        break;
+                    }
+                }
+            }
+
+            let Some(frame) = decoded_frame else {
+                continue;
+            };
             if out[..n_out].iter().any(|d| d.frame == frame) {
                 continue;
             }
 
-            // Audio frequency in Hz: (FIRST_BIN + q0 / 2.0) * 6000 / 512 = ((2 * FIRST_BIN + q0) * 3000 + 256) / 512
+            let tr = &self.tracks[tr_i];
             let audio_hz = (((2 * FIRST_BIN as u32 + tr.q0 as u32) * (PROC_RATE_HZ / 2) + 256) / FFT_N as u32) as u16;
             let time_offset_ms = ((tr.start_sym as i16 - NOMINAL_START_SYM as i16) * 80) + (tr.phase as i16 * 40);
-
-            // Estimate SNR referenced to 2,500 Hz BW:
-            // Per-bin noise BW (Hann window ENBW = 1.5 * 12.5 Hz = 18.75 Hz); 2500 / 18.75 = 133.3 -> -21.25 dB offset.
-            // Each unit of `sig_accum - noise_accum` over 12 sync symbols is `0.376 / 12` dB of (S+N)/N.
-            let diff_db_x10 = ((tr.sig_accum - tr.noise_accum).max(0) * 376) / (12 * 10);
-            let snr_2500 = (diff_db_x10 - 212) / 10;
-            let snr_db = snr_2500.clamp(-24, 20) as i8;
+            let snr_db = estimate_snr_2500_db(tr.on_pwr_sum, tr.off_pwr_sum);
 
             out[n_out] = Decoded { frame, audio_hz, time_offset_ms, snr_db };
             n_out += 1;
         }
-        let _ = data_sym_pos;
-        let _ = self.spacing_hz;
         n_out
     }
+}
+
+/// Convert accumulated linear sync power (`on_pwr_sum` across 12 active sync bins, `off_pwr_sum` across 36 inactive
+/// sync bins) into unbiased SNR in dB referenced to a `2,500 Hz` noise bandwidth.
+fn estimate_snr_2500_db(on_pwr_sum: u64, off_pwr_sum: u64) -> i8 {
+    // Mean noise per bin = off_pwr_sum / 36; mean (S + N) per bin = on_pwr_sum / 12 = (3 * on_pwr_sum) / 36.
+    let n_36 = off_pwr_sum.max(1);
+    let sn_36 = on_pwr_sum.saturating_mul(3);
+    // Floor pure signal at 1/16 of per-bin noise (`-12 dB` per-bin = `-33 dB` in 2500 Hz) if noisy fluctuation dips.
+    let s_36 = sn_36.saturating_sub(n_36).max((n_36 >> 4).max(1));
+
+    // 10 * log10(s_36 / n_36) = 3.0103 * (log2(s_36) - log2(n_36)).
+    // In Q8 (`1/256` log2), `d_q8 * 771 >> 16` = `d_q8 * (3.0117 / 256)` in tenths of a dB (`x10`)? Wait:
+    // Let's check exact arithmetic in tenths of a dB (`0.1 dB` units)!
+    // `log2_q8` is `256 * log2(x)`.
+    // `100 * log10(x) = 30.103 * log2(x) = (log2_q8(x) * 3010 + 12800) / 25600` (in `0.1 dB` units!).
+    let diff_q8 = log2_q8(s_36) - log2_q8(n_36);
+    let bin_snr_db_x10 = (diff_q8 * 301 + 1280) / 2560;
+
+    // 480-sample (`80 ms`) Hann window has ENBW = `1.5 * 12.5 Hz = 18.75 Hz`.
+    // `10 * log10(18.75 / 2500) = -21.25 dB`, plus `+0.55 dB` average half-bin/Hann scalloping loss = `-20.7 dB` (`-207`).
+    let snr_2500_x10 = bin_snr_db_x10 - 207;
+    let rounded = if snr_2500_x10 >= 0 {
+        (snr_2500_x10 + 5) / 10
+    } else {
+        (snr_2500_x10 - 5) / 10
+    };
+    rounded.clamp(-24, 20) as i8
 }
 
 impl Default for Receiver {
@@ -446,8 +550,6 @@ impl Default for Receiver {
 }
 
 const fn compute_tone_q_off(spacing_hz: u32) -> [u16; 4] {
-    // Half-bin units: 1 bin = PROC_RATE_HZ / FFT_N = 6000 / 512 Hz, so 1 half-bin = 3000 / 512 Hz.
-    // q_off(t) = round(t * spacing_hz * 512 / 3000).
     let mut out = [0u16; 4];
     let mut t = 0usize;
     while t < 4 {
