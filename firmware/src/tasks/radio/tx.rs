@@ -233,7 +233,7 @@ impl Radio {
                 self.tx.test_playing = true;
                 crate::tasks::dsp::TXTEST.signal(Some((g, t.eq)));
             } else {
-                self.afsk_bk_start(n, t.level);
+                self.bk_test_start(n, &t);
             }
             log(b"txtest playing ", t.signal as u32 + 1);
         }

@@ -1,7 +1,7 @@
 //! Host CLI for SOL950 bench testing, carrier/BFO measurement, and asynchronous WAV decoding:
 //!
-//!   cargo run -p usol950 --example sol950_wav -- cq W1AW FN31 1050 sol950-cq.wav
-//!   cargo run -p usol950 --example sol950_wav -- rx K1ABC W1AW -14 0 1275 sol950-rx-frame.wav
+//!   cargo run -p usol950 --example sol950_wav -- cq NQ6N FN31 1050 sol950-cq.wav
+//!   cargo run -p usol950 --example sol950_wav -- rx K1ABC NQ6N -14 0 1275 sol950-rx-frame.wav
 //!   cargo run -p usol950 --example sol950_wav -- decode sol950-rx.wav
 //!   cargo run -p usol950 --example sol950_wav -- tone sol950-rx.wav
 
@@ -401,7 +401,7 @@ mod tests {
 
     #[test]
     fn late_burst_at_6_10s_in_15s_wav_decodes() {
-        let w1aw = Callsign::encode(b"W1AW").unwrap();
+        let w1aw = Callsign::encode(b"NQ6N").unwrap();
         let fn31 = encode_grid4(b"FN31").unwrap();
         let frame = Frame::Cq { sender: w1aw, grid4: fn31, tx_pwr: 10, reserved: 0 };
         let tones = encode_tones(frame);

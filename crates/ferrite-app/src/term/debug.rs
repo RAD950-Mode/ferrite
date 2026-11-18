@@ -628,6 +628,8 @@ impl Job {
                     let rc = if a.shaped && a.signal == Signal::Fsk { " rc" } else { "" };
                     if a.signal.takes_baud() {
                         put!(out, "  txtest: {} {}{} at {} % armed for the next PTT key-up, from the key-up to the release; once", a.signal.name(), a.baud, rc, a.level);
+                    } else if a.signal.is_sol950() {
+                        put!(out, "  txtest: {} (dev {}) at {} % armed for the next PTT key-up; once", a.signal.name(), a.baud, a.level);
                     } else {
                         put!(out, "  txtest: {} at {} % armed for the next PTT key-up, from the key-up to the release; once", a.signal.name(), a.level);
                     }
@@ -655,6 +657,13 @@ impl Job {
                     }
                     if a.signal == Signal::AfskBk {
                         put!(out, "  afsk-bk: tone 1 1200/2200 Hz (REG_71) at gain {} (REG_70), REG_30 0xC3FA (mic off), TMR5 at 1200 Bd; DAC1, PC12 untouched", bk_gain(a.level));
+                        self.st = St::Over;
+                        self.line += 1;
+                        return Step::Line;
+                    }
+                    if a.signal.is_sol950() {
+                        let g = ferrite_core::txtest::sol950_gains(a.level);
+                        put!(out, "  {}: frozen Tone 1 REG_70 [{},{},{},{}], REG_40 dev {}, TX DC/AF bypassed, TMR5 1.25 ms; restored at unkey", a.signal.name(), g[0], g[1], g[2], g[3], a.baud);
                         self.st = St::Over;
                         self.line += 1;
                         return Step::Line;

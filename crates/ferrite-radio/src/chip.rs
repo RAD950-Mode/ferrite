@@ -540,6 +540,51 @@ pub fn afsk_bk_end<B: Bus>(bk: &mut Bk4829<B>) {
     bk.tone_tx(0);
 }
 
+/// Registers saved by [`sol950_bk_prime`] and restored at unkey by [`sol950_bk_end`].
+#[cfg(all(feature = "tx", feature = "bench"))]
+#[derive(Clone, Copy)]
+pub struct Sol950Saved {
+    pub regs: [(u8, u16); 7],
+}
+
+/// Start SOL950 frozen-tone continuous-phase 4-FSK on the keyed BK4829: saves modified TX/tone registers, enters
+/// `Source::Tones` (`REG_30 = 0xC3FA`, mic off), bypasses TX AF/DC/HPF/pre-emphasis filters, sets `REG_40` low 12
+/// bits to `dev`, and starts Tone 1 at 1 kHz (`g0`); caller waits 250 us (quarter cycle) and calls [`sol950_bk_freeze`].
+#[cfg(all(feature = "tx", feature = "bench"))]
+pub fn sol950_bk_prime<B: Bus>(bk: &mut Bk4829<B>, dev: u16, g0: u8, narrow: bool) -> Sol950Saved {
+    let regs = [0x70u8, 0x71, 0x47, 0x7E, 0x29, 0x2B, 0x40].map(|r| (r, bk.read(r)));
+    let get = |r: u8| regs.iter().find(|s| s.0 == r).map_or(0, |s| s.1);
+    bk.tx_on(bk4829::tx::Source::Tones, !narrow);
+    bk.write(0x47, get(0x47) | 1); // AF TX filters bypassed
+    bk.write(0x7E, get(0x7E) & !0x0038); // TX DC filter off
+    bk.write(0x29, get(0x29) & !0x0E00); // TX DC filter HPF1 off
+    bk.write(0x2B, get(0x2B) | 0x0007); // TX HPF, LPF1, pre-emphasis off
+    bk.write(0x40, (get(0x40) & 0xF000) | (dev & 0x0FFF));
+    bk.write(0x70, 1 << 15 | ((g0 & 0x7F) as u16) << 8);
+    bk.write(0x71, bk4829::tone_word(1000));
+    Sol950Saved { regs }
+}
+
+/// Freeze Tone 1's phase accumulator near its peak (`REG_71 = 0`).
+#[cfg(all(feature = "tx", feature = "bench"))]
+pub fn sol950_bk_freeze<B: Bus>(bk: &mut Bk4829<B>) {
+    bk.write(0x71, 0);
+}
+
+/// Step Tone 1's frozen output amplitude (`REG_70` bits 14:8).
+#[cfg(all(feature = "tx", feature = "bench"))]
+pub fn sol950_bk_gain<B: Bus>(bk: &mut Bk4829<B>, gain: u8) {
+    bk.write(0x70, 1 << 15 | ((gain & 0x7F) as u16) << 8);
+}
+
+/// Restore all 7 registers saved by [`sol950_bk_prime`] before unkey completes.
+#[cfg(all(feature = "tx", feature = "bench"))]
+pub fn sol950_bk_end<B: Bus>(bk: &mut Bk4829<B>, saved: &Sol950Saved) {
+    for &(r, v) in &saved.regs {
+        bk.write(r, v);
+    }
+}
+
 /// TERM-34 `txtest suite` (decision 139): what the suite changes on the keyed chip, as the key-up left it: the four
 /// registers of the `flat`/`data` set-up, REG_40 (the deviation field), REG_07 and REG_52 (the sub-tone word and
 /// the CTCSS threshold the sub-tone steps rewrite) and the key-up's sub-tone (the slot's tone word and its REG_51

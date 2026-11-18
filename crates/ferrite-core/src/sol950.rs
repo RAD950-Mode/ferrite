@@ -641,7 +641,7 @@ mod tests {
 
     #[test]
     fn clean_three_slot_exchange_and_aborted_tx_safety() {
-        let mut a = make_engine(b"W1AW", b"FN31", OpMode::AutoCq { parity: 0 }, &[W0]);
+        let mut a = make_engine(b"NQ6N", b"FN31", OpMode::AutoCq { parity: 0 }, &[W0]);
         let mut b = make_engine(b"K1ABC", b"FN42", OpMode::Pounce, &[W0, W1]);
 
         // Verify an unconfirmed/aborted TX never satisfies local completion:
@@ -649,7 +649,7 @@ mod tests {
         // Do NOT call confirm_tx_completed(0) — simulate PTT/path abort!
         let mut logs = [None; 2];
         let k1abc = Callsign::encode(b"K1ABC").unwrap();
-        let w1aw = Callsign::encode(b"W1AW").unwrap();
+        let w1aw = Callsign::encode(b"NQ6N").unwrap();
         a.on_rx_frames(
             1,
             W0,
@@ -664,7 +664,7 @@ mod tests {
         assert_eq!(a.total_logged(), 0, "aborted TX must never count as tx_report_done_at");
 
         // Fresh clean 3-slot run: A logs at Slot 2, B logs at Slot 2, and B goes quiet right away.
-        let mut a = make_engine(b"W1AW", b"FN31", OpMode::AutoCq { parity: 0 }, &[W0]);
+        let mut a = make_engine(b"NQ6N", b"FN31", OpMode::AutoCq { parity: 0 }, &[W0]);
         let (_, tx_b) = sim_pair(&mut a, &mut b, 8, None, None);
         assert_eq!((a.total_logged(), b.total_logged()), (1, 1));
         assert_eq!(tx_b, 1, "pouncer B sent exactly 1 frame");
@@ -676,13 +676,13 @@ mod tests {
     fn single_slot_erasure_matrix_with_multi_window_scanning() {
         // (b) Slot 0 CQ erased while B scans [W1, W0] (starting on W1, opposite initial scan phase!):
         // 2-slot dwell guarantees rendezvous and mutual completion.
-        let mut a = make_engine(b"W1AW", b"FN31", OpMode::AutoCq { parity: 0 }, &[W0]);
+        let mut a = make_engine(b"NQ6N", b"FN31", OpMode::AutoCq { parity: 0 }, &[W0]);
         let mut b = make_engine(b"K1ABC", b"FN42", OpMode::Pounce, &[W1, W0]);
         sim_pair(&mut a, &mut b, 12, Some(0), None);
         assert_eq!((a.total_logged(), b.total_logged()), (1, 1), "Slot 0 erased + opposite scan phase");
 
         // (c) Slot 1 (B's initial RX ACK=0) erased: B retries in Slot 3, A answers ACK=1 in Slot 4 -> both log 1.
-        let mut a = make_engine(b"W1AW", b"FN31", OpMode::AutoCq { parity: 0 }, &[W0]);
+        let mut a = make_engine(b"NQ6N", b"FN31", OpMode::AutoCq { parity: 0 }, &[W0]);
         let mut b = make_engine(b"K1ABC", b"FN42", OpMode::Pounce, &[W0, W1]);
         sim_pair(&mut a, &mut b, 10, Some(1), None);
         assert_eq!((a.total_logged(), b.total_logged()), (1, 1), "Slot 1 erased");
@@ -695,7 +695,7 @@ mod tests {
         // Because B lingers on W0 (Post-Completion Linger), when A retries RX(ACK=0) in Slot 3, B is STILL on W0,
         // answers with cooldown ACK=1 in Slot 4 (no duplicate log at B!), and A logs in Slot 4!
         let mut a_scan = make_engine(b"K1ABC", b"FN42", OpMode::Pounce, &[W0, W1]);
-        let mut b_scan = make_engine(b"W1AW", b"FN31", OpMode::AutoCq { parity: 0 }, &[W0, W1]);
+        let mut b_scan = make_engine(b"NQ6N", b"FN31", OpMode::AutoCq { parity: 0 }, &[W0, W1]);
         sim_pair(&mut b_scan, &mut a_scan, 12, Some(2), None);
         assert_eq!(
             (b_scan.total_logged(), a_scan.total_logged()),
@@ -717,7 +717,7 @@ mod tests {
     fn two_simultaneous_callers_and_sustained_loss_bounds() {
         // (e) Two callers (B and C) answer A's Slot 0 CQ simultaneously in Slot 1:
         // A works B in Slot 2 and C in Slot 4 while obeying <= 3 TX / 60 s, logging 2 QSOs cleanly.
-        let mut a = make_engine(b"W1AW", b"FN31", OpMode::AutoCq { parity: 0 }, &[W0]);
+        let mut a = make_engine(b"NQ6N", b"FN31", OpMode::AutoCq { parity: 0 }, &[W0]);
         let mut b = make_engine(b"K1ABC", b"FN42", OpMode::Pounce, &[W0]);
         let mut c = make_engine(b"VE3XYZ", b"EN93", OpMode::Pounce, &[W0]);
 
@@ -758,7 +758,7 @@ mod tests {
         // (f) Sustained complete path loss after Slot 0 (`cut_from_slot = Some(1)`):
         // B hears A's Slot 0 CQ, then propagation dies completely. B must stop retrying after `MAX_TRIES = 4`
         // and neither station logs a QSO.
-        let mut a2 = make_engine(b"W1AW", b"FN31", OpMode::AutoCq { parity: 0 }, &[W0]);
+        let mut a2 = make_engine(b"NQ6N", b"FN31", OpMode::AutoCq { parity: 0 }, &[W0]);
         let mut b2 = make_engine(b"K1ABC", b"FN42", OpMode::Pounce, &[W0, W1]);
         let (_, tx_b2) = sim_pair(&mut a2, &mut b2, 25, None, Some(1));
         assert_eq!((a2.total_logged(), b2.total_logged()), (0, 0));
@@ -767,9 +767,9 @@ mod tests {
 
     #[test]
     fn unsolicited_or_stale_ack1_never_logs_or_replies() {
-        let mut pouncer = make_engine(b"W1AW", b"FN31", OpMode::Pounce, &[W0, W1]);
-        let mut caller = make_engine(b"W1AW", b"FN31", OpMode::AutoCq { parity: 0 }, &[W0]);
-        let w1aw = Callsign::encode(b"W1AW").unwrap();
+        let mut pouncer = make_engine(b"NQ6N", b"FN31", OpMode::Pounce, &[W0, W1]);
+        let mut caller = make_engine(b"NQ6N", b"FN31", OpMode::AutoCq { parity: 0 }, &[W0]);
+        let w1aw = Callsign::encode(b"NQ6N").unwrap();
         let k1abc = Callsign::encode(b"K1ABC").unwrap();
         let cold_ack1 = [Decoded {
             frame: Frame::Rx { sender: k1abc, recipient: w1aw, snr_db: -12, ack: true, reserved: false },

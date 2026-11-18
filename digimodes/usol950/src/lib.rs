@@ -64,7 +64,7 @@ mod tests {
 
     #[test]
     fn callsign_grid_and_snr_codec() {
-        for &call in &[b"W1AW".as_slice(), b"K1ABC", b"VE3XYZ", b"G4ABC", b"3D2AG", b"9A1A"] {
+        for &call in &[b"NQ6N".as_slice(), b"K1ABC", b"VE3XYZ", b"G4ABC", b"3D2AG", b"9A1A"] {
             let c = Callsign::encode(call).unwrap();
             let mut buf = [0u8; 6];
             let n = c.decode(&mut buf);
@@ -130,29 +130,29 @@ mod tests {
 
     #[test]
     fn worked_reference_vectors_and_tx_trajectory() {
-        let w1aw = Callsign::encode(b"W1AW").unwrap();
+        let nq6n = Callsign::encode(b"NQ6N").unwrap();
         let k1abc = Callsign::encode(b"K1ABC").unwrap();
         let fn31 = encode_grid4(b"FN31").unwrap();
 
-        let cq = Frame::Cq { sender: w1aw, grid4: fn31, tx_pwr: 10, reserved: 0 };
-        let rx_init = Frame::Rx { sender: k1abc, recipient: w1aw, snr_db: -14, ack: false, reserved: false };
-        let rx_ack = Frame::Rx { sender: w1aw, recipient: k1abc, snr_db: -11, ack: true, reserved: false };
+        let cq = Frame::Cq { sender: nq6n, grid4: fn31, tx_pwr: 10, reserved: 0 };
+        let rx_init = Frame::Rx { sender: k1abc, recipient: nq6n, snr_db: -14, ack: false, reserved: false };
+        let rx_ack = Frame::Rx { sender: nq6n, recipient: k1abc, snr_db: -11, ack: true, reserved: false };
 
         // Lock deterministic reference payload words, CRCs, and all 110 tone indices (matching sol950-design-v2.md §3).
         let cq_u64 = cq.pack_u64();
         let rx_u64 = rx_init.pack_u64();
-        assert_eq!(cq_u64, 0x0213_29EA_85BA_0000);
-        assert_eq!(crc14_u64(cq_u64), 0x11FA);
-        assert_eq!(rx_u64, 0x80F2_C508_2132_9EA8);
-        assert_eq!(crc14_u64(rx_u64), 0x35B8);
+        assert_eq!(cq_u64, 0x30DD_C102_85BA_0000);
+        assert_eq!(crc14_u64(cq_u64), 0x0648);
+        assert_eq!(rx_u64, 0x80F2_C50B_0DDC_1028);
+        assert_eq!(crc14_u64(rx_u64), 0x2375);
         assert_eq!(Frame::unpack_u64(cq_u64), Some(cq));
         assert_ne!(crc14_u64(0), 0, "all-zero payload must not have zero CRC");
 
         let cq_tones = encode_tones(cq);
         let rx_tones = encode_tones(rx_init);
         let ack_tones = encode_tones(rx_ack);
-        let want_cq = b"03013201233013313030320102300002030301330221123310002300312030303323023100111200333123033130123301200132310230";
-        let want_rx = b"03013233000023200030320121121301200230122233320110100331303312331330313123111322010112130203233200021113310230";
+        let want_cq = b"03013201033000332130320110001201300301003132130333202301032213222031210100301212221033100130032203101110310230";
+        let want_rx = b"03013233032031213030320122013131212101030023013320101000213221002133313103202003203320130130210302123202310230";
         for i in 0..N_SYMBOLS {
             assert_eq!(cq_tones[i], want_cq[i] - b'0', "CQ tone {i}");
             assert_eq!(rx_tones[i], want_rx[i] - b'0', "RX tone {i}");
@@ -209,7 +209,7 @@ mod tests {
 
     #[test]
     fn blind_overlapping_callers_with_skew_and_strong_neighbor_displacement() {
-        let w1aw = Callsign::encode(b"W1AW").unwrap();
+        let w1aw = Callsign::encode(b"NQ6N").unwrap();
         let k1abc = Callsign::encode(b"K1ABC").unwrap();
         let ve3xyz = Callsign::encode(b"VE3XYZ").unwrap();
 
@@ -329,7 +329,7 @@ mod tests {
 
     #[test]
     fn weak_signal_awgn_blind_decode_and_noise_rejection() {
-        let w1aw = Callsign::encode(b"W1AW").unwrap();
+        let w1aw = Callsign::encode(b"NQ6N").unwrap();
         let fn31 = encode_grid4(b"FN31").unwrap();
         let frame = Frame::Cq { sender: w1aw, grid4: fn31, tx_pwr: 10, reserved: 0 };
         let tones = encode_tones(frame);
@@ -392,7 +392,7 @@ mod tests {
 
     #[test]
     fn snr_calibration_regression_across_levels() {
-        let w1aw = Callsign::encode(b"W1AW").unwrap();
+        let w1aw = Callsign::encode(b"NQ6N").unwrap();
         let fn31 = encode_grid4(b"FN31").unwrap();
         let frame = Frame::Cq { sender: w1aw, grid4: fn31, tx_pwr: 10, reserved: 0 };
         let tones = encode_tones(frame);
@@ -402,13 +402,13 @@ mod tests {
         let mut rng = Rng(0xACE1_2468_1357_9BDF);
         let mut rx = Receiver::new();
 
-        // Average estimated SNR across 6 realizations at -15, -10, -5, and +3 dB (referenced to 2,500 Hz).
+        // Average estimated SNR across 8 realizations at -14, -10, -5, and +3 dB (referenced to 2,500 Hz).
         // Verify monotonic scaling and accuracy within +/- 3.0 dB (never saturating at +20 dB on weak signals).
-        for &want_db in &[-15i32, -10, -5, 3] {
+        for &want_db in &[-14i32, -10, -5, 3] {
             let amp = (2.0 * p_n_2500 * libm_pow10(want_db as f64 / 10.0)).sqrt() as i16;
             let mut sum_db = 0i32;
             let mut cnt = 0i32;
-            for _ in 0..6 {
+            for _ in 0..8 {
                 let mut pcm = std::vec![0i16; INPUT_RATE_HZ as usize * 10];
                 for s in &mut pcm {
                     *s = rng.gauss(sigma).clamp(-32_000.0, 32_000.0) as i16;
@@ -431,7 +431,7 @@ mod tests {
                     cnt += 1;
                 }
             }
-            assert!(cnt >= 5, "expected decodes at {want_db} dB, got {cnt}/6");
+            assert!(cnt >= 6, "expected decodes at {want_db} dB, got {cnt}/8");
             let mean_db = sum_db as f64 / cnt as f64;
             assert!(
                 (mean_db - want_db as f64).abs() <= 3.0,
@@ -461,7 +461,7 @@ mod tests {
         }
 
         let k1abc = Callsign::encode(b"K1ABC").unwrap();
-        let w1aw = Callsign::encode(b"W1AW").unwrap();
+        let w1aw = Callsign::encode(b"NQ6N").unwrap();
         let frame = Frame::Rx { sender: k1abc, recipient: w1aw, snr_db: -12, ack: false, reserved: false };
         let tones = encode_tones(frame);
 

@@ -2176,6 +2176,22 @@ fn txtest(t: &mut Toks) -> Result<Done, No> {
         Some(Tok::Word(w)) => {
             let signal = Signal::parse(w).ok_or_else(|| t.say_t(USAGE))?;
             let mut arm = Arm::new(signal);
+            if signal.is_sol950() {
+                if let Some(tok) = t.next()? {
+                    let Tok::Word(d) = tok else { return Err(t.say_t(USAGE)) };
+                    arm.baud = number(d).filter(|n| (1..=4095).contains(n)).ok_or_else(|| t.say_t(USAGE))? as u16;
+                    if signal.takes_level() {
+                        if let Some(tok2) = t.next()? {
+                            let Tok::Word(lv) = tok2 else { return Err(t.say_t(USAGE)) };
+                            arm.level = level(lv, t)?;
+                        }
+                    }
+                }
+                if t.next()?.is_some() {
+                    return Err(t.say_t(USAGE));
+                }
+                return Ok(Done::Debug(Job::new(Kind::TxTest(Ask::Set(Some(arm))))));
+            }
             if signal.takes_baud() {
                 arm.baud = match t.next()? {
                     Some(Tok::Word(b)) => number(b).filter(|n| (BAUD_MIN as u32..=BAUD_MAX as u32).contains(n)).ok_or_else(|| t.say_t(USAGE))? as u16,
