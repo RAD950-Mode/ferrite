@@ -54,6 +54,27 @@ const OFF_POLL_MS: u64 = 500;
 /// The fix is published at most this often (the module sends once a second, in several sentences).
 const PUBLISH_MS: u32 = 500;
 
+/// Monotonic 2 kHz (`0.5 ms`) tick of the first byte of the most recent 1 Hz NMEA burst (`> 400 ms` UART idle),
+/// latched in `USART3` RX ISR so slot timing removes `POLL_MS` (50 ms) polling jitter.
+static GPS_BURST_TICK: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static GPS_LAST_RX_TICK: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+#[inline(always)] // called from `usart3` ISR (fast flash)
+pub fn on_rx_isr() {
+    let t = Instant::now().as_ticks() as u32;
+    let prev = GPS_LAST_RX_TICK.swap(t, Relaxed);
+    if t.wrapping_sub(prev) >= 800 {
+        GPS_BURST_TICK.store(t, Relaxed);
+    }
+}
+
+/// Most recent NMEA burst-start timestamp in 2 kHz (`0.5 ms`) ticks (`0` until first burst).
+#[allow(dead_code)]
+#[inline(always)]
+pub fn last_burst_tick() -> u32 {
+    GPS_BURST_TICK.load(Relaxed)
+}
+
 /// GPS-22 (TX audit F15): PB10 driven low now, by the Radio task just before a key-up, as stock's PTT press does
 /// (0x0801C6D4) before its key-up; the GPS task's next look keeps it low while keyed, or hands it back.
 #[cfg(feature = "tx")]

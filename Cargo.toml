@@ -1,8 +1,8 @@
 [workspace]
 resolver = "2"
-members = ["crates/ferrite-core", "crates/ferrite-ui", "crates/ferrite-app", "crates/ferrite-store", "crates/ferrite-checks", "crates/ferrite-radio", "firmware", "reader", "restorer", "sim", "sim-web", "drivers/bus", "drivers/bk4829", "drivers/si4732", "drivers/st7789", "drivers/w25q", "drivers/keypad", "drivers/nmea", "digimodes/udsp", "digimodes/ufx25", "digimodes/uafsk", "digimodes/upocsag", "digimodes/udsc", "digimodes/uaprs"]
+members = ["crates/ferrite-core", "crates/ferrite-ui", "crates/ferrite-app", "crates/ferrite-store", "crates/ferrite-checks", "crates/ferrite-radio", "firmware", "reader", "restorer", "sim", "sim-web", "drivers/bus", "drivers/bk4829", "drivers/si4732", "drivers/st7789", "drivers/w25q", "drivers/keypad", "drivers/nmea", "digimodes/udsp", "digimodes/ufx25", "digimodes/uafsk", "digimodes/upocsag", "digimodes/udsc", "digimodes/uaprs", "digimodes/usol950"]
 # Plain `cargo test` / `cargo clippy` cover what runs on the PC; the firmware builds with `cargo fw` (radio only).
-default-members = ["crates/ferrite-core", "crates/ferrite-ui", "crates/ferrite-app", "crates/ferrite-store", "crates/ferrite-checks", "crates/ferrite-radio", "sim", "drivers/bus", "drivers/bk4829", "drivers/si4732", "drivers/st7789", "drivers/w25q", "drivers/keypad", "drivers/nmea", "digimodes/udsp", "digimodes/ufx25", "digimodes/uafsk", "digimodes/upocsag", "digimodes/udsc", "digimodes/uaprs"]
+default-members = ["crates/ferrite-core", "crates/ferrite-ui", "crates/ferrite-app", "crates/ferrite-store", "crates/ferrite-checks", "crates/ferrite-radio", "sim", "drivers/bus", "drivers/bk4829", "drivers/si4732", "drivers/st7789", "drivers/w25q", "drivers/keypad", "drivers/nmea", "digimodes/udsp", "digimodes/ufx25", "digimodes/uafsk", "digimodes/upocsag", "digimodes/udsc", "digimodes/uaprs", "digimodes/usol950"]
 
 [workspace.package]
 version = "0.9.3"
@@ -33,6 +33,7 @@ upocsag = { path = "digimodes/upocsag" }
 udsp = { path = "digimodes/udsp" }
 udsc = { path = "digimodes/udsc" }
 uaprs = { path = "digimodes/uaprs", default-features = false }
+usol950 = { path = "digimodes/usol950" }
 
 [profile.release]
 opt-level = "z"

@@ -128,7 +128,11 @@ extern "C" fn usart1() {
     hal::uart::isr(UART_BT)
 }
 extern "C" fn usart3() {
-    hal::uart::isr(UART_GPS)
+    let before = hal::uart::stats(UART_GPS).rx_bytes;
+    hal::uart::isr(UART_GPS);
+    if hal::uart::stats(UART_GPS).rx_bytes != before {
+        tasks::gps::on_rx_isr();
+    }
 }
 extern "C" fn uart4() {
     hal::uart::isr(UART_CPS)

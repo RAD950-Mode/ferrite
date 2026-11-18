@@ -108,7 +108,13 @@ Both frame types carry **64 payload bits + 14-bit CRC = 78 bits**, encoded to **
 - **`ACK` (1 bit in Type 1):**
   - `0` = **`RX` (Initial Report):** *"I decoded you; here is your SNR."*
   - `1` = **`R+RX` (Confirmed Report):** *"I decoded your report addressed to me; here is your SNR."*
-- **Worked Reference Test Vectors:** The `digimodes/usol950` crate publishes locked end-to-end reference vectors (`CQ` and `RX` human-readable inputs → 64-bit payload → 78-bit CRC-14 word [poly `0x2757`, init `0`] → 184-bit systematic LDPC codeword → interleaved dibits → 110 tone indices → reference PCM/IQ burst).
+- **Worked Reference Test Vectors (Frozen in `digimodes/usol950`):**
+  1. **`CQ` (`W1AW`, `FN31`, `tx_pwr = 10`, `reserved = 0`):**
+     - `payload_u64`: `0x0213_29EA_85BA_0000` · `crc14` (`poly 0x2757`, `init 0x3FFF`): `0x11FA`
+     - `tones[110]`: `03013201233013313030320102300002030301330221123310002300312030303323023100111200333123033130123301200132310230`
+  2. **`RX` (`K1ABC -> W1AW`, `snr_db = -14`, `ack = 0`, `reserved = 0`):**
+     - `payload_u64`: `0x80F2_C508_2132_9EA8` · `crc14`: `0x35B8`
+     - `tones[110]`: `03013233000023200030320121121301200230122233320110100331303312331330313123111322010112130203233200021113310230`
 
 ---
 

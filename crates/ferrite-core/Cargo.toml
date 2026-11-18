@@ -17,6 +17,7 @@ uafsk.workspace = true
 upocsag.workspace = true
 udsc.workspace = true
 udsp.workspace = true
+usol950.workspace = true
 
 [dev-dependencies]
 miniz_oxide = "0.8"

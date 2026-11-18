@@ -17,6 +17,7 @@ pub mod chipid;
 pub mod clocktree;
 pub mod cmdq;
 pub mod sha256;
+pub mod sol950;
 pub mod ssb;
 pub mod stuck;
 pub mod dcs;

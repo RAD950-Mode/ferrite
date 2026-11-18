@@ -429,6 +429,7 @@ dependencies = [
  "udsc",
  "udsp",
  "upocsag",
+ "usol950",
 ]
 
 [[package]]
@@ -1391,6 +1392,13 @@ version = "0.1.0"
 [[package]]
 name = "uradio-bus"
 version = "0.1.0"
+
+[[package]]
+name = "usol950"
+version = "0.1.0"
+dependencies = [
+ "udsp",
+]
 
 [[package]]
 name = "valuable"
