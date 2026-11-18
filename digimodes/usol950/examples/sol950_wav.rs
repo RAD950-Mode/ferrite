@@ -108,24 +108,11 @@ fn emit_wav(frame: Frame, audio_hz: u32, path: &str) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// Decode a WAV file without assuming the recording began on a 10-second UTC slot boundary:
-/// steps a 10.0 s window in `560 ms` (`7`-symbol) strides across the file (the receiver's internal `[-320, +360]` ms
-/// search spans `680 ms`, so `560 ms` strides cover every possible burst start time seamlessly with 120 ms overlap)
-/// and deduplicates bursts that appear in two overlapping windows.
-fn decode_wav(path: &str) -> ExitCode {
-    let data = match fs::read(path) {
-        Ok(d) => d,
-        Err(e) => {
-            eprintln!("failed to read {path}: {e}");
-            return ExitCode::from(1);
-        }
-    };
-    let Some((rate, samples)) = read_wav_mono16(&data) else {
-        eprintln!("{path}: expected 16-bit PCM mono WAV");
-        return ExitCode::from(1);
-    };
-    let pcm_24k = resample_to_24k(rate, &samples);
-
+/// Decode a 24 kHz PCM stream without assuming the recording began on a 10-second UTC slot boundary:
+/// steps a 10.0 s window in `560 ms` (`7`-symbol) strides while at least `8.88 s` (`80 ms` earliest sync offset +
+/// `8.80 s` 110-symbol burst) remains in the stream—continuing even after `win_start + 10.0 s` reaches EOF so a
+/// complete burst near the end of a capture (e.g. `6.10 s .. 14.90 s` in a `15.00 s` WAV) is never missed.
+fn decode_pcm_24k(pcm_24k: &[i16]) -> Vec<(i64, Decoded)> {
     let mut rx = Receiver::new();
     let dummy = Frame::Cq {
         sender: Callsign::from_raw(0).unwrap(),
@@ -134,30 +121,25 @@ fn decode_wav(path: &str) -> ExitCode {
         reserved: 0,
     };
     let slot_samples = (RATE_24K * 10) as usize;
-    let min_burst_samples = (RATE_24K as usize * 89) / 10; // 8.9 s minimum needed for a complete 8.8 s burst
+    let min_burst_samples = (RATE_24K as usize * 888) / 100; // 8.88 s = 0.08 s min start + 8.80 s burst
     let stride_samples = (RATE_24K as usize * 560) / 1000; // 560 ms stride (< 680 ms receiver window)
 
-    // `(burst_start_ms, Decoded)` deduplicated within +/- 1,000 ms for the same frame.
     let mut found: Vec<(i64, Decoded)> = Vec::new();
     let mut win_start = 0usize;
-    loop {
-        if win_start >= pcm_24k.len() {
+    while win_start < pcm_24k.len() {
+        let rem_total = pcm_24k.len() - win_start;
+        if win_start > 0 && rem_total < min_burst_samples {
             break;
         }
         let end = (win_start + slot_samples).min(pcm_24k.len());
         let slice = &pcm_24k[win_start..end];
-        if slice.len() < min_burst_samples && win_start > 0 {
-            break;
-        }
         rx.reset();
         for blk in slice.chunks(192) {
             rx.push_samples(blk);
         }
-        // Pad short tail up to 9.6 s so any burst starting near +0.08 s finishes all 110 symbols.
         if slice.len() < slot_samples {
-            let pad_needed = slot_samples - slice.len();
             let zeros = [0i16; 192];
-            let mut rem = pad_needed;
+            let mut rem = slot_samples - slice.len();
             while rem > 0 {
                 let n = rem.min(zeros.len());
                 rx.push_samples(&zeros[..n]);
@@ -173,21 +155,15 @@ fn decode_wav(path: &str) -> ExitCode {
                 found.push((burst_start_ms, *d));
             }
         }
-        if end == pcm_24k.len() {
+        if rem_total < min_burst_samples {
             break;
         }
         win_start += stride_samples;
     }
-
-    for (t_ms, d) in &found {
-        print_decoded(*t_ms, d);
-    }
-    println!("decoded {} frame(s) from {path} (input {rate} Hz, {} samples)", found.len(), samples.len());
-    ExitCode::SUCCESS
+    found
 }
 
-/// Measure peak continuous audio tone in `200..2,800 Hz` and `SNR_2500` for Gatekeeper Experiment 1 (carrier + BFO).
-fn measure_tone(path: &str) -> ExitCode {
+fn decode_wav(path: &str) -> ExitCode {
     let data = match fs::read(path) {
         Ok(d) => d,
         Err(e) => {
@@ -199,12 +175,21 @@ fn measure_tone(path: &str) -> ExitCode {
         eprintln!("{path}: expected 16-bit PCM mono WAV");
         return ExitCode::from(1);
     };
-    // Average Welch periodograms at the native sample rate (`N = rate` -> exact 1.000 Hz bin spacing, zero resampling
-    // filter droop on the noise floor).
+    let pcm_24k = resample_to_24k(rate, &samples);
+    let found = decode_pcm_24k(&pcm_24k);
+
+    for (t_ms, d) in &found {
+        print_decoded(*t_ms, d);
+    }
+    println!("decoded {} frame(s) from {path} (input {rate} Hz, {} samples)", found.len(), samples.len());
+    ExitCode::SUCCESS
+}
+
+/// Returns `(peak_hz, snr_2500_db, blocks, tone_present)`.
+fn analyze_tone_samples(rate: u32, samples: &[i16]) -> Option<(f64, f64, usize, bool)> {
     let n = rate as usize;
     if samples.len() < n || rate < 6_000 {
-        eprintln!("{path}: need at least 1.0 second of audio at >= 6 kHz");
-        return ExitCode::from(1);
+        return None;
     }
     let lo_bin = 200usize;
     let hi_bin = 2800usize.min(n / 2 - 2);
@@ -212,7 +197,6 @@ fn measure_tone(path: &str) -> ExitCode {
     let mut blocks = 0usize;
     for chunk in samples.chunks_exact(n) {
         blocks += 1;
-        // Direct Hann-windowed DFT over 200..=2801 Hz (fast on host for a few 1-second blocks, exact 1.000 Hz bins!).
         let mut w_chunk = vec![0.0f64; n];
         for (i, &s) in chunk.iter().enumerate() {
             let w = 0.5 * (1.0 - (2.0 * std::f64::consts::PI * i as f64 / n as f64).cos());
@@ -243,7 +227,6 @@ fn measure_tone(path: &str) -> ExitCode {
             peak_k = k;
         }
     }
-    // Parabolic log-magnitude interpolation for sub-0.1 Hz peak accuracy:
     let a = pwr[peak_k - 1].max(1.0).ln();
     let b = pwr[peak_k].max(1.0).ln();
     let c = pwr[peak_k + 1].max(1.0).ln();
@@ -251,7 +234,6 @@ fn measure_tone(path: &str) -> ExitCode {
     let delta = if denom.abs() > 1e-12 { 0.5 * (a - c) / denom } else { 0.0 };
     let peak_hz = peak_k as f64 + delta.clamp(-0.5, 0.5);
 
-    // Sum signal power over peak_k +/- 2 bins, and estimate noise spectral density from the remaining bins in 300..2800 Hz.
     let mut sig_plus_n = 0.0f64;
     let mut noise_sum = 0.0f64;
     let mut noise_bins = 0usize;
@@ -265,13 +247,37 @@ fn measure_tone(path: &str) -> ExitCode {
             noise_bins += 1;
         }
     }
-    // Parseval identity for 1-second Hann DFT: signal sum over peak +/- 2 bins is `(3/16) N^2 P_s`, and expected
-    // noise per bin is `(3/16) N^2 N_0` (one-sided PSD per Hz), so `(3/16) N^2` cancels identically!
     let noise_per_bin = noise_sum / noise_bins.max(1) as f64;
+    let peak_to_noise = if noise_per_bin > 0.0 { pwr[peak_k] / noise_per_bin } else { 0.0 };
+    // Over 2,500 bins of pure white noise, 99.99% extreme-value threshold is ~17x for B=1 s and < 6x for B >= 3 s.
+    let min_ratio = if blocks == 1 { 20.0 } else { 10.0 };
+    let tone_present = peak_to_noise >= min_ratio;
+
     let sig_pwr = (sig_plus_n - 5.0 * noise_per_bin).max(1e-9);
     let noise_2500 = noise_per_bin * 2500.0;
     let snr_2500_db = 10.0 * (sig_pwr / noise_2500.max(1e-9)).log10();
+    Some((peak_hz, snr_2500_db, blocks, tone_present))
+}
 
+/// Measure peak continuous audio tone in `200..2,800 Hz` and `SNR_2500` for Gatekeeper Experiment 1 (carrier + BFO).
+fn measure_tone(path: &str) -> ExitCode {
+    let data = match fs::read(path) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("failed to read {path}: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    let Some((rate, samples)) = read_wav_mono16(&data) else {
+        eprintln!("{path}: expected 16-bit PCM mono WAV");
+        return ExitCode::from(1);
+    };
+    let Some((peak_hz, snr_2500_db, blocks, tone_present)) = analyze_tone_samples(rate, &samples) else {
+        eprintln!("{path}: need at least 1.0 second of audio at >= 6 kHz");
+        return ExitCode::from(1);
+    };
+
+    println!("tone_found  = {}", if tone_present { "YES" } else { "NO (noise floor only)" });
     println!("peak_hz     = {peak_hz:.2} Hz");
     println!("snr_2500_db = {snr_2500_db:+.1} dB  (averaged over {blocks} s, input {rate} Hz)");
     ExitCode::SUCCESS
@@ -387,4 +393,62 @@ fn read_wav_mono16(b: &[u8]) -> Option<(u32, Vec<i16>)> {
         pos += len + (len & 1);
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn late_burst_at_6_10s_in_15s_wav_decodes() {
+        let w1aw = Callsign::encode(b"W1AW").unwrap();
+        let fn31 = encode_grid4(b"FN31").unwrap();
+        let frame = Frame::Cq { sender: w1aw, grid4: fn31, tx_pwr: 10, reserved: 0 };
+        let tones = encode_tones(frame);
+
+        // Place an 8.80 s burst starting at 6.10 s and ending at 14.90 s inside a 15.00 s 16 kHz capture
+        // (matching `ferrite_link.py PORT audio 15 ... --raw 16000`).
+        let fs = 16_000u32;
+        let mut pcm_16k = vec![0i16; (fs * 15) as usize];
+        let start = (6_100 * fs as usize) / 1000;
+        let mut m = Modulator::new(tones, fs, 1050, DEFAULT_SPACING_HZ, 10_000);
+        let mut idx = start;
+        while let Some(s) = m.next_sample() {
+            pcm_16k[idx] = s;
+            idx += 1;
+        }
+        assert_eq!(idx, (14_900 * fs as usize) / 1000);
+
+        let pcm_24k = resample_to_24k(fs, &pcm_16k);
+        let found = decode_pcm_24k(&pcm_24k);
+        assert_eq!(found.len(), 1, "6.10s..14.90s burst in 15.00s recording must decode once");
+        assert_eq!(found[0].1.frame, frame);
+        assert!((found[0].0 - 6_100).abs() <= 40, "expected start ~6100 ms, got {} ms", found[0].0);
+    }
+
+    #[test]
+    fn tone_analyzer_distinguishes_carrier_from_noise() {
+        let fs = 16_000u32;
+        let mut x = 0x1234_5678_9ABC_DEF0u64;
+        let mut next_noise = || -> i16 {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            (((x >> 16) as i32 & 0x3FF) - 512) as i16
+        };
+
+        let noise_only: Vec<i16> = (0..(fs * 5)).map(|_| next_noise()).collect();
+        let (_, _, _, present_noise) = analyze_tone_samples(fs, &noise_only).unwrap();
+        assert!(!present_noise, "noise-only capture must report tone_present = false");
+
+        let with_tone: Vec<i16> = (0..(fs * 5))
+            .map(|i| {
+                let c = (350.0 * (2.0 * std::f64::consts::PI * 1050.25 * i as f64 / fs as f64).cos()) as i16;
+                next_noise().saturating_add(c)
+            })
+            .collect();
+        let (hz, _, _, present_tone) = analyze_tone_samples(fs, &with_tone).unwrap();
+        assert!(present_tone, "carrier capture must report tone_present = true");
+        assert!((hz - 1050.25).abs() <= 0.15, "peak_hz {hz}");
+    }
 }

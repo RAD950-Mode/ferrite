@@ -45,10 +45,41 @@ pub const MAX_TRACKS: usize = 8;
 pub const MAX_DECODED: usize = 8;
 pub const LDPC_MAX_ITER: usize = 35;
 
-/// Data-symbol index (`62..92`, i.e. `rel_sym >= 74`, where linear drift exceeds half a bin) from which
-/// negative/positive linear drift branches diverge.
-const DRIFT_START_DATA: usize = 66;
-const TAIL_DATA_BITS: usize = (N_DATA_SYMS - DRIFT_START_DATA) * 2; // 52 bits
+/// Data-symbol index (`36..92`, i.e. `rel_sym = 48..104`) from which negative/positive linear drift branches diverge:
+/// - `rel_sym in 48..83` (`d in 36..71`, 35 symbols): `+/- 1` half-bin (`+/- 5.86 Hz`) intermediate correction
+/// - `rel_sym in 83..104` (`d in 71..92`, 21 symbols): `+/- 2` half-bins (`+/- 11.72 Hz`) end-of-burst correction
+pub const DRIFT_START_DATA: usize = 36;
+const TAIL_DATA_SYMS: usize = N_DATA_SYMS - DRIFT_START_DATA; // 56 dibits (packed 1 byte per dibit = 56 bytes)
+
+/// Half-bin drift magnitude (`0`, `1`, or `2`) applied along the negative/positive linear drift trajectories at
+/// burst-relative symbol `rel_sym in 0..110` (nearest-integer rounding of a `0 -> 2` half-bin ramp from `S0/S1`
+/// center `rel_sym = 12` to `S2` center `rel_sym = 107`).
+#[inline]
+pub const fn drift_step_half_bins(rel_sym: usize) -> u16 {
+    if rel_sym < 48 {
+        0
+    } else if rel_sym < 83 {
+        1
+    } else {
+        2
+    }
+}
+
+#[inline]
+fn pack_dibit_i4(b0: i8, b1: i8) -> u8 {
+    // Scale `[-24, +24]` by `/ 3` into signed 4-bit `[-8, +7]` nibbles.
+    let q0 = ((b0 as i16 + if b0 >= 0 { 1 } else { -1 }) / 3).clamp(-8, 7) as i8;
+    let q1 = ((b1 as i16 + if b1 >= 0 { 1 } else { -1 }) / 3).clamp(-8, 7) as i8;
+    (((q0 as u8) & 0x0F) << 4) | ((q1 as u8) & 0x0F)
+}
+
+#[inline]
+fn unpack_dibit_i4(packed: u8) -> (i8, i8) {
+    // Sign-extend 4-bit nibbles and restore `* 3` LLR scale (`[-24, +21]`).
+    let q0 = ((packed as i8) >> 4) * 3;
+    let q1 = (((packed << 4) as i8) >> 4) * 3;
+    (q0, q1)
+}
 
 /// Packed `i16` length holding `RING_SYMS * 2 * N_BINS = 9,600` bytes during capture, and reused at `finish_slot`
 /// for `post: [i16; 184]` + `c2v: [i8; 525]` LDPC belief-propagation scratch (`447` `i16` words < `4,800`).
@@ -106,10 +137,10 @@ struct Track {
     s2_scores: [i16; 3],
     /// Zero-drift LLRs across all 92 data symbols (`184` bits).
     llr_zero: [i8; N_BITS],
-    /// Second-half (`d = 40..92`) LLRs along negative linear drift (`-2` half-bins by `S2`).
-    llr_neg_tail: [i8; TAIL_DATA_BITS],
-    /// Second-half (`d = 40..92`) LLRs along positive linear drift (`+2` half-bins by `S2`).
-    llr_pos_tail: [i8; TAIL_DATA_BITS],
+    /// Packed 4-bit dibit LLRs for `d = 36..92` along negative linear drift (`-1` then `-2` half-bins).
+    llr_neg_tail: [u8; TAIL_DATA_SYMS],
+    /// Packed 4-bit dibit LLRs for `d = 36..92` along positive linear drift (`+1` then `+2` half-bins).
+    llr_pos_tail: [u8; TAIL_DATA_SYMS],
 }
 
 impl Track {
@@ -123,8 +154,8 @@ impl Track {
             off_pwr_sum: 0,
             s2_scores: [0; 3],
             llr_zero: [0; N_BITS],
-            llr_neg_tail: [0; TAIL_DATA_BITS],
-            llr_pos_tail: [0; TAIL_DATA_BITS],
+            llr_neg_tail: [0; TAIL_DATA_SYMS],
+            llr_pos_tail: [0; TAIL_DATA_SYMS],
         }
     }
 }
@@ -389,18 +420,19 @@ impl Receiver {
     fn feed_track_symbol(&mut self, tr_i: usize, rel_sym: usize, bins: &[u8; N_BINS]) {
         let q0 = self.tracks[tr_i].q0;
 
-        // Tail sync S2 (`104..110`): score the 3 drift endpoints `[-2, 0, +2]` half-bins (`-11.7, 0, +11.7 Hz`).
+        // Tail sync S2 (`104..110`): score the 3 drift endpoints `[-2, 0, +2]` half-bins (`-11.7, 0, +11.7 Hz`),
+        // including the raw energy tie-breaker so high-SNR frames don't tie at the +48 contrast ceiling.
         if rel_sym >= 104 {
             let k = rel_sym - 104;
             let w = S2[k] as usize;
             let q_neg = q0.saturating_sub(2);
             let q_pos = q0.saturating_add(2);
-            let c_neg = Self::contrast_sym(bins, q_neg, &self.tone_q_off, w).0 as i16;
-            let c_zero = Self::contrast_sym(bins, q0, &self.tone_q_off, w).0 as i16;
-            let c_pos = Self::contrast_sym(bins, q_pos, &self.tone_q_off, w).0 as i16;
-            self.tracks[tr_i].s2_scores[0] = self.tracks[tr_i].s2_scores[0].saturating_add(c_neg);
-            self.tracks[tr_i].s2_scores[1] = self.tracks[tr_i].s2_scores[1].saturating_add(c_zero);
-            self.tracks[tr_i].s2_scores[2] = self.tracks[tr_i].s2_scores[2].saturating_add(c_pos);
+            let (cn, wn) = Self::contrast_sym(bins, q_neg, &self.tone_q_off, w);
+            let (cz, wz) = Self::contrast_sym(bins, q0, &self.tone_q_off, w);
+            let (cp, wp) = Self::contrast_sym(bins, q_pos, &self.tone_q_off, w);
+            self.tracks[tr_i].s2_scores[0] = self.tracks[tr_i].s2_scores[0].saturating_add((cn * 4 + (wn >> 2)) as i16);
+            self.tracks[tr_i].s2_scores[1] = self.tracks[tr_i].s2_scores[1].saturating_add((cz * 4 + (wz >> 2)) as i16);
+            self.tracks[tr_i].s2_scores[2] = self.tracks[tr_i].s2_scores[2].saturating_add((cp * 4 + (wp >> 2)) as i16);
             return;
         }
 
@@ -429,23 +461,20 @@ impl Receiver {
         self.tracks[tr_i].llr_zero[2 * d] = b0;
         self.tracks[tr_i].llr_zero[2 * d + 1] = b1;
 
-        // Second half (`d = 40..92`, `rel_sym = 52..104`): also record negative and positive linear drift trajectories:
-        // `-1` / `+1` half-bin over `rel_sym = 52..78`, ramping to `-2` / `+2` half-bins over `rel_sym = 78..104`.
+        // Drift-divergent data symbols (`d = 36..92`, `rel_sym = 48..104`): record negative and positive linear
+        // drift trajectories using `drift_step_half_bins(rel_sym)` (`1` half-bin on `48..83`, `2` on `83..104`).
         if d >= DRIFT_START_DATA {
-            let step = if rel_sym < 78 { 1u16 } else { 2u16 };
+            let step = drift_step_half_bins(rel_sym);
             let (nb0, nb1) = Self::extract_dibit_llr(bins, q0.saturating_sub(step), &self.tone_q_off);
             let (pb0, pb1) = Self::extract_dibit_llr(bins, q0.saturating_add(step), &self.tone_q_off);
-            let ti = (d - DRIFT_START_DATA) * 2;
-            self.tracks[tr_i].llr_neg_tail[ti] = nb0;
-            self.tracks[tr_i].llr_neg_tail[ti + 1] = nb1;
-            self.tracks[tr_i].llr_pos_tail[ti] = pb0;
-            self.tracks[tr_i].llr_pos_tail[ti + 1] = pb1;
+            let ti = d - DRIFT_START_DATA;
+            self.tracks[tr_i].llr_neg_tail[ti] = pack_dibit_i4(nb0, nb1);
+            self.tracks[tr_i].llr_pos_tail[ti] = pack_dibit_i4(pb0, pb1);
         }
     }
 
     /// Run serial normalized min-sum LDPC + CRC-14 decoding across all admitted tracks at end of slot, reusing
-    /// `self.work` (`[i16; 4800]`) for both `post` (`184`) and `c2v` (`525`) scratch (`0` bytes of BP stack scratch)
-    /// and ranking drift branches by `S2`.
+    /// `self.work` (`[i16; 4800]`) for `post` (`184`) and `c2v` (`525`) scratch and ranking drift branches by `S2`.
     pub fn finish_slot(&mut self, out: &mut [Decoded; MAX_DECODED]) -> usize {
         let (post_slice, rest) = self.work.split_at_mut(N_BITS);
         let post: &mut [i16; N_BITS] = post_slice.try_into().unwrap();
@@ -463,7 +492,7 @@ impl Receiver {
             // (with small +6 tie-break bias toward zero drift when stationary).
             let sc = [
                 self.tracks[tr_i].s2_scores[0],
-                self.tracks[tr_i].s2_scores[1].saturating_add(6),
+                self.tracks[tr_i].s2_scores[1].saturating_add(16),
                 self.tracks[tr_i].s2_scores[2],
             ];
             let mut order = [1usize, 0, 2];
@@ -481,9 +510,19 @@ impl Receiver {
             for &branch in &order {
                 raw_llr.copy_from_slice(&self.tracks[tr_i].llr_zero);
                 if branch == 0 {
-                    raw_llr[DRIFT_START_DATA * 2..].copy_from_slice(&self.tracks[tr_i].llr_neg_tail);
+                    for (ti, &pk) in self.tracks[tr_i].llr_neg_tail.iter().enumerate() {
+                        let (b0, b1) = unpack_dibit_i4(pk);
+                        let bit_i = (DRIFT_START_DATA + ti) * 2;
+                        raw_llr[bit_i] = b0;
+                        raw_llr[bit_i + 1] = b1;
+                    }
                 } else if branch == 2 {
-                    raw_llr[DRIFT_START_DATA * 2..].copy_from_slice(&self.tracks[tr_i].llr_pos_tail);
+                    for (ti, &pk) in self.tracks[tr_i].llr_pos_tail.iter().enumerate() {
+                        let (b0, b1) = unpack_dibit_i4(pk);
+                        let bit_i = (DRIFT_START_DATA + ti) * 2;
+                        raw_llr[bit_i] = b0;
+                        raw_llr[bit_i + 1] = b1;
+                    }
                 }
                 for code_i in 0..N_BITS {
                     deinter[code_i] = raw_llr[interleave_idx(code_i)];
@@ -512,6 +551,26 @@ impl Receiver {
             n_out += 1;
         }
         n_out
+    }
+
+    #[cfg(test)]
+    pub(crate) fn top_track_drift_info(&self) -> Option<([i16; 3], usize, usize)> {
+        let tr = self.tracks.iter().find(|t| t.active)?;
+        let mut diff_step1 = 0usize;
+        let mut diff_step2 = 0usize;
+        for ti in 0..TAIL_DATA_SYMS {
+            let d = DRIFT_START_DATA + ti;
+            let (pb0, pb1) = unpack_dibit_i4(tr.llr_pos_tail[ti]);
+            let (z0, z1) = unpack_dibit_i4(pack_dibit_i4(tr.llr_zero[2 * d], tr.llr_zero[2 * d + 1]));
+            if (pb0, pb1) != (z0, z1) {
+                if d < 71 {
+                    diff_step1 += 1;
+                } else {
+                    diff_step2 += 1;
+                }
+            }
+        }
+        Some((tr.s2_scores, diff_step1, diff_step2))
     }
 }
 

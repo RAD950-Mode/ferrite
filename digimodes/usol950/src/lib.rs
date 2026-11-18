@@ -442,18 +442,66 @@ mod tests {
 
     #[test]
     fn swept_carrier_drift_uses_s2_branch() {
+        use crate::phy::data_sym_pos;
+        use crate::rx::{drift_step_half_bins, DRIFT_START_DATA};
+
+        // 1. Verify exact per-symbol drift trajectory transitions across all 92 data symbols:
+        //    - d in 0..36  (rel_sym  6..48): 0 half-bins
+        //    - d in 36..71 (rel_sym 48..83): 1 half-bin  (35 intermediate-step symbols)
+        //    - d in 71..92 (rel_sym 83..104): 2 half-bins (21 end-of-burst symbols)
+        assert_eq!(DRIFT_START_DATA, 36);
+        for d in 0..36 {
+            assert_eq!(drift_step_half_bins(data_sym_pos(d)), 0, "d={d}");
+        }
+        for d in 36..71 {
+            assert_eq!(drift_step_half_bins(data_sym_pos(d)), 1, "d={d} must use 1-half-bin intermediate step");
+        }
+        for d in 71..92 {
+            assert_eq!(drift_step_half_bins(data_sym_pos(d)), 2, "d={d} must use 2-half-bin final step");
+        }
+
         let k1abc = Callsign::encode(b"K1ABC").unwrap();
         let w1aw = Callsign::encode(b"W1AW").unwrap();
         let frame = Frame::Rx { sender: k1abc, recipient: w1aw, snr_db: -12, ack: false, reserved: false };
         let tones = encode_tones(frame);
 
+        // 2. Finite-SNR (-8 dB) +11.5 Hz and -11.5 Hz sweeps: verify S2 strictly prefers the matching drift sign
+        //    AND that both the 1-half-bin (d in 36..71) and 2-half-bin (d in 71..92) segments capture distinct
+        //    non-saturated shifted metrics relative to zero-drift.
+        let mut rng_clean = Rng(0x2468_ACE0_1357_9BDF);
+        for &(drift_mhz, expect_branch) in &[(11_500i64, 2usize), (-11_500i64, 0usize)] {
+            let mut pcm = std::vec![0i16; INPUT_RATE_HZ as usize * 10];
+            for s in &mut pcm {
+                *s = rng_clean.gauss(800.0).clamp(-32_000.0, 32_000.0) as i16;
+            }
+            let start_idx = (400 * INPUT_RATE_HZ as usize) / 1000;
+            let mut m = Modulator::with_drift_mhz(tones, INPUT_RATE_HZ, 1275, DEFAULT_SPACING_HZ, drift_mhz, 220);
+            let mut idx = start_idx;
+            while let Some(v) = m.next_sample() {
+                pcm[idx] = pcm[idx].saturating_add(v);
+                idx += 1;
+            }
+            let mut rx = Receiver::new();
+            for chunk in pcm.chunks(192) {
+                rx.push_samples(chunk);
+            }
+            let (s2, diff1, diff2) = rx.top_track_drift_info().expect("track acquired");
+            assert!(diff1 > 0, "1-half-bin segment (d=36..71) must diverge from zero-drift metrics");
+            assert!(diff2 > 0, "2-half-bin segment (d=71..92) must diverge from zero-drift metrics");
+            if expect_branch == 2 {
+                assert!(s2[2] > s2[1] && s2[2] > s2[0], "+11.5 Hz sweep must score highest at +2 half-bins: {s2:?}");
+            } else {
+                assert!(s2[0] > s2[1] && s2[0] > s2[2], "-11.5 Hz sweep must score highest at -2 half-bins: {s2:?}");
+            }
+        }
+
+        // 3. Noisy (-13 dB SNR_2500) +11.5 Hz and -11.5 Hz swept-carrier payload recovery.
         let sigma = 1_000.0;
         let p_n_2500 = sigma * sigma * (2500.0 / 12000.0);
-        let amp = (2.0 * p_n_2500 * libm_pow10(-13.0 / 10.0)).sqrt() as i16; // -13 dB SNR_2500
+        let amp = (2.0 * p_n_2500 * libm_pow10(-13.0 / 10.0)).sqrt() as i16;
         let mut rng = Rng(0x55AA_7733_9911_CCEE);
         let mut rx = Receiver::new();
 
-        // Test both +11.5 Hz and -11.5 Hz linear sweeps across the 8.8 s burst (~1 full FFT bin of drift!).
         for &drift_mhz in &[11_500i64, -11_500i64] {
             let mut ok = 0usize;
             for _ in 0..8 {
