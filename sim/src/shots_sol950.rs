@@ -109,6 +109,40 @@ pub fn run(scale: u32) {
         for c in &saved {
             h.store.save_contact(c);
         }
+
+        // Pre-fill 22.4 s (112 cols) of scrolling panafall with 3 active 4-FSK signals and 10 s slot edges.
+        for tick in 0..112u32 {
+            let slot_step = tick % 50; // 50 ticks x 200 ms = 10.0 s slot
+            let slot_edge = slot_step == 0;
+            let in_burst = (2..46).contains(&slot_step);
+            let mut col = [0u8; 12];
+            let mut seed = tick.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            for r in 0..24usize {
+                seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                let mut lvl = ((seed >> 29) & 3) as u8;
+                if in_burst {
+                    let sym_hop = (tick.wrapping_mul(7).wrapping_add(r as u32 * 3) >> 2) & 3;
+                    let sig = match r {
+                        7 => if sym_hop <= 1 { 14 } else { 9 },
+                        8 => if sym_hop >= 2 { 13 } else { 6 },
+                        11 => if sym_hop == 0 || sym_hop == 2 { 11 } else { 5 },
+                        12 => if sym_hop == 1 || sym_hop == 3 { 10 } else { 4 },
+                        15 => if sym_hop <= 1 { 9 } else { 4 },
+                        18 => if sym_hop == 2 { 8 } else { 3 },
+                        _ => 0,
+                    };
+                    if sig > lvl {
+                        lvl = sig;
+                    }
+                }
+                if (r & 1) == 0 {
+                    col[r >> 1] = lvl;
+                } else {
+                    col[r >> 1] |= lvl << 4;
+                }
+            }
+            h.wf.push(col, slot_edge);
+        }
     }
 
     // 1. Operate screen (activity list + status header)

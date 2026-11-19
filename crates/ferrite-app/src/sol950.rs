@@ -41,6 +41,75 @@ pub fn band_label(dial: Freq10) -> &'static str {
 /// Maximum GPS UTC uncertainty (ms) permitted to transmit on a 10 s slot edge (`docs/sol950-firmware-feature.md` §3).
 pub const MAX_TX_UNCERT_MS: u16 = 150;
 
+/// Scrolling horizontal panafall dimensions (`112` time slices x `24` frequency bins = `224 x 48 px` at 2x2 px/cell).
+/// At 5 slices/s (`200 ms`), the strip holds `22.4 s` (~2.2 SOL950 slots) scrolling right-to-left.
+pub const WF_COLS: usize = 112;
+pub const WF_ROWS: usize = 24;
+pub const WF_COL_BYTES: usize = WF_ROWS / 2; // 12 bytes (two 4-bit bins per byte)
+
+/// Compact right-to-left scrolling waterfall ring (`1,364` bytes, zero heap allocation).
+pub struct Sol950Waterfall {
+    cols: [[u8; WF_COL_BYTES]; WF_COLS],
+    slot_marks: [u8; WF_COLS / 8],
+    head: u8,
+    pub seq: u32,
+}
+
+impl Default for Sol950Waterfall {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Sol950Waterfall {
+    pub const fn new() -> Self {
+        Self {
+            cols: [[0; WF_COL_BYTES]; WF_COLS],
+            slot_marks: [0; WF_COLS / 8],
+            head: 0,
+            seq: 0,
+        }
+    }
+
+    pub fn clear(&mut self) {
+        self.cols = [[0; WF_COL_BYTES]; WF_COLS];
+        self.slot_marks = [0; WF_COLS / 8];
+        self.head = 0;
+        self.seq = self.seq.wrapping_add(1);
+    }
+
+    /// Append the newest 24-bin spectrum slice at the right edge (scrolling older columns left).
+    pub fn push(&mut self, col: [u8; WF_COL_BYTES], slot_edge: bool) {
+        let idx = self.head as usize;
+        self.cols[idx] = col;
+        let byte = idx >> 3;
+        let bit = 1u8 << (idx & 7);
+        if slot_edge {
+            self.slot_marks[byte] |= bit;
+        } else {
+            self.slot_marks[byte] &= !bit;
+        }
+        self.head = if idx + 1 == WF_COLS { 0 } else { (idx + 1) as u8 };
+        self.seq = self.seq.wrapping_add(1);
+    }
+
+    /// 4-bit intensity (`0..=15`) at screen column `x_col` (`0` = oldest/left, `WF_COLS - 1` = newest/right)
+    /// and frequency bin `row` (`0` = lowest ~586 Hz, `WF_ROWS - 1` = highest ~2,344 Hz).
+    #[inline]
+    pub fn level(&self, x_col: usize, row: usize) -> u8 {
+        let idx = (self.head as usize + x_col) % WF_COLS;
+        let b = self.cols[idx][row >> 1];
+        if (row & 1) == 0 { b & 0x0F } else { b >> 4 }
+    }
+
+    /// True if column `x_col` (`0` = left, `WF_COLS - 1` = right) marks a 10 s UTC slot boundary.
+    #[inline]
+    pub fn is_slot_mark(&self, x_col: usize) -> bool {
+        let idx = (self.head as usize + x_col) % WF_COLS;
+        (self.slot_marks[idx >> 3] & (1u8 << (idx & 7))) != 0
+    }
+}
+
 /// Effective grid source displayed in the SOL950 header and saved with contacts.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GridSource {
@@ -474,6 +543,8 @@ pub struct Sol950Host {
     pub notice_len: u8,
     /// Diagnostic counters copied from the DSP task: `[finishes, last_syms, last_tracks, total_decoded]`.
     pub diag: [u32; 4],
+    /// Live right-to-left scrolling passband panafall (`224 x 48 px`).
+    pub wf: Sol950Waterfall,
 }
 
 impl Default for Sol950Host {
@@ -516,6 +587,7 @@ impl Sol950Host {
             notice: [0; 28],
             notice_len: 0,
             diag: [0; 4],
+            wf: Sol950Waterfall::new(),
         }
     }
 

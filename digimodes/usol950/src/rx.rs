@@ -340,12 +340,14 @@ impl Track {
 pub struct Receiver {
     decim: Decimator<31>,
     pcm_ring: [i16; SYM_SAMPLES],
-    pcm_pos: usize,
+    pcm_pos: u16,
+    acquired: bool,
+    wf_ready: bool,
     decim_count: u32,
     tone_q_off: [u16; 4],
+    wf_col: [u8; 12],
     work: [i16; WORK_I16],
     tracks: [Track; MAX_TRACKS],
-    acquired: bool,
 }
 
 impl Receiver {
@@ -364,6 +366,8 @@ impl Receiver {
             work: [0; WORK_I16],
             tracks: [Track::empty(); MAX_TRACKS],
             acquired: false,
+            wf_ready: false,
+            wf_col: [0; 12],
         }
     }
 
@@ -385,6 +389,18 @@ impl Receiver {
         self.work.fill(0);
         self.tracks = [Track::empty(); MAX_TRACKS];
         self.acquired = false;
+        self.wf_ready = false;
+        self.wf_col = [0; 12];
+    }
+
+    /// Take the latest 24-bin (`586..2,344 Hz`) packed 4-bit waterfall column (emitted every `200 ms`).
+    pub fn take_wf_col(&mut self) -> Option<[u8; 12]> {
+        if self.wf_ready {
+            self.wf_ready = false;
+            Some(self.wf_col)
+        } else {
+            None
+        }
     }
 
     /// Diagnostic hook: bypass blind `S0 + S1` acquisition and pin track 0 to the nearest `(start_sym, phase, q0)`
@@ -464,8 +480,8 @@ impl Receiver {
     pub fn push_samples(&mut self, samples: &[i16]) {
         for &x in samples {
             if let Some(y) = self.decim.push(x, &DECIM_TAPS, DECIM_FACTOR) {
-                self.pcm_ring[self.pcm_pos] = y;
-                self.pcm_pos = if self.pcm_pos + 1 == SYM_SAMPLES { 0 } else { self.pcm_pos + 1 };
+                self.pcm_ring[self.pcm_pos as usize] = y;
+                self.pcm_pos = if self.pcm_pos as usize + 1 == SYM_SAMPLES { 0 } else { self.pcm_pos + 1 };
                 if self.acquired {
                     self.work[(self.decim_count as usize) % HIST_LEN] = y;
                 }
@@ -485,7 +501,7 @@ impl Receiver {
 
     fn on_half_symbol(&mut self, sym: usize, phase: usize) {
         let mut z = [0i16; FFT_N];
-        let mut idx = self.pcm_pos;
+        let mut idx = self.pcm_pos as usize;
         for (n, &w) in HANN_480.iter().enumerate() {
             let s = self.pcm_ring[idx] as i32;
             idx = if idx + 1 == SYM_SAMPLES { 0 } else { idx + 1 };
@@ -500,6 +516,35 @@ impl Receiver {
             cur_bins[out_i] = lp.clamp(0, 255) as u8;
             out_i += 1;
         });
+
+        // Emit a 24-bin (`586..2,344 Hz`) packed 4-bit waterfall column every 5 half-symbols (`200 ms`).
+        if (sym * 2 + phase).is_multiple_of(5) {
+            let mut sum = 0u32;
+            for &b in &cur_bins {
+                sum += b as u32;
+            }
+            let floor = (sum / N_BINS as u32) as i32;
+            let mut col = [0u8; 12];
+            for r in 0..24usize {
+                let lo = r * N_BINS / 24;
+                let hi = ((r + 1) * N_BINS / 24).max(lo + 1);
+                let mut pk = 0u8;
+                for &b in &cur_bins[lo..hi] {
+                    if b > pk {
+                        pk = b;
+                    }
+                }
+                // Map `floor..floor+45` (~0..17 dB above local passband floor) into `0..=15`.
+                let lvl = (((pk as i32 - floor + 2).max(0) * 15) / 42).clamp(0, 15) as u8;
+                if (r & 1) == 0 {
+                    col[r >> 1] = lvl;
+                } else {
+                    col[r >> 1] |= lvl << 4;
+                }
+            }
+            self.wf_col = col;
+            self.wf_ready = true;
+        }
 
         if !self.acquired {
             self.write_ring_bins(sym % RING_SYMS, phase, &cur_bins);
@@ -857,7 +902,7 @@ impl Receiver {
         self.work.fill(0);
         if self.decim_count as usize >= SYM_SAMPLES {
             let start_cnt = self.decim_count as usize - SYM_SAMPLES;
-            let mut r_idx = self.pcm_pos;
+            let mut r_idx = self.pcm_pos as usize;
             for i in 0..SYM_SAMPLES {
                 self.work[(start_cnt + i) % HIST_LEN] = self.pcm_ring[r_idx];
                 r_idx += 1;

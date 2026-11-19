@@ -271,6 +271,8 @@ pub struct SimCore {
     sol950_last_tx: Option<ferrite_core::sol950::usol950::Frame>,
     /// Counter for rotating simulated SOL950 stations in the interactive simulator.
     sol950_sim_idx: u8,
+    /// Last 200 ms panafall tick pushed to `Sol950Host::wf`.
+    sol950_wf_tick: u32,
 }
 
 /// One render pass as [`SimCore::watch_passes`] records it.
@@ -435,6 +437,7 @@ impl SimCore {
             sol950_tx_end_ms: None,
             sol950_last_tx: None,
             sol950_sim_idx: 0,
+            sol950_wf_tick: 0,
         };
         if owner_card {
             ferrite_app::sample::owner_card(s.app.settings_mut());
@@ -646,9 +649,42 @@ impl SimCore {
             let sat_t = if secs < 1_700_000_000 { ferrite_app::sat::SIM_T0 + now / 1000 } else { secs as u32 };
             let here = store.extra.fix.get().map(|f| (f.pos.lat, f.pos.lon, f.alt_m));
             app.sat_clock(Some(sat_t), true, here);
+            let sol_open = app.sol950_open();
             if let Some(h) = app.sol950_host_mut() {
                 let gps_grid = here.map(|(lat, lon, _)| ferrite_app::gpsdata::pos_to_grid4(lat, lon));
                 h.update_clock(sat_t, (now % 1000) as u16, 40, gps_grid);
+                let wf_tick = now / 200;
+                if sol_open && wf_tick != self.sol950_wf_tick {
+                    self.sol950_wf_tick = wf_tick;
+                    let slot_ms = (sat_t % 10) * 1000 + (now % 1000);
+                    let slot_edge = slot_ms < 220;
+                    let in_burst = (500..9_300).contains(&slot_ms);
+                    let mut col = [0u8; 12];
+                    let mut seed = wf_tick.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                    for r in 0..24usize {
+                        seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                        let mut lvl = ((seed >> 29) & 3) as u8;
+                        if in_burst {
+                            // 3 simulated 4-FSK signals hopping on the 225 Hz grid (rows 7, 11, 15).
+                            let hop0 = ((wf_tick.wrapping_mul(3) + r as u32) & 3) as usize;
+                            let active = match r {
+                                7..=8 if hop0 < 2 => 13,
+                                11..=12 if hop0 == 1 || hop0 == 2 => 10,
+                                15..=16 if hop0 == 2 || hop0 == 3 => 8,
+                                _ => 0,
+                            };
+                            if active > lvl {
+                                lvl = active;
+                            }
+                        }
+                        if (r & 1) == 0 {
+                            col[r >> 1] = lvl;
+                        } else {
+                            col[r >> 1] |= lvl << 4;
+                        }
+                    }
+                    h.wf.push(col, slot_edge);
+                }
             }
             if let Some((rf_freq, power, frame)) = app.sol950_take_tx() {
                 send(radio, ferrite_core::msg::RadioCmd::Sol950Tx { freq: rf_freq, power });

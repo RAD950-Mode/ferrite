@@ -1608,6 +1608,12 @@ async fn sol950_step(
             h.on_rx_frame(d);
         }
     }
+    if let Some(wf_col) = crate::chan::SOL950_WF.try_take() {
+        if let Some(h) = app.sol950_host_mut() {
+            let slot_edge = h.utc_sec != 0 && (h.utc_sec % 10 == 0) && h.utc_ms_in_sec < 250;
+            h.wf.push(wf_col, slot_edge);
+        }
+    }
     // Check live TX completion from the Radio task.
     #[cfg(feature = "tx")]
     if let Some(ok) = crate::chan::SOL950_TX_DONE.try_take() {

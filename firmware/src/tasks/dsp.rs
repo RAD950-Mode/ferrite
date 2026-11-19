@@ -580,6 +580,9 @@ pub async fn task() {
                     Stream::Raw(r) => r.chunk(&out[..n]),
                 }
                 feed(&mut slot, &out[..n], lvl.0.max(lvl.1), &mut heard, &mut since_cap);
+                if let Some(wf_col) = slot.sol950_take_wf() {
+                    crate::chan::SOL950_WF.signal(wf_col);
+                }
                 #[cfg(feature = "bench")]
                 WORK_MAX_US.fetch_max(crate::hal::time::cycles().wrapping_sub(t0) / mhz, Relaxed);
             }

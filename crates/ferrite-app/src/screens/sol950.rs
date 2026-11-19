@@ -7,7 +7,7 @@ use super::shared::*;
 use super::{Cx, Hints, View};
 use crate::chan::ChannelStore;
 use crate::keys::{KeyEvent, Press};
-use crate::sol950::{band_label, field_letters, GridSource, SavedContact, Sol950Store, SOL950_DIALS};
+use crate::sol950::{band_label, field_letters, GridSource, SavedContact, Sol950Store, SOL950_DIALS, WF_COLS, WF_ROWS};
 use crate::{App, Screen};
 use ferrite_core::freq::Freq10;
 use ferrite_core::keys::Key;
@@ -31,7 +31,7 @@ pub const PAGE_STATS: u8 = 5;
 pub const PAGE_GRIDS_OVERVIEW: u8 = 6;
 pub const PAGE_GRIDS_FIELD: u8 = 7;
 
-const OPERATE_ROWS: usize = 5;
+const OPERATE_ROWS: usize = 4;
 const LOG_ROWS: usize = 6;
 const SETUP_ROWS: usize = 8;
 const TOP_Y: i32 = w::SBAR_H;
@@ -488,6 +488,66 @@ impl Sol950Scr {
                 });
             }
         }
+        self.draw_panafall(app, lcd);
+    }
+
+    /// Scrolling right-to-left horizontal panafall of the `586..2,344 Hz` SOL950 grid (`224 x 48 px`) along the bottom.
+    fn draw_panafall(self, app: &mut App, lcd: &mut impl Panel) {
+        const WF_PALETTE: [u16; 16] = [
+            0x0000, 0x0821, 0x0864, 0x08C8, 0x114C, 0x11D1, 0x1A75, 0x1B39,
+            0x2439, 0x2554, 0x366D, 0x5728, 0x9FA4, 0xDF02, 0xFD60, 0xFFE6,
+        ];
+        let Some(h) = app.sol950_host() else { return };
+        let seq = h.wf.seq;
+        let slot_sec = if h.utc_sec == 0 { 0 } else { (h.utc_sec % 10) as u8 };
+        let wf_h = Mix::new().n(seq).n(slot_sec as u32).get();
+        if let Some(clear) = app.dirty_shape(R_NOTE, wf_h, true) {
+            let y0 = 210i32;
+            let wf_x = 12i32;
+            let wf_y = y0 + 18; // 228..276 (48 px tall)
+            let wf_w = (WF_COLS * 2) as i32; // 224 px (x = 12..236)
+            let wf_ht = (WF_ROWS * 2) as i32; // 48 px
+            redraw_box!(clear, lcd, (0, y0, W, 70, BG), {
+                lcd.fill(0, y0, W, 1, RULE);
+                lcd.text4(6, y0 + 14, b"586-2344 Hz  225Hz", &UI_12, DIM, BG);
+                let mut tr = Buf::<8>::new();
+                let _ = uwrite!(tr, "T+{}s", slot_sec);
+                lcd.text4(W - 40, y0 + 14, tr.as_bytes(), &UI_12, AMBER, BG);
+
+                // Subtle 225 Hz grid channel ticks along the left margin (every 3 rows ~ 220 Hz).
+                for ch in 0..8i32 {
+                    let ty = wf_y + ch * 6;
+                    lcd.fill(4, ty, 6, 1, RULE);
+                }
+                lcd.fill(wf_x - 1, wf_y - 1, wf_w + 2, 1, RULE);
+                lcd.fill(wf_x - 1, wf_y + wf_ht, wf_w + 2, 1, RULE);
+                lcd.fill(wf_x - 1, wf_y, 1, wf_ht, RULE);
+                lcd.fill(wf_x + wf_w, wf_y, 1, wf_ht, RULE);
+            });
+
+            // Stream the 224 x 48 panafall in one SPI window (inclusive x1/y1; high freq at top, newest at right).
+            if let Some(host) = app.sol950_host() {
+                lcd.window(wf_x, wf_y, wf_x + wf_w - 1, wf_y + wf_ht - 1);
+                let mut line = [0u16; WF_COLS * 2];
+                for r_top in 0..WF_ROWS {
+                    let bin = WF_ROWS - 1 - r_top;
+                    let is_grid_line = r_top % 3 == 0 && r_top > 0;
+                    for col in 0..WF_COLS {
+                        let lvl = host.wf.level(col, bin) as usize;
+                        let mut px = WF_PALETTE[lvl & 15];
+                        if host.wf.is_slot_mark(col) && lvl < 4 {
+                            px = 0x2945; // subtle vertical 10 s slot divider scrolling left
+                        } else if is_grid_line && lvl < 2 {
+                            px = 0x1082; // faint horizontal 225 Hz channel guide
+                        }
+                        line[col * 2] = px;
+                        line[col * 2 + 1] = px;
+                    }
+                    lcd.push_buf(&line);
+                    lcd.push_buf(&line);
+                }
+            }
+        }
     }
 
     fn draw_active(self, app: &mut App, lcd: &mut impl Panel, live: &LiveAll) {
@@ -552,6 +612,7 @@ impl Sol950Scr {
                 }
             });
         }
+        self.draw_panafall(app, lcd);
     }
 
     fn draw_setup(self, app: &mut App, lcd: &mut impl Panel) {

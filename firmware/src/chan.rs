@@ -40,6 +40,8 @@ pub static ALERTS: Channel<M, SameDecoded, 2> = Channel::new();
 
 /// SOL950 decoded frames from the DSP task (`DspCmd::Sol950Finish`) to the UI task.
 pub static SOL950_RX: Channel<M, ferrite_core::sol950::usol950::Decoded, 8> = Channel::new();
+/// Latest 24-bin packed 4-bit SOL950 waterfall slice (`200 ms` cadence) from DSP to UI.
+pub static SOL950_WF: Signal<M, [u8; 12]> = Signal::new();
 /// SOL950 frame staged by the UI task before sending `RadioCmd::Sol950Tx` (keeps `RadioCmd <= 8 B`).
 #[cfg(feature = "tx")]
 pub static SOL950_TX: Signal<M, ferrite_core::sol950::usol950::Frame> = Signal::new();

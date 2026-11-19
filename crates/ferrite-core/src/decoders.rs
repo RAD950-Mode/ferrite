@@ -118,6 +118,16 @@ impl Decoder {
         }
     }
 
+    /// Take the latest 24-bin packed 4-bit SOL950 panafall column (`200 ms` cadence).
+    pub fn sol950_take_wf(&mut self) -> Option<[u8; 12]> {
+        if self.kind == DecoderKind::Sol950 {
+            let d = unsafe { &mut *self.inner.sol950 };
+            d.take_wf_col()
+        } else {
+            None
+        }
+    }
+
     /// Finish the current 10 s SOL950 UTC slot, write decoded frames to `out`, and reset for the next slot.
     #[inline(never)]
     pub fn sol950_finish(&mut self, out: &mut [usol950::Decoded; usol950::MAX_DECODED]) -> usize {
