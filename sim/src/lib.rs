@@ -7,6 +7,7 @@ pub mod fake;
 pub mod fakegps;
 pub mod parts;
 pub mod simcore;
+pub mod sol950_wf;
 
 /// An RGB image (0xRRGGBB per pixel) as a PNG.
 #[cfg(not(target_arch = "wasm32"))]
