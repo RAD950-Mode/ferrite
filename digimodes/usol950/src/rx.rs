@@ -303,8 +303,18 @@ impl Receiver {
 
         if !self.acquired {
             self.write_ring_bins(sym % RING_SYMS, phase, &cur_bins);
+            // Spread the 18 `(s, phase)` acquisition searches across `sym = 24..=32` (1 per 40 ms half-symbol)
+            // so no single 8 ms audio DMA half ever stalls. `s = sym - 23` has all of `S0 (s..s+6)` and
+            // `S1 (s+18..s+24)` in the ring buffer right as `sym` finishes arriving!
+            if (24..=ACQUIRE_AT_SYM).contains(&sym) {
+                let s = sym - 23; // 1..=9 == MIN_START_SYM..=MAX_START_SYM
+                if sym == 24 && phase == 0 {
+                    self.acq_scratch_init();
+                }
+                self.acquire_step(s, phase);
+            }
             if sym == ACQUIRE_AT_SYM && phase == 1 {
-                self.acquire_candidates();
+                self.acquire_finish();
                 self.acquired = true;
             }
             return;
@@ -339,41 +349,111 @@ impl Receiver {
         }
     }
 
-    fn acquire_candidates(&mut self) {
+    // During acquisition (`sym = 24..=32`), `self.tracks[0..6].llr_zero` (unused until `acquire_finish`)
+    // stores `best_score[0..300]` (600 B across tracks 0..4) and `best_sp[0..300]` (300 B across tracks 4..6).
+    fn acq_scratch_init(&mut self) {
+        let min_bytes = i16::MIN.to_le_bytes();
+        for q in 0..300usize {
+            let b = q * 2;
+            self.tracks[b / N_BITS].llr_zero[b % N_BITS] = min_bytes[0] as i8;
+            self.tracks[(b + 1) / N_BITS].llr_zero[(b + 1) % N_BITS] = min_bytes[1] as i8;
+            self.tracks[4 + q / N_BITS].llr_zero[q % N_BITS] = 0;
+        }
+    }
+
+    #[inline]
+    fn acq_get_score(&self, q: usize) -> i16 {
+        let b = q * 2;
+        let lo = self.tracks[b / N_BITS].llr_zero[b % N_BITS] as u8;
+        let hi = self.tracks[(b + 1) / N_BITS].llr_zero[(b + 1) % N_BITS] as u8;
+        i16::from_le_bytes([lo, hi])
+    }
+
+    #[inline]
+    fn acq_set(&mut self, q: usize, sc: i16, sp: u8) {
+        let b = q * 2;
+        let bytes = sc.to_le_bytes();
+        self.tracks[b / N_BITS].llr_zero[b % N_BITS] = bytes[0] as i8;
+        self.tracks[(b + 1) / N_BITS].llr_zero[(b + 1) % N_BITS] = bytes[1] as i8;
+        self.tracks[4 + q / N_BITS].llr_zero[q % N_BITS] = sp as i8;
+    }
+
+    #[inline]
+    fn expand_half_bins(bins: &[u8; N_BINS]) -> [u8; N_BINS * 2] {
+        let mut h = [0u8; N_BINS * 2];
+        for b in 0..N_BINS {
+            let v0 = bins[b] as u16;
+            h[b * 2] = v0 as u8;
+            h[b * 2 + 1] = if b + 1 < N_BINS {
+                ((v0 + bins[b + 1] as u16 + 1) >> 1) as u8
+            } else {
+                v0 as u8
+            };
+        }
+        h
+    }
+
+    /// Score one `(s, phase)` pair against all `q0 in 0..n_q` using pre-expanded half-bins (~1.5 ms on 120 MHz M4).
+    fn acquire_step(&mut self, s: usize, phase: usize) {
         let max_q0 = ((N_BINS - 2) * 2).saturating_sub(self.tone_q_off[3] as usize) as u16;
+        let n_q = (max_q0 as usize + 1).min(300);
+        let o0 = self.tone_q_off[0] as usize;
+        let o1 = self.tone_q_off[1] as usize;
+        let o2 = self.tone_q_off[2] as usize;
+        let o3 = self.tone_q_off[3] as usize;
+        let mut s0_h = [[0u8; N_BINS * 2]; 6];
+        let mut s1_h = [[0u8; N_BINS * 2]; 6];
+        for k in 0..6 {
+            let b0 = self.read_ring_bins((s + k) % RING_SYMS, phase);
+            let b1 = self.read_ring_bins((s + 18 + k) % RING_SYMS, phase);
+            s0_h[k] = Self::expand_half_bins(&b0);
+            s1_h[k] = Self::expand_half_bins(&b1);
+        }
+        let sp = ((s as u8) << 1) | (phase as u8);
+        for q0 in 0..n_q {
+            let mut contrast = 0i32;
+            let mut raw_sum = 0i32;
+            for (k, &w) in S0.iter().enumerate() {
+                let row = &s0_h[k];
+                let e0 = row[q0 + o0] as i32;
+                let e1 = row[q0 + o1] as i32;
+                let e2 = row[q0 + o2] as i32;
+                let e3 = row[q0 + o3] as i32;
+                let arr = [e0, e1, e2, e3];
+                let want = arr[(w as usize) & 3];
+                contrast += (4 * want - (e0 + e1 + e2 + e3)).clamp(-48, 48);
+                raw_sum += want;
+            }
+            for (k, &w) in S1.iter().enumerate() {
+                let row = &s1_h[k];
+                let e0 = row[q0 + o0] as i32;
+                let e1 = row[q0 + o1] as i32;
+                let e2 = row[q0 + o2] as i32;
+                let e3 = row[q0 + o3] as i32;
+                let arr = [e0, e1, e2, e3];
+                let want = arr[(w as usize) & 3];
+                contrast += (4 * want - (e0 + e1 + e2 + e3)).clamp(-48, 48);
+                raw_sum += want;
+            }
+            let score = contrast * 8 + (raw_sum >> 4);
+            let sc = score.clamp(i16::MIN as i32 + 1, i16::MAX as i32) as i16;
+            if sc > self.acq_get_score(q0) {
+                self.acq_set(q0, sc, sp);
+            }
+        }
+    }
+
+    fn acquire_finish(&mut self) {
+        let max_q0 = ((N_BINS - 2) * 2).saturating_sub(self.tone_q_off[3] as usize) as u16;
+        let n_q = (max_q0 as usize + 1).min(300);
         let mut best_score = [i16::MIN; 300];
         let mut best_sp = [0u8; 300];
-        let n_q = (max_q0 as usize + 1).min(300);
-
-        for s in MIN_START_SYM..=MAX_START_SYM {
-            for phase in 0..2usize {
-                let mut s0_bins = [[0u8; N_BINS]; 6];
-                let mut s1_bins = [[0u8; N_BINS]; 6];
-                for k in 0..6 {
-                    s0_bins[k] = self.read_ring_bins((s + k) % RING_SYMS, phase);
-                    s1_bins[k] = self.read_ring_bins((s + 18 + k) % RING_SYMS, phase);
-                }
-                for q0 in 0..n_q {
-                    let mut contrast = 0i32;
-                    let mut raw_sum = 0i32;
-                    for (k, &w) in S0.iter().enumerate() {
-                        let (c, rw) = Self::contrast_sym(&s0_bins[k], q0 as u16, &self.tone_q_off, w as usize);
-                        contrast += c;
-                        raw_sum += rw;
-                    }
-                    for (k, &w) in S1.iter().enumerate() {
-                        let (c, rw) = Self::contrast_sym(&s1_bins[k], q0 as u16, &self.tone_q_off, w as usize);
-                        contrast += c;
-                        raw_sum += rw;
-                    }
-                    let score = contrast * 8 + (raw_sum >> 4);
-                    let sc = score.clamp(i16::MIN as i32 + 1, i16::MAX as i32) as i16;
-                    if sc > best_score[q0] {
-                        best_score[q0] = sc;
-                        best_sp[q0] = ((s as u8) << 1) | (phase as u8);
-                    }
-                }
-            }
+        for q in 0..n_q {
+            best_score[q] = self.acq_get_score(q);
+            best_sp[q] = self.tracks[4 + q / N_BITS].llr_zero[q % N_BITS] as u8;
+        }
+        for t in &mut self.tracks {
+            *t = Track::empty();
         }
 
         let mut chosen_n = 0usize;
