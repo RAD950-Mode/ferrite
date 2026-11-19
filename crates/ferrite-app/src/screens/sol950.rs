@@ -38,6 +38,7 @@ pub const PAGE_CHAT_PREVIEW: u8 = 11;
 pub const PAGE_CHAT_MORE: u8 = 12;
 pub const PAGE_DISTRESS: u8 = 13;
 pub const PAGE_OPERATE_MENU: u8 = 14;
+pub const PAGE_RENDEZVOUS: u8 = 15;
 
 const OPERATE_ROWS: usize = 4;
 const LOG_ROWS: usize = 6;
@@ -98,6 +99,7 @@ pub fn page_id(s: &Sol950Scr) -> &'static str {
         PAGE_CHAT_MORE => "rad950.chat_more",
         PAGE_DISTRESS => "rad950.distress",
         PAGE_OPERATE_MENU => "rad950.menu",
+        PAGE_RENDEZVOUS => "rad950.rendezvous",
         _ => "sol950.operate",
     }
 }
@@ -167,6 +169,7 @@ impl View for Sol950Scr {
             PAGE_CHAT_MORE => "RAD950 More",
             PAGE_DISTRESS => "RAD950 Distress",
             PAGE_OPERATE_MENU => "RAD950 Menu",
+            PAGE_RENDEZVOUS => "RAD950 Rendezvous",
             _ => "RAD950",
         }
     }
@@ -185,6 +188,7 @@ impl View for Sol950Scr {
             PAGE_CHAT_MORE => b"MORE",
             PAGE_DISTRESS => b"DISTRESS",
             PAGE_OPERATE_MENU => b"RAD MENU",
+            PAGE_RENDEZVOUS => b"RENDEZV",
             _ => b"RAD950",
         };
         b.set(t);
@@ -214,6 +218,7 @@ impl View for Sol950Scr {
             PAGE_CHAT_MORE => self.key_chat_more(app, e.key),
             PAGE_DISTRESS => self.key_distress(app, e.key),
             PAGE_OPERATE_MENU => self.key_operate_menu(app, e.key),
+            PAGE_RENDEZVOUS => self.key_rendezvous(app, e.key),
             _ => app.screen = Screen::Sol950(Sol950Scr::OPERATE),
         }
     }
@@ -262,8 +267,8 @@ impl View for Sol950Scr {
 
     fn tick(self, app: &mut App, _live: &LiveAll) {
         use ferrite_core::sol950::usol950::frame::encode_grid4;
-        // Apply pending Chat auto-QSY (on Accept) or auto-return to calling dial (on End).
-        if app.sol950_host_mut().is_some_and(|h| h.chat.take_retune()) {
+        // Apply pending Chat auto-QSY (on Accept), auto-return (on End), or Rendezvous band hop.
+        if app.sol950_host_mut().is_some_and(|h| h.chat.take_retune() || h.rdv.take_retune()) {
             app.sol950_retune();
         }
         if self.page != PAGE_DISTRESS || self.field != 1 || self.top < 3 {
@@ -319,6 +324,7 @@ impl View for Sol950Scr {
             PAGE_CHAT_MORE => self.draw_chat_more(app, lcd),
             PAGE_DISTRESS => self.draw_distress(app, lcd),
             PAGE_OPERATE_MENU => self.draw_operate_menu(app, lcd),
+            PAGE_RENDEZVOUS => self.draw_rendezvous(app, lcd, cx.live),
             _ => self.draw_operate(app, lcd, cx.live),
         }
     }
@@ -355,6 +361,7 @@ impl View for Sol950Scr {
             }
             PAGE_CHAT_PREVIEW => Hints::new(&[("OK", "Send"), ("BACK", "Back")]),
             PAGE_DISTRESS => Hints::new(&[(ARROWS_LR, "Change"), ("OK", "Send"), ("BACK", "Cancel")]),
+            PAGE_RENDEZVOUS => Hints::new(&[("OK", "Toggle"), ("1-4", "Bands"), ("BACK", "Back")]),
             _ => Hints::new(&[("BACK", "Back")]),
         }
     }
@@ -442,6 +449,10 @@ impl Sol950Scr {
             }
             Key::Digit(4) => {
                 app.screen = Screen::Sol950(Sol950Scr::GRIDS);
+                return;
+            }
+            Key::Digit(5) => {
+                app.screen = Screen::Sol950(Sol950Scr { page: PAGE_RENDEZVOUS, sel: 0, top: 0, field: 0, sub: 0 });
                 return;
             }
             Key::Star => {
@@ -2183,7 +2194,7 @@ impl Sol950Scr {
     }
 
     fn key_operate_menu(mut self, app: &mut App, k: Key) {
-        const ITEMS: u8 = 5;
+        const ITEMS: u8 = 6;
         match k {
             Key::Exit => {
                 app.screen = Screen::Sol950(Sol950Scr::OPERATE);
@@ -2193,15 +2204,16 @@ impl Sol950Scr {
             Key::Down => self.sel = (self.sel + 1) % ITEMS,
             Key::Menu => {
                 match self.sel {
-                    0 => app.screen = Screen::Sol950(Sol950Scr::ACTIVE),
-                    1 => app.screen = Screen::Sol950(Sol950Scr::SETUP),
-                    2 => {
+                    0 => app.screen = Screen::Sol950(Sol950Scr { page: PAGE_RENDEZVOUS, sel: 0, top: 0, field: 0, sub: 0 }),
+                    1 => app.screen = Screen::Sol950(Sol950Scr::ACTIVE),
+                    2 => app.screen = Screen::Sol950(Sol950Scr::SETUP),
+                    3 => {
                         if let Some(h) = app.sol950_host_mut() {
                             h.log_grid_filter = None;
                         }
                         app.screen = Screen::Sol950(Sol950Scr::LOG);
                     }
-                    3 => app.screen = Screen::Sol950(Sol950Scr::GRIDS),
+                    4 => app.screen = Screen::Sol950(Sol950Scr::GRIDS),
                     _ => {
                         app.screen = Screen::Sol950(Sol950Scr { page: PAGE_DISTRESS, sel: 0, top: 0, field: 0, sub: 0 });
                     }
@@ -2214,7 +2226,8 @@ impl Sol950Scr {
     }
 
     fn draw_operate_menu(self, app: &mut App, lcd: &mut impl Panel) {
-        const LABELS: [(&[u8], &[u8]); 5] = [
+        const LABELS: [(&[u8], &[u8]); 6] = [
+            (b"Rendezvous", b"5"),
             (b"Active QSO", b""),
             (b"Setup", b"*"),
             (b"Contact log", b"2"),
@@ -2229,7 +2242,7 @@ impl Sol950Scr {
             if app.dirty(R_ROW + i, rh) {
                 let y = y0 + i as i32 * row_h;
                 let bg = if selected { BLUE } else { BG };
-                let fg = if selected { BLUE_FG } else if i == 4 { AMBER } else { TEXT };
+                let fg = if selected { BLUE_FG } else if i == 5 { AMBER } else { TEXT };
                 let dim = if selected { BLUE_FG } else { DIM };
                 redraw_box!(true, lcd, (0, y, W, row_h, bg), {
                     lcd.text4(8, y + 22, label, &UI_14, fg, bg);
@@ -2238,6 +2251,271 @@ impl Sol950Scr {
                     }
                 });
             }
+        }
+    }
+
+    fn key_rendezvous(mut self, app: &mut App, k: Key) {
+        match k {
+            Key::Exit => {
+                app.screen = Screen::Sol950(Sol950Scr::OPERATE);
+                return;
+            }
+            Key::Up => self.sel = if self.sel == 0 { 2 } else { self.sel - 1 },
+            Key::Down => self.sel = (self.sel + 1) % 3,
+            Key::Digit(1) => {
+                if let Some(h) = app.sol950_host_mut() {
+                    h.rdv.toggle_band(0);
+                }
+            }
+            Key::Digit(2) => {
+                if let Some(h) = app.sol950_host_mut() {
+                    h.rdv.toggle_band(1);
+                }
+            }
+            Key::Digit(3) => {
+                if let Some(h) = app.sol950_host_mut() {
+                    h.rdv.toggle_band(2);
+                }
+            }
+            Key::Digit(4) => {
+                if let Some(h) = app.sol950_host_mut() {
+                    h.rdv.toggle_band(3);
+                }
+            }
+            Key::Left | Key::Right if self.sel == 2 => {
+                let dir: i32 = if k == Key::Left { -1 } else { 1 };
+                self.sub = (self.sub as i32 + dir).rem_euclid(4) as u8;
+            }
+            Key::Menu | Key::Left | Key::Right => {
+                let mut retune = false;
+                if let Some(h) = app.sol950_host_mut() {
+                    match self.sel {
+                        0 => {
+                            h.rdv.follow_schedule = !h.rdv.follow_schedule;
+                            // If already inside an active window, tune immediately when Follow turns ON.
+                            if h.rdv.follow_schedule {
+                                if let Some(win) = h.rdv.window_status(h.utc_sec) {
+                                    if win.is_now {
+                                        let di = crate::rad950_rdv::RDV_BANDS[win.band_idx as usize].dial_idx;
+                                        if h.profile.dial_idx != di {
+                                            h.profile.dial_idx = di;
+                                            h.sync_engine_config();
+                                            retune = true;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        1 => {
+                            h.rdv.call_listen_armed = !h.rdv.call_listen_armed;
+                        }
+                        _ => {
+                            h.rdv.toggle_band(self.sub);
+                        }
+                    }
+                }
+                if retune {
+                    app.sol950_retune();
+                }
+            }
+            _ => {}
+        }
+        app.screen = Screen::Sol950(self);
+    }
+
+    fn draw_rendezvous(self, app: &mut App, lcd: &mut impl Panel, live: &LiveAll) {
+        use crate::rad950_rdv::{RdvTurnPlan, RDV_BANDS};
+        let Some(h) = app.sol950_host() else { return };
+        let rdv = h.rdv;
+        let utc_sec = h.utc_sec;
+        let tx_now = matches!(live.mode, ModeLive::Sol950 { tx_active: true, .. }) || h.tx_in_flight;
+        let win = rdv.window_status(utc_sec);
+        let cur_slot = utc_sec / 10;
+        let sec_in_slot = (utc_sec % 10) as u8;
+        let sec_in_hour = (utc_sec % 3600) as u16;
+
+        let rh = Mix::new()
+            .n(utc_sec)
+            .n(tx_now as u32)
+            .n(rdv.band_mask as u32)
+            .n(rdv.follow_schedule as u32)
+            .n(rdv.call_listen_armed as u32)
+            .n(rdv.seed)
+            .n(self.sel as u32)
+            .n(self.sub as u32)
+            .get();
+        if app.dirty(R_TOP, rh) {
+            let y0 = TOP_Y;
+            redraw_box!(true, lcd, (0, y0, W, 268, BG), {
+                // 1. Header: NOW / NEXT band + dial + live countdown (or red TX flag)
+                let mut hdr = Buf::<24>::new();
+                let hdr_col = if let Some(w) = win {
+                    let b = RDV_BANDS[w.band_idx as usize];
+                    if w.is_now {
+                        let _ = uwrite!(hdr, "NOW {} ", b.label);
+                        push_khz3(&mut hdr, w.dial_hz10);
+                        GREEN
+                    } else {
+                        let _ = uwrite!(hdr, "NEXT {} ", b.label);
+                        push_khz3(&mut hdr, w.dial_hz10);
+                        AMBER
+                    }
+                } else {
+                    let _ = uwrite!(hdr, "Select a band");
+                    DIM
+                };
+                lcd.text4(8, y0 + 16, hdr.as_bytes(), &UI_14, hdr_col, BG);
+                if tx_now {
+                    draw_tx_flag(lcd, W - 36, y0 + 3);
+                } else if let Some(w) = win {
+                    let mm = w.countdown_s / 60;
+                    let ss = w.countdown_s % 60;
+                    let mut cd = Buf::<16>::new();
+                    if w.is_now {
+                        let _ = uwrite!(cd, "{}{}:{}{} left", mm / 10, mm % 10, ss / 10, ss % 10);
+                    } else {
+                        let _ = uwrite!(cd, "in {}{}:{}{}", mm / 10, mm % 10, ss / 10, ss % 10);
+                    }
+                    lcd.text4(W - 76, y0 + 16, cd.as_bytes(), &UI_12, hdr_col, BG);
+                }
+                lcd.fill(0, y0 + 23, W, 1, RULE);
+
+                // 2. Hourly 60-minute UTC band-hop timeline (y = y0 + 28 .. y0 + 82)
+                let ty = y0 + 38;
+                lcd.text4(8, ty, b"Hourly UTC band hops", &UI_12, DIM, BG);
+                let hh = (utc_sec / 3600) % 24;
+                let mm = (utc_sec / 60) % 60;
+                let ss = utc_sec % 60;
+                let mut clk = Buf::<12>::new();
+                let _ = uwrite!(clk, "{}{}:{}{}:{}{}Z", hh / 10, hh % 10, mm / 10, mm % 10, ss / 10, ss % 10);
+                lcd.text4(W - 66, ty, clk.as_bytes(), &UI_12, TEXT, BG);
+
+                let rx = 12i32;
+                let rw = 216i32; // 3.6 px per minute across 60 minutes
+                let ry = ty + 8;
+                let rht = 14i32;
+                lcd.fill(rx, ry, rw, rht, LINE);
+                for (i, b) in RDV_BANDS.iter().enumerate() {
+                    let bx = rx + (b.start_min as i32 * rw) / 60;
+                    let bw = (5 * rw) / 60; // 18 px
+                    let enabled = rdv.band_enabled(i as u8);
+                    let is_now = win.is_some_and(|w| w.is_now && w.band_idx == i as u8);
+                    let is_next = win.is_some_and(|w| !w.is_now && w.band_idx == i as u8);
+                    if is_now {
+                        lcd.fill(bx, ry, bw, rht, GREEN);
+                        lcd.fill(bx, ry, bw, 1, WHITE);
+                        lcd.fill(bx, ry + rht - 1, bw, 1, WHITE);
+                    } else if enabled {
+                        lcd.fill(bx, ry, bw, rht, BLUE);
+                        if is_next {
+                            lcd.fill(bx, ry, bw, 2, AMBER);
+                            lcd.fill(bx, ry + rht - 2, bw, 2, AMBER);
+                        }
+                    } else {
+                        lcd.fill(bx, ry, bw, 1, RULE);
+                        lcd.fill(bx, ry + rht - 1, bw, 1, RULE);
+                        lcd.fill(bx, ry, 1, rht, RULE);
+                        lcd.fill(bx + bw - 1, ry, 1, rht, RULE);
+                    }
+                    let lcol = if is_now { GREEN } else if is_next { AMBER } else if enabled { TEXT } else { DIM };
+                    lcd.text4(bx, ry + rht + 13, b.label.as_bytes(), &UI_12, lcol, BG);
+                }
+                // Live UTC playhead needle across the 60-minute rail
+                let px = rx + ((sec_in_hour as i32 * rw) / 3600).clamp(0, rw - 2);
+                lcd.fill(px - 1, ry - 4, 4, 3, AMBER);
+                lcd.fill(px, ry - 1, 2, rht + 2, WHITE);
+
+                // 3. Upcoming 6 ten-second turns & random 50/50 CQ/RX + clear-subchannel strip
+                let sy = ry + rht + 28;
+                lcd.text4(8, sy, b"Next turns (50/50)", &UI_12, DIM, BG);
+                let mut nt = Buf::<14>::new();
+                let _ = uwrite!(nt, "Turn in {}s", 10 - sec_in_slot);
+                lcd.text4(W - 76, sy, nt.as_bytes(), &UI_12, AMBER, BG);
+
+                let cy = sy + 7;
+                let cw = 34i32;
+                let ch = 46i32;
+                for k in 0..6usize {
+                    let s = cur_slot + k as u32;
+                    let cx = 12 + k as i32 * 36;
+                    let plan = rdv.plan_slot(s, 0xFF);
+                    let is_cq = matches!(plan, RdvTurnPlan::Cq { .. });
+                    let card_bg = if k == 0 && tx_now {
+                        RED
+                    } else if is_cq {
+                        0x4080 // dark warm amber/red tint
+                    } else {
+                        LINE
+                    };
+                    lcd.fill(cx, cy, cw, ch, card_bg);
+                    if k == 0 {
+                        // Bright frame on current turn
+                        lcd.fill(cx, cy, cw, 1, WHITE);
+                        lcd.fill(cx, cy + ch - 1, cw, 1, WHITE);
+                        lcd.fill(cx, cy, 1, ch, WHITE);
+                        lcd.fill(cx + cw - 1, cy, 1, ch, WHITE);
+                        let prog = ((sec_in_slot as i32 + 1) * (cw - 2)) / 10;
+                        lcd.fill(cx + 1, cy + ch - 3, prog, 2, if tx_now { WHITE } else { GREEN });
+                    } else if is_cq {
+                        lcd.fill(cx, cy, cw, 1, AMBER);
+                    }
+                    let sec_mark = ((s % 6) * 10) as u8;
+                    let mut sl = Buf::<4>::new();
+                    let _ = uwrite!(sl, ":{}{}", sec_mark / 10, sec_mark % 10);
+                    lcd.text4(cx + 6, cy + 12, sl.as_bytes(), &UI_12, if k == 0 { WHITE } else { DIM }, card_bg);
+                    match plan {
+                        RdvTurnPlan::Cq { hz, .. } => {
+                            let fg = if k == 0 && tx_now { WHITE } else { AMBER };
+                            lcd.text4(cx + 8, cy + 27, b"CQ", &UI_12B, fg, card_bg);
+                            let mut fb = Buf::<6>::new();
+                            let _ = uwrite!(fb, "{}", hz);
+                            lcd.text4(cx + 3, cy + 40, fb.as_bytes(), &UI_12, TEXT, card_bg);
+                        }
+                        RdvTurnPlan::Listen => {
+                            let fg = if k == 0 { BLUE } else { DIM };
+                            lcd.text4(cx + 8, cy + 27, b"RX", &UI_12B, fg, card_bg);
+                            let tag: &[u8] = if (s & 1) == 1 { b"odd" } else { b"mon" };
+                            lcd.text4(cx + 6, cy + 40, tag, &UI_12, DIM, card_bg);
+                        }
+                    }
+                }
+
+                // 4. Controls: Follow schedule, Call & listen, and 4 independent band checkboxes
+                let ky = cy + ch + 10;
+                for row in 0..3usize {
+                    let y = ky + row as i32 * 24;
+                    let selected = self.sel as usize == row;
+                    let bg = if selected { BLUE } else { BG };
+                    let fg = if selected { BLUE_FG } else { TEXT };
+                    lcd.fill(0, y, W, 23, bg);
+                    match row {
+                        0 => {
+                            lcd.text4(8, y + 16, b"Follow schedule", &UI_12, fg, bg);
+                            let v = if rdv.follow_schedule { b"ON".as_slice() } else { b"OFF" };
+                            let vc = if selected { BLUE_FG } else if rdv.follow_schedule { GREEN } else { DIM };
+                            lcd.text4(W - 44, y + 16, v, &UI_12B, vc, bg);
+                        }
+                        1 => {
+                            lcd.text4(8, y + 16, b"Call & listen", &UI_12, fg, bg);
+                            let v = if rdv.call_listen_armed { b"ARMED".as_slice() } else { b"OFF" };
+                            let vc = if selected { BLUE_FG } else if rdv.call_listen_armed { AMBER } else { DIM };
+                            lcd.text4(W - 56, y + 16, v, &UI_12B, vc, bg);
+                        }
+                        _ => {
+                            lcd.text4(8, y + 16, b"Bands:", &UI_12, fg, bg);
+                            for (bi, b) in RDV_BANDS.iter().enumerate() {
+                                let bx = 62 + bi as i32 * 43;
+                                let on = rdv.band_enabled(bi as u8);
+                                let focused = selected && self.sub as usize == bi;
+                                let pbg = if focused { WHITE } else if on { GREEN } else { LINE };
+                                let pfg = if focused || on { BG } else { DIM };
+                                lcd.fill(bx, y + 3, 38, 17, pbg);
+                                lcd.text4(bx + 7, y + 15, b.label.as_bytes(), &UI_12B, pfg, pbg);
+                            }
+                        }
+                    }
+                }
+            });
         }
     }
 }

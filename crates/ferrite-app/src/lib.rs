@@ -44,6 +44,7 @@ pub mod remote;
 pub mod sample;
 pub mod sat;
 pub mod rad950_chat;
+pub mod rad950_rdv;
 pub mod sol950;
 pub mod screens;
 pub mod slotctl;

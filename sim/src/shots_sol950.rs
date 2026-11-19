@@ -276,4 +276,23 @@ pub fn run(scale: u32) {
     press(&mut app, Key::Menu, &mut t); // Confirm -> shows 3x PTT hold prompt
     step(&mut app, &mut fb, &mut radio, 100, &mut t);
     crate::save(&fb, "sol950-distress", scale);
+
+    // 14. Automated Rendezvous visual (10m window active at :01:24 UTC, 10m+12m+17m selected, Follow ON, Call & listen ARMED)
+    press(&mut app, Key::Exit, &mut t); // Chat
+    press(&mut app, Key::Exit, &mut t); // Operate
+    press(&mut app, Key::Digit(5), &mut t); // Rendezvous
+    if let Some(h) = app.sol950_host_mut() {
+        h.rdv.band_mask = 0b1011; // 10m, 12m, 17m enabled; 15m disabled (no antenna)
+        h.rdv.follow_schedule = true;
+        h.rdv.call_listen_armed = true;
+    }
+    // Position UTC clock at 19:01:24Z (inside the 10m :00-:04 window, 4s into a 10s slot!)
+    let base_hour = (base_utc / 3600) * 3600;
+    let rdv_utc = base_hour + 84; // :01:24 UTC
+    if let Some(h) = app.sol950_host_mut() {
+        h.update_clock(rdv_utc, 0, 35, Some(*b"CM87"));
+    }
+    dev.clock_min = Some(((rdv_utc / 60) % 1440) as u16);
+    app.render(&mut fb, &radio.live, &dev, &store);
+    crate::save(&fb, "sol950-rendezvous", scale);
 }

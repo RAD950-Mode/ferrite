@@ -649,6 +649,8 @@ pub struct Sol950Host {
     pub last_coop: Option<CoopRxReport>,
     /// Conversation extension session state (`docs/sol950-conversation-extension.md`).
     pub chat: crate::rad950_chat::ChatState,
+    /// Ad-hoc hourly UTC rendezvous state (`docs/sol950-rendezvous-addendum.md`).
+    pub rdv: crate::rad950_rdv::RdvState,
 }
 
 impl Default for Sol950Host {
@@ -704,6 +706,7 @@ impl Sol950Host {
             last_soft: None,
             last_coop: None,
             chat: crate::rad950_chat::ChatState::new(),
+            rdv: crate::rad950_rdv::RdvState::new(),
         }
     }
 
@@ -723,6 +726,9 @@ impl Sol950Host {
 
     /// Push the current profile + effective grid into the underlying `Engine`.
     pub fn sync_engine_config(&mut self) {
+        if let Some(c) = self.profile.callsign() {
+            self.rdv.set_seed_from_call(c.raw());
+        }
         let my_call = self.profile.callsign().unwrap_or_else(|| Callsign::from_raw(0).unwrap());
         let (grid_bytes, src) = self.profile.effective_grid(self.gps_grid);
         let my_grid4 = if src == GridSource::Unset {
@@ -813,6 +819,15 @@ impl Sol950Host {
                 return;
             }
             let plan = self.engine.begin_slot(slot, utc_ok);
+            let has_active_qso =
+                matches!(plan, SlotPlan::Tx { .. }) || !matches!(self.engine.mode(), OpMode::Monitor);
+            let (new_dial, rdv_cq_hz) =
+                self.rdv.on_slot_start(utc_sec, slot, has_active_qso, self.profile.dial_idx, 0xFF);
+            if let Some(di) = new_dial {
+                self.profile.dial_idx = di;
+                self.sync_engine_config();
+                self.rx_slot_dial_hz = self.active_dial().saturating_mul(10);
+            }
             if let SlotPlan::Tx { window, subchannel_hz, frame } = plan {
                 if utc_ok && !self.tx_in_flight {
                     let rf_freq = window.saturating_add(subchannel_hz as u32 / 10);
@@ -826,6 +841,19 @@ impl Sol950Host {
                         self.set_notice(b"Waiting for GPS UTC");
                     } else if self.profile.callsign().is_none() {
                         self.set_notice(b"Set callsign in Setup");
+                    }
+                }
+            } else if let Some(subch_hz) = rdv_cq_hz {
+                if utc_ok && !self.tx_in_flight && self.profile.coop_rx != CoopRxMode::Capture {
+                    if let Some(me) = self.profile.callsign() {
+                        let (g4_bytes, _) = self.profile.effective_grid(self.gps_grid);
+                        let grid4 = ferrite_core::sol950::usol950::frame::encode_grid4(&g4_bytes).unwrap_or(0);
+                        let frame = Frame::Cq { sender: me, grid4, tx_pwr: self.profile.tx_power, reserved: 0 };
+                        let rf_freq = self.profile.dial().saturating_add(subch_hz as u32 / 10);
+                        self.tx_subch_hz = subch_hz;
+                        self.tx_tones = ferrite_core::sol950::usol950::encode_tones(frame);
+                        self.pending_tx = Some((rf_freq, self.profile.tx_power, frame));
+                        self.finish_sent_slot = slot;
                     }
                 }
             }
