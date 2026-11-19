@@ -635,6 +635,8 @@ pub struct Sol950Host {
     tx_wf_tick: u32,
     /// Most recent failed-CRC soft candidate `(slot, SoftCandidate)` for Cooperative RX host capture.
     pub last_soft: Option<(u32, SoftCandidate)>,
+    /// Conversation extension session state (`docs/sol950-conversation-extension.md`).
+    pub chat: crate::rad950_chat::ChatState,
 }
 
 impl Default for Sol950Host {
@@ -682,6 +684,7 @@ impl Sol950Host {
             tx_tones: [0; ferrite_core::sol950::usol950::phy::N_SYMBOLS],
             tx_wf_tick: u32::MAX,
             last_soft: None,
+            chat: crate::rad950_chat::ChatState::new(),
         }
     }
 
@@ -766,6 +769,18 @@ impl Sol950Host {
             }
             self.last_slot = slot;
             let utc_ok = self.utc_ready() && self.profile.callsign().is_some();
+            if self.chat.is_open() {
+                if let Some(frame) = self.chat.on_slot_start(slot, utc_ok) {
+                    if utc_ok && !self.tx_in_flight {
+                        let subchannel_hz = 1300u16;
+                        let rf_freq = self.profile.dial().saturating_add(subchannel_hz as u32 / 10);
+                        self.tx_subch_hz = subchannel_hz;
+                        self.tx_tones = ferrite_core::sol950::usol950::encode_tones(frame);
+                        self.pending_tx = Some((rf_freq, self.profile.tx_power, frame));
+                    }
+                }
+                return;
+            }
             let plan = self.engine.begin_slot(slot, utc_ok);
             if let SlotPlan::Tx { window, subchannel_hz, frame } = plan {
                 if utc_ok && !self.tx_in_flight {
@@ -832,9 +847,12 @@ impl Sol950Host {
     }
 
     pub fn on_rx_frame(&mut self, d: Decoded) {
+        let slot = if self.last_slot == u32::MAX { 0 } else { self.last_slot };
+        if self.chat.on_rx_frame(d.frame, slot) {
+            return;
+        }
         let mut logs = [None; 4];
         let w = self.profile.dial();
-        let slot = if self.last_slot == u32::MAX { 0 } else { self.last_slot };
         let n = self.engine.on_rx_frames(slot, w, &[d], &mut logs);
         if n > 0 {
             if let Some(rec) = logs[0] {
@@ -845,6 +863,10 @@ impl Sol950Host {
 
     pub fn on_tx_done(&mut self, ok: bool) {
         self.tx_in_flight = false;
+        if self.chat.is_open() {
+            self.chat.on_tx_done(ok);
+            return;
+        }
         let slot = if self.last_slot == u32::MAX { 0 } else { self.last_slot };
         if ok {
             if let Some(rec) = self.engine.confirm_tx_completed(slot) {

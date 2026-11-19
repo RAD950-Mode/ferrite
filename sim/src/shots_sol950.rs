@@ -187,4 +187,68 @@ pub fn run(scale: u32) {
     press(&mut app, Key::Menu, &mut t);
     step(&mut app, &mut fb, &mut radio, 100, &mut t);
     crate::save(&fb, "sol950-grids-field", scale);
+
+    // 9. Chat conversation flow via real keypad navigation:
+    //    Operate -> OK (answer K1ABC) -> TX report -> peer R+RX saves QSO -> 2 (Chat) -> peer Accept + Question
+    press(&mut app, Key::Exit, &mut t);
+    press(&mut app, Key::Exit, &mut t);
+    step(&mut app, &mut fb, &mut radio, 60, &mut t);
+    press(&mut app, Key::Menu, &mut t); // Active QSO with K1ABC (Answering)
+    t = (t / 10_000 + 1) * 10_000 + 100; // advance to our TX slot
+    step(&mut app, &mut fb, &mut radio, 60, &mut t);
+    if let Some(h) = app.sol950_host_mut() {
+        h.on_tx_done(true); // our report finished transmitting
+    }
+    t = (t / 10_000 + 1) * 10_000 + 100; // advance to peer's reply slot
+    step(&mut app, &mut fb, &mut radio, 60, &mut t);
+    if let Some(h) = app.sol950_host_mut() {
+        let peer = Callsign::encode(b"K1ABC").unwrap();
+        let me = Callsign::encode(b"NQ6N").unwrap();
+        h.on_rx_frame(Decoded {
+            frame: Frame::Rx { sender: peer, recipient: me, snr_db: -13, ack: true, reserved: false },
+            audio_hz: 1130,
+            time_offset_ms: 20,
+            snr_db: -14,
+        });
+    }
+    step(&mut app, &mut fb, &mut radio, 60, &mut t);
+    press(&mut app, Key::Digit(2), &mut t); // 2 Chat -> sends Invite & opens CHAT
+    if let Some(h) = app.sol950_host_mut() {
+        use ferrite_core::sol950::usol950::chat::{encode_chat_frame, ChatBody, ChatCtrl, ChatPacket};
+        let sref = h.chat.session_ref;
+        for (seq, body) in [
+            (0u8, ChatBody::Ctrl(ChatCtrl::Accept)),
+            (1u8, ChatBody::Question { topic: 0, variant: 0 }),
+        ] {
+            h.on_rx_frame(Decoded {
+                frame: encode_chat_frame(ChatPacket { session_ref: sref, seq, body }),
+                audio_hz: 1130,
+                time_offset_ms: 20,
+                snr_db: -12,
+            });
+        }
+    }
+    step(&mut app, &mut fb, &mut radio, 60, &mut t);
+
+    // 10. Chat Reply menu (context-aware: "My station" auto-highlighted because peer asked about antenna!)
+    press(&mut app, Key::Menu, &mut t);
+    step(&mut app, &mut fb, &mut radio, 100, &mut t);
+    crate::save(&fb, "sol950-chat-reply", scale);
+
+    // Queue My station card (OK -> Preview, OK -> Queue TX -> returns to CHAT)
+    press(&mut app, Key::Menu, &mut t);
+    press(&mut app, Key::Menu, &mut t);
+    // Position clock at +4 s into the peer's slot so "TX in 6s" is clearly displayed.
+    t = (t / 10_000) * 10_000 + 4_000;
+    step(&mut app, &mut fb, &mut radio, 100, &mut t);
+    crate::save(&fb, "sol950-chat", scale);
+
+    // 11. Chat Preview screen for multi-burst typed message ("HEY MATT HOW HAVE YOU BEEN?", 6 bursts ~1m 49s)
+    press(&mut app, Key::Menu, &mut t); // Reply
+    press(&mut app, Key::Menu, &mut t); // Preview
+    if let Some(h) = app.sol950_host_mut() {
+        h.chat.set_literal_draft(b"HEY MATT HOW HAVE YOU BEEN?");
+    }
+    step(&mut app, &mut fb, &mut radio, 100, &mut t);
+    crate::save(&fb, "sol950-chat-preview", scale);
 }

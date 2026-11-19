@@ -52,10 +52,11 @@ pub enum TextFor {
     ContactName,
     /// 0 5 9 9: who auto reply answers (APRS-57.1): capitals, digits and `-`, * typing the wildcard.
     ReplyTo,
-    /// SOL950 Setup: base callsign (up to 6 chars), optional prefix (up to 4 chars), manual 4-char grid.
+    /// RAD950 Setup & Chat: base callsign (up to 6 chars), optional prefix (up to 4), manual grid (4), short chat message (up to 40).
     Sol950Call,
     Sol950Prefix,
     Sol950Grid,
+    Sol950Chat,
 }
 
 /// What a text takes: any text, a channel name (the name set, CHAN-31), capitals and digits (a callsign, a grid
@@ -90,6 +91,7 @@ impl TextFor {
             TextFor::Sol950Call => "RAD950 call",
             TextFor::Sol950Prefix => "RAD950 prefix",
             TextFor::Sol950Grid => "RAD950 grid",
+            TextFor::Sol950Chat => "Chat message",
         }
     }
 
@@ -102,6 +104,7 @@ impl TextFor {
             TextFor::GridFixed | TextFor::GridWaypoint => 6,
             TextFor::Sol950Call => 6,
             TextFor::Sol950Prefix | TextFor::Sol950Grid => 4,
+            TextFor::Sol950Chat => 40,
             TextFor::Capcode => 7,
             TextFor::Clock => 12,
             _ => 16,
@@ -135,6 +138,7 @@ impl TextFor {
             TextFor::Sol950Call => app.sol950_host().map_or(Buf::new(), |h| Buf::from(h.profile.base_call_bytes())),
             TextFor::Sol950Prefix => app.sol950_host().map_or(Buf::new(), |h| Buf::from(&h.profile.prefix[..h.profile.prefix_len as usize])),
             TextFor::Sol950Grid => app.sol950_host().map_or(Buf::new(), |h| Buf::from(&h.profile.manual_grid)),
+            TextFor::Sol950Chat => Buf::new(),
         }
     }
 
@@ -501,6 +505,17 @@ fn keep(to: TextFor, app: &mut App, store: &impl ChannelStore) {
                 h.profile_dirty = true;
                 h.sync_engine_config();
             }
+        }
+        TextFor::Sol950Chat => {
+            if t.as_bytes().is_empty() {
+                return app.show_toast(b"Chat message", b"Type a short message", false);
+            }
+            if let Some(h) = app.sol950_host_mut() {
+                h.chat.set_literal_draft(t.as_bytes());
+            }
+            app.back();
+            app.screen = Screen::Sol950(super::sol950::Sol950Scr::CHAT_PREVIEW);
+            return;
         }
     }
     app.back();

@@ -721,6 +721,49 @@ impl SimCore {
                                     snr_db: -14,
                                 });
                             }
+                            Frame::ExtFrag { .. } => {
+                                use ferrite_core::sol950::usol950::chat::{
+                                    decode_chat_frame, encode_chat_frame, ChatBody, ChatCtrl, ChatPacket, StationCard,
+                                };
+                                if let Some(pkt) = decode_chat_frame(tx_frame) {
+                                    let mut feed = |seq: u8, body: ChatBody| {
+                                        let reply = encode_chat_frame(ChatPacket {
+                                            session_ref: pkt.session_ref,
+                                            seq: seq & 7,
+                                            body,
+                                        });
+                                        h.on_rx_frame(Decoded {
+                                            frame: reply,
+                                            audio_hz: 1130,
+                                            time_offset_ms: 20,
+                                            snr_db: -12,
+                                        });
+                                    };
+                                    match pkt.body {
+                                        ChatBody::Ctrl(ChatCtrl::Invite) => {
+                                            feed(0, ChatBody::Ctrl(ChatCtrl::Accept));
+                                            feed(1, ChatBody::Question { topic: 0, variant: 0 });
+                                        }
+                                        ChatBody::Station(_) => {
+                                            feed(pkt.seq, ChatBody::Ctrl(ChatCtrl::Ack { ack_seq: pkt.seq, frag_mask: 1 }));
+                                            feed(pkt.seq.wrapping_add(1), ChatBody::Phrase(0));
+                                        }
+                                        ChatBody::Question { .. } => {
+                                            feed(pkt.seq, ChatBody::Ctrl(ChatCtrl::Ack { ack_seq: pkt.seq, frag_mask: 1 }));
+                                            feed(pkt.seq.wrapping_add(1), ChatBody::Station(StationCard::DEFAULT_RT950));
+                                        }
+                                        ChatBody::Phrase(_) => {
+                                            feed(pkt.seq, ChatBody::Ctrl(ChatCtrl::Ack { ack_seq: pkt.seq, frag_mask: 1 }));
+                                            feed(pkt.seq.wrapping_add(1), ChatBody::Phrase(2));
+                                        }
+                                        ChatBody::LiteralFrag { is_final: true, .. } => {
+                                            feed(pkt.seq, ChatBody::Ctrl(ChatCtrl::Ack { ack_seq: pkt.seq, frag_mask: 0x3F }));
+                                            feed(pkt.seq.wrapping_add(1), ChatBody::Phrase(2));
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                            }
                             _ => {}
                         }
                     } else {

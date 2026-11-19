@@ -7,6 +7,7 @@ use super::shared::*;
 use super::{Cx, Hints, View};
 use crate::chan::ChannelStore;
 use crate::keys::{KeyEvent, Press};
+use crate::rad950_chat::{ChatDelivery, ChatDraft, ChatPhase};
 use crate::sol950::{band_label, field_letters, CoopLink, CoopRxMode, GridSource, SavedContact, Sol950Store, SOL950_DIALS, WF_COLS, WF_ROWS};
 use crate::{App, Screen};
 use ferrite_core::freq::Freq10;
@@ -30,6 +31,10 @@ pub const PAGE_LOG_DETAIL: u8 = 4;
 pub const PAGE_STATS: u8 = 5;
 pub const PAGE_GRIDS_OVERVIEW: u8 = 6;
 pub const PAGE_GRIDS_FIELD: u8 = 7;
+pub const PAGE_CHAT: u8 = 8;
+pub const PAGE_CHAT_REPLY: u8 = 9;
+pub const PAGE_CHAT_PICK: u8 = 10;
+pub const PAGE_CHAT_PREVIEW: u8 = 11;
 
 const OPERATE_ROWS: usize = 4;
 const LOG_ROWS: usize = 6;
@@ -55,6 +60,9 @@ impl Sol950Scr {
     pub const STATS: Self = Self { page: PAGE_STATS, sel: 0, top: 0, field: 0, sub: 0 };
     /// Default cursor on `FN` (`lon_f = 5, lat_f = 13 -> 5 * 18 + 13 = 103`).
     pub const GRIDS: Self = Self { page: PAGE_GRIDS_OVERVIEW, sel: 0, top: 0, field: 103, sub: 31 };
+    pub const CHAT: Self = Self { page: PAGE_CHAT, sel: 0, top: 0, field: 0, sub: 0 };
+    pub const CHAT_REPLY: Self = Self { page: PAGE_CHAT_REPLY, sel: 0, top: 0, field: 0, sub: 0 };
+    pub const CHAT_PREVIEW: Self = Self { page: PAGE_CHAT_PREVIEW, sel: 0, top: 0, field: 0, sub: 0 };
 }
 
 /// `MENU 0 3 7`: open SOL950; refused while transmitting or repeating.
@@ -80,6 +88,10 @@ pub fn page_id(s: &Sol950Scr) -> &'static str {
         PAGE_STATS => "sol950.stats",
         PAGE_GRIDS_OVERVIEW => "sol950.grids",
         PAGE_GRIDS_FIELD => "sol950.grids_field",
+        PAGE_CHAT => "rad950.chat",
+        PAGE_CHAT_REPLY => "rad950.chat_reply",
+        PAGE_CHAT_PICK => "rad950.chat_pick",
+        PAGE_CHAT_PREVIEW => "rad950.chat_preview",
         _ => "sol950.operate",
     }
 }
@@ -137,6 +149,10 @@ impl View for Sol950Scr {
             PAGE_LOG | PAGE_LOG_DETAIL => "RAD950 Log",
             PAGE_STATS => "RAD950 Stats",
             PAGE_GRIDS_OVERVIEW | PAGE_GRIDS_FIELD => "RAD950 Grids",
+            PAGE_CHAT => "RAD950 Chat",
+            PAGE_CHAT_REPLY => "RAD950 Reply",
+            PAGE_CHAT_PICK => "RAD950 Pick",
+            PAGE_CHAT_PREVIEW => "RAD950 Send",
             _ => "RAD950",
         }
     }
@@ -148,6 +164,10 @@ impl View for Sol950Scr {
             PAGE_LOG | PAGE_LOG_DETAIL => b"RAD LOG",
             PAGE_STATS => b"RAD STAT",
             PAGE_GRIDS_OVERVIEW | PAGE_GRIDS_FIELD => b"RAD MAP",
+            PAGE_CHAT => b"RAD CHAT",
+            PAGE_CHAT_REPLY => b"REPLY",
+            PAGE_CHAT_PICK => b"PICK",
+            PAGE_CHAT_PREVIEW => b"SEND",
             _ => b"RAD950",
         };
         b.set(t);
@@ -170,6 +190,10 @@ impl View for Sol950Scr {
             PAGE_STATS => self.key_stats(app, e.key),
             PAGE_GRIDS_OVERVIEW => self.key_grids_overview(app, e.key),
             PAGE_GRIDS_FIELD => self.key_grids_field(app, e.key),
+            PAGE_CHAT => self.key_chat(app, e.key),
+            PAGE_CHAT_REPLY => self.key_chat_reply(app, e.key, store),
+            PAGE_CHAT_PICK => self.key_chat_pick(app, e.key),
+            PAGE_CHAT_PREVIEW => self.key_chat_preview(app, e.key),
             _ => app.screen = Screen::Sol950(Sol950Scr::OPERATE),
         }
     }
@@ -195,20 +219,39 @@ impl View for Sol950Scr {
             PAGE_STATS => self.draw_stats(app, lcd),
             PAGE_GRIDS_OVERVIEW => self.draw_grids_overview(app, lcd),
             PAGE_GRIDS_FIELD => self.draw_grids_field(app, lcd),
+            PAGE_CHAT => self.draw_chat(app, lcd, cx.live),
+            PAGE_CHAT_REPLY => self.draw_chat_reply(app, lcd),
+            PAGE_CHAT_PICK => self.draw_chat_pick(app, lcd),
+            PAGE_CHAT_PREVIEW => self.draw_chat_preview(app, lcd),
             _ => self.draw_operate(app, lcd, cx.live),
         }
     }
 
-    fn hints(self, _app: &App) -> Hints {
+    fn hints(self, app: &App) -> Hints {
         match self.page {
             PAGE_OPERATE => Hints::new(&[("OK", "Answer"), ("1", "CQ"), ("2-4", "Log/Map")]),
-            PAGE_ACTIVE => Hints::new(&[("0", "Stop"), ("*", "Setup"), ("BACK", "List")]),
+            PAGE_ACTIVE => {
+                if app.sol950_host().is_some_and(|h| h.saved_ack && h.last_qso.is_some()) {
+                    Hints::new(&[("2", "Chat"), ("0", "Stop"), ("BACK", "List")])
+                } else {
+                    Hints::new(&[("0", "Stop"), ("*", "Setup"), ("BACK", "List")])
+                }
+            }
             PAGE_SETUP => Hints::new(&[(ARROWS_LR, "Change"), ("BACK", "Done")]),
             PAGE_LOG => Hints::new(&[("OK", "Detail"), ("BACK", "Back")]),
             PAGE_LOG_DETAIL => Hints::new(&[("BACK", "Log")]),
             PAGE_STATS => Hints::new(&[(ARROWS_LR, "Scope"), ("BACK", "Back")]),
             PAGE_GRIDS_OVERVIEW => Hints::new(&[(ARROWS_4, "Field"), ("OK", "Zoom"), ("BACK", "Back")]),
             PAGE_GRIDS_FIELD => Hints::new(&[(ARROWS_4, "Grid"), ("OK", "Log"), ("BACK", "Map")]),
+            PAGE_CHAT => {
+                if app.sol950_host().is_some_and(|h| h.chat.phase == ChatPhase::IncomingInvite) {
+                    Hints::new(&[("OK", "Accept"), ("0", "Decline"), ("BACK", "Back")])
+                } else {
+                    Hints::new(&[("OK", "Reply"), ("0", "End"), ("BACK", "Back")])
+                }
+            }
+            PAGE_CHAT_REPLY | PAGE_CHAT_PICK => Hints::new(&[("OK", "Select"), ("BACK", "Back")]),
+            PAGE_CHAT_PREVIEW => Hints::new(&[("OK", "Send"), ("BACK", "Back")]),
             _ => Hints::new(&[("BACK", "Back")]),
         }
     }
@@ -314,6 +357,23 @@ impl Sol950Scr {
     fn key_active(self, app: &mut App, k: Key) {
         match k {
             Key::Exit | Key::Hash => app.screen = Screen::Sol950(Sol950Scr::OPERATE),
+            Key::Digit(2) => {
+                // Invite the completed QSO peer to continue in RAD950 Chat.
+                let invited = if let Some(h) = app.sol950_host_mut() {
+                    if let (true, Some(rec), Some(me)) = (h.saved_ack, h.last_qso, h.profile.callsign()) {
+                        let slot = if h.last_slot == u32::MAX { 0 } else { h.last_slot };
+                        h.chat.invite(me, rec.peer, slot);
+                        true
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                };
+                if invited {
+                    app.screen = Screen::Sol950(Sol950Scr::CHAT);
+                }
+            }
             Key::Digit(0) => {
                 if let Some(h) = app.sol950_host_mut() {
                     h.engine.stop_session();
@@ -1157,6 +1217,347 @@ impl Sol950Scr {
                         }
                     }
                 }
+            });
+        }
+    }
+
+    // ---- RAD950 Conversation Extension (Invite -> Ask -> Station Card -> Phrase -> Typed -> End) ----
+
+    fn key_chat(mut self, app: &mut App, k: Key) {
+        let phase = app.sol950_host().map_or(ChatPhase::Idle, |h| h.chat.phase);
+        let count = app.sol950_host().map_or(0usize, |h| h.chat.entry_count as usize);
+        match k {
+            Key::Exit => {
+                app.screen = Screen::Sol950(Sol950Scr::OPERATE);
+                return;
+            }
+            Key::Digit(0) => {
+                if let Some(h) = app.sol950_host_mut() {
+                    if phase == ChatPhase::IncomingInvite {
+                        h.chat.decline_invite();
+                    } else {
+                        h.chat.end_chat();
+                    }
+                }
+                app.screen = Screen::Sol950(Sol950Scr::OPERATE);
+                return;
+            }
+            Key::Up if self.top > 0 => self.top -= 1,
+            Key::Down if (self.top as usize) + 3 < count => self.top += 1,
+            Key::Menu => {
+                if phase == ChatPhase::IncomingInvite {
+                    if let Some(h) = app.sol950_host_mut() {
+                        h.chat.accept_invite();
+                    }
+                } else if phase == ChatPhase::Active {
+                    // Context-aware default: highlight "My station" (row 1) when peer asked about antenna/rig.
+                    let default_sel = app
+                        .sol950_host()
+                        .and_then(|h| h.chat.last_peer_topic)
+                        .map_or(0u8, |t| if t <= 1 { 1 } else { 0 });
+                    app.screen = Screen::Sol950(Sol950Scr { page: PAGE_CHAT_REPLY, sel: default_sel, top: 0, field: 0, sub: 0 });
+                    return;
+                }
+            }
+            _ => {}
+        }
+        app.screen = Screen::Sol950(self);
+    }
+
+    fn key_chat_reply(mut self, app: &mut App, k: Key, store: &impl ChannelStore) {
+        use super::text::{open as open_text, TextFor};
+        let has_out = app.sol950_host().is_some_and(|h| h.chat.has_outgoing());
+        let n_items: u8 = if has_out { 6 } else { 5 };
+        match k {
+            Key::Exit => {
+                app.screen = Screen::Sol950(Sol950Scr::CHAT);
+                return;
+            }
+            Key::Up => self.sel = if self.sel == 0 { n_items - 1 } else { self.sel - 1 },
+            Key::Down => self.sel = (self.sel + 1) % n_items,
+            Key::Menu => {
+                match self.sel {
+                    0 => {
+                        app.screen = Screen::Sol950(Sol950Scr { page: PAGE_CHAT_PICK, sel: 0, top: 0, field: 0, sub: 0 });
+                        return;
+                    }
+                    1 => {
+                        if let Some(h) = app.sol950_host_mut() {
+                            h.chat.draft = Some(ChatDraft::StationCard);
+                        }
+                        app.screen = Screen::Sol950(Sol950Scr::CHAT_PREVIEW);
+                        return;
+                    }
+                    2 => {
+                        app.screen = Screen::Sol950(Sol950Scr { page: PAGE_CHAT_PICK, sel: 0, top: 0, field: 0, sub: 1 });
+                        return;
+                    }
+                    3 => {
+                        open_text(app, TextFor::Sol950Chat, store);
+                        return;
+                    }
+                    4 if has_out => {
+                        if let Some(h) = app.sol950_host_mut() {
+                            h.chat.cancel_send();
+                        }
+                        app.screen = Screen::Sol950(Sol950Scr::CHAT);
+                        return;
+                    }
+                    _ => {
+                        if let Some(h) = app.sol950_host_mut() {
+                            h.chat.end_chat();
+                        }
+                        app.screen = Screen::Sol950(Sol950Scr::OPERATE);
+                        return;
+                    }
+                }
+            }
+            _ => {}
+        }
+        app.screen = Screen::Sol950(self);
+    }
+
+    fn key_chat_pick(mut self, app: &mut App, k: Key) {
+        use ferrite_core::sol950::usol950::chat::{PHRASES, QUESTIONS};
+        let list_len = if self.sub == 0 { PHRASES.len() } else { QUESTIONS.len() } as u8;
+        match k {
+            Key::Exit => {
+                app.screen = Screen::Sol950(Sol950Scr::CHAT_REPLY);
+                return;
+            }
+            Key::Up => self.sel = if self.sel == 0 { list_len - 1 } else { self.sel - 1 },
+            Key::Down => self.sel = (self.sel + 1) % list_len,
+            Key::Menu => {
+                if let Some(h) = app.sol950_host_mut() {
+                    h.chat.draft = Some(if self.sub == 0 {
+                        ChatDraft::Phrase(self.sel)
+                    } else {
+                        ChatDraft::Question(self.sel)
+                    });
+                }
+                app.screen = Screen::Sol950(Sol950Scr::CHAT_PREVIEW);
+                return;
+            }
+            _ => {}
+        }
+        app.screen = Screen::Sol950(self);
+    }
+
+    fn key_chat_preview(self, app: &mut App, k: Key) {
+        match k {
+            Key::Exit => {
+                app.screen = Screen::Sol950(Sol950Scr::CHAT_REPLY);
+            }
+            Key::Menu => {
+                if let Some(h) = app.sol950_host_mut() {
+                    h.chat.queue_draft();
+                }
+                app.screen = Screen::Sol950(Sol950Scr::CHAT);
+            }
+            _ => {}
+        }
+    }
+
+    fn draw_chat(self, app: &mut App, lcd: &mut impl Panel, live: &LiveAll) {
+        let Some(h) = app.sol950_host() else { return };
+        let tx_active = matches!(live.mode, ModeLive::Sol950 { tx_active: true, .. });
+        let phase = h.chat.phase;
+        let peer = h.chat.peer;
+        let secs = h.chat.secs_until_tx(h.utc_sec);
+        let count = h.chat.entry_count as usize;
+        let entries = h.chat.entries;
+
+        let mut th = Mix::new()
+            .n(phase as u32)
+            .n(peer.raw())
+            .n(secs as u32)
+            .n(tx_active as u32)
+            .n(count as u32)
+            .n(self.top as u32);
+        for e in &entries[..count] {
+            let st_key = match e.status {
+                ChatDelivery::None => 0u32,
+                ChatDelivery::Queued => 1,
+                ChatDelivery::Sending { sent, total } => 2 + ((sent as u32) << 8) + ((total as u32) << 16),
+                ChatDelivery::AwaitingAck => 3,
+                ChatDelivery::Delivered => 4,
+                ChatDelivery::Cancelled => 5,
+            };
+            th = th.n(e.from_me as u32).n(st_key).b(e.bytes());
+        }
+        if let Some(clear) = app.dirty_shape(R_TOP, th.get(), true) {
+            let y0 = TOP_Y;
+            redraw_box!(clear, lcd, (0, y0, W, 184, BG), {
+                let mut cb = [0u8; 6];
+                let cn = peer.decode(&mut cb);
+                let ps = core::str::from_utf8(&cb[..cn]).unwrap_or("?");
+                let mut hdr = Buf::<20>::new();
+                let _ = uwrite!(hdr, "CHAT {}", ps);
+                lcd.text4(8, y0 + 16, hdr.as_bytes(), &UI_14, TEXT, BG);
+
+                // Make the wait visible on the right of the header.
+                let mut st = Buf::<16>::new();
+                let st_col = match phase {
+                    ChatPhase::Inviting => {
+                        let _ = uwrite!(st, "Inviting...");
+                        AMBER
+                    }
+                    ChatPhase::IncomingInvite => {
+                        let _ = uwrite!(st, "Invite!");
+                        AMBER
+                    }
+                    ChatPhase::Active if tx_active => {
+                        let _ = uwrite!(st, "TX now");
+                        RED
+                    }
+                    ChatPhase::Active => {
+                        let _ = uwrite!(st, "TX in {}s", secs);
+                        GREEN
+                    }
+                    ChatPhase::Idle => {
+                        let _ = uwrite!(st, "Ended");
+                        DIM
+                    }
+                };
+                lcd.text4(W - 76, y0 + 16, st.as_bytes(), &UI_12, st_col, BG);
+                lcd.fill(0, y0 + 22, W, 1, RULE);
+
+                if phase == ChatPhase::IncomingInvite {
+                    let mut inv = Buf::<32>::new();
+                    let _ = uwrite!(inv, "{} invites you to chat", ps);
+                    lcd.text4(8, y0 + 56, inv.as_bytes(), &UI_14, AMBER, BG);
+                    lcd.text4(8, y0 + 82, b"OK Accept   0 Decline", &UI_12, TEXT, BG);
+                } else if count == 0 {
+                    let msg: &[u8] = if phase == ChatPhase::Inviting {
+                        b"Waiting for peer to accept..."
+                    } else {
+                        b"Connected. Press OK to reply."
+                    };
+                    lcd.text4(8, y0 + 54, msg, &UI_12, DIM, BG);
+                } else {
+                    // Show up to 4 transcript rows (each 38 px tall: sender+status on top, text below).
+                    let start = (self.top as usize).min(count.saturating_sub(1));
+                    for slot in 0..4usize {
+                        let idx = start + slot;
+                        if idx >= count {
+                            break;
+                        }
+                        let e = &entries[idx];
+                        let ry = y0 + 28 + slot as i32 * 38;
+                        let who: &[u8] = if e.from_me { b"You" } else { ps.as_bytes() };
+                        let who_col = if e.from_me { BLUE } else { GREEN };
+                        lcd.text4(8, ry + 12, who, &UI_12, who_col, BG);
+                        let mut dtag = Buf::<16>::new();
+                        let dcol = match e.status {
+                            ChatDelivery::None => DIM,
+                            ChatDelivery::Queued => {
+                                let _ = uwrite!(dtag, "Queued");
+                                AMBER
+                            }
+                            ChatDelivery::Sending { sent, total } => {
+                                let _ = uwrite!(dtag, "Send {}/{}", sent, total);
+                                RED
+                            }
+                            ChatDelivery::AwaitingAck => {
+                                let _ = uwrite!(dtag, "Wait ACK");
+                                AMBER
+                            }
+                            ChatDelivery::Delivered => {
+                                let _ = uwrite!(dtag, "Delivered");
+                                GREEN
+                            }
+                            ChatDelivery::Cancelled => {
+                                let _ = uwrite!(dtag, "Cancelled");
+                                DIM
+                            }
+                        };
+                        if !dtag.as_bytes().is_empty() {
+                            lcd.text4(W - 72, ry + 12, dtag.as_bytes(), &UI_12, dcol, BG);
+                        }
+                        let txt = e.bytes();
+                        let show = &txt[..txt.len().min(30)];
+                        lcd.text4(8, ry + 28, show, &UI_12, TEXT, BG);
+                    }
+                }
+            });
+        }
+        self.draw_panafall(app, lcd);
+    }
+
+    fn draw_chat_reply(self, app: &mut App, lcd: &mut impl Panel) {
+        let has_out = app.sol950_host().is_some_and(|h| h.chat.has_outgoing());
+        let labels: [&[u8]; 6] = if has_out {
+            [b"Quick phrase", b"My station", b"Ask a question", b"Type message", b"Cancel send", b"End chat"]
+        } else {
+            [b"Quick phrase", b"My station", b"Ask a question", b"Type message", b"End chat", b""]
+        };
+        let n_items = if has_out { 6 } else { 5 };
+        let y0 = TOP_Y + 6;
+        let row_h = 30;
+        for (i, &label) in labels.iter().enumerate().take(n_items) {
+            let selected = i == self.sel as usize;
+            let rh = Mix::new().n(selected as u32).b(label).get();
+            if let Some(clear) = app.dirty_shape(R_ROW + i, rh, selected) {
+                let y = y0 + i as i32 * row_h;
+                let bg = if selected { BLUE } else { BG };
+                let fg = if selected { BLUE_FG } else { TEXT };
+                redraw_box!(clear || selected, lcd, (0, y, W, row_h, bg), {
+                    lcd.text4(10, y + 20, label, &UI_14, fg, bg);
+                });
+            }
+        }
+    }
+
+    fn draw_chat_pick(self, app: &mut App, lcd: &mut impl Panel) {
+        use ferrite_core::sol950::usol950::chat::{PHRASES, QUESTIONS};
+        let items: &[&str] = if self.sub == 0 { PHRASES } else { QUESTIONS };
+        let y0 = TOP_Y + 6;
+        let row_h = 32;
+        for (i, item) in items.iter().enumerate() {
+            let selected = i == self.sel as usize;
+            let rh = Mix::new().n(selected as u32).b(item.as_bytes()).get();
+            if let Some(clear) = app.dirty_shape(R_ROW + i, rh, selected) {
+                let y = y0 + i as i32 * row_h;
+                let bg = if selected { BLUE } else { BG };
+                let fg = if selected { BLUE_FG } else { TEXT };
+                redraw_box!(clear || selected, lcd, (0, y, W, row_h, bg), {
+                    let s = item.as_bytes();
+                    lcd.text4(8, y + 20, &s[..s.len().min(29)], &UI_12, fg, bg);
+                });
+            }
+        }
+    }
+
+    fn draw_chat_preview(self, app: &mut App, lcd: &mut impl Panel) {
+        let Some(h) = app.sol950_host() else { return };
+        let mut buf = [0u8; 64];
+        let (len, bursts, airtime_s) = h.chat.preview_draft(&mut buf);
+        let ph = Mix::new().b(&buf[..len]).n(bursts as u32).n(airtime_s as u32).get();
+        if let Some(clear) = app.dirty_shape(R_TOP, ph, true) {
+            let y0 = TOP_Y + 8;
+            redraw_box!(clear, lcd, (0, y0, W, 220, BG), {
+                lcd.text4(8, y0 + 16, b"Preview before sending:", &UI_12, DIM, BG);
+                let txt = &buf[..len];
+                // Word-wrap across 2 lines of up to 24 chars each.
+                let (line1, line2) = if txt.len() <= 24 {
+                    (txt, &[][..])
+                } else if let Some(sp) = txt[..=24].iter().rposition(|&b| b == b' ') {
+                    (&txt[..sp], &txt[sp + 1..txt.len().min(sp + 25)])
+                } else {
+                    (&txt[..24], &txt[24..txt.len().min(48)])
+                };
+                lcd.text4(8, y0 + 48, line1, &UI_14, TEXT, BG);
+                if !line2.is_empty() {
+                    lcd.text4(8, y0 + 72, line2, &UI_14, TEXT, BG);
+                }
+                let mut est = Buf::<32>::new();
+                if airtime_s >= 60 {
+                    let _ = uwrite!(est, "{} bursts · ~{}m {}s", bursts, airtime_s / 60, airtime_s % 60);
+                } else {
+                    let _ = uwrite!(est, "{} burst · ~{}s", bursts, airtime_s);
+                }
+                lcd.text4(8, y0 + 114, est.as_bytes(), &UI_14, AMBER, BG);
+                lcd.text4(8, y0 + 144, b"Press OK to queue TX.", &UI_12, GREEN, BG);
             });
         }
     }
