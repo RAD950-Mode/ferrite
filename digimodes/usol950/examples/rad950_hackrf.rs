@@ -73,6 +73,7 @@ struct NodeConfig {
     grid4: u16,
     grid_str: String,
     dial_hz: u64,
+    ppm: f64,
     subch: usize,
     lna_db: u8,
     vga_db: u8,
@@ -81,6 +82,15 @@ struct NodeConfig {
     dry_tx: bool,
     serial: Option<String>,
     log_path: String,
+}
+
+fn ppm_offset_hz(dial_hz: u64, ppm: f64) -> i64 {
+    (dial_hz as f64 * ppm / 1_000_000.0).round() as i64
+}
+
+fn tuned_center_hz(cfg: &NodeConfig) -> u64 {
+    let cal_hz = ppm_offset_hz(cfg.dial_hz, cfg.ppm);
+    (cfg.dial_hz as i64 + cal_hz - RF_OFFSET_HZ).max(1_000_000) as u64
 }
 
 /// Exact same 16-level RX and TX RGB565 palettes as the RT-950 Pro `draw_panafall`.
@@ -243,6 +253,7 @@ fn usage() {
     eprintln!("  --grid <GRID4|NONE>       4-char Maidenhead grid (default: FN31)");
     eprintln!("  --band <10m|12m|15m|17m>  RAD950 calling band (default: 10m = 28.078 MHz)");
     eprintln!("  --freq <HZ>               Custom USB dial frequency in Hz (e.g. 28185000)");
+    eprintln!("  --ppm <FLOAT>             HackRF crystal frequency calibration in ppm (default: 0.0)");
     eprintln!("  --subch <0..7>            TX audio subchannel index (default: 0 = 600 Hz)");
     eprintln!("  --lna <0..40>             HackRF RX LNA gain in dB, 8 dB steps (default: 16)");
     eprintln!("  --vga <0..62>             HackRF RX VGA gain in dB, 2 dB steps (default: 20)");
@@ -613,7 +624,7 @@ fn transmit_slot(cfg: &NodeConfig, job: &TxJob, state: &Arc<Mutex<SharedState>>)
         }
     });
 
-    let center_hz = (cfg.dial_hz as i64 - RF_OFFSET_HZ).max(1_000_000) as u64;
+    let center_hz = tuned_center_hz(cfg);
     let mut cmd = Command::new("hackrf_transfer");
     cmd.args([
         "-t",
@@ -660,7 +671,7 @@ fn transmit_slot(cfg: &NodeConfig, job: &TxJob, state: &Arc<Mutex<SharedState>>)
 }
 
 fn receive_slot(cfg: &NodeConfig, state: &Arc<Mutex<SharedState>>) -> Result<(Vec<Decoded>, f32), String> {
-    let center_hz = (cfg.dial_hz as i64 - RF_OFFSET_HZ).max(1_000_000) as u64;
+    let center_hz = tuned_center_hz(cfg);
     let n_samples: u64 = (HACKRF_FS as u64 * RX_SLOT_MS) / 1000;
 
     let mut cmd = Command::new("hackrf_transfer");
@@ -1216,7 +1227,7 @@ impl TuiState {
     }
 }
 
-const SETTINGS_COUNT: usize = 12;
+const SETTINGS_COUNT: usize = 13;
 
 fn render_tui(state: &Arc<Mutex<SharedState>>, tui: &TuiState) {
     let (cols, rows) = term_size();
@@ -1261,8 +1272,17 @@ fn render_tui(state: &Arc<Mutex<SharedState>>, tui: &TuiState) {
     let bar_w = 26usize;
     let filled = ((slot_elapsed_ms as usize * bar_w) / 10_000).min(bar_w);
     let bar: String = "█".repeat(filled) + &"░".repeat(bar_w - filled);
+    let cal_str = if st.cfg.ppm.abs() >= 0.05 {
+        format!(
+            "  Cal:{:+.1}ppm({:+}Hz)",
+            st.cfg.ppm,
+            ppm_offset_hz(st.cfg.dial_hz, st.cfg.ppm)
+        )
+    } else {
+        String::new()
+    };
     let line2 = format!(
-        " {phase_col}{phase_lbl}\x1b[0m [{phase_col}{bar}\x1b[0m] {:4.1}s/10s  Peak:{:3.0}%  Grids:{}  Q:{}",
+        " {phase_col}{phase_lbl}\x1b[0m [{phase_col}{bar}\x1b[0m] {:4.1}s/10s  Peak:{:3.0}%  Grids:{}  Q:{}{cal_str}",
         slot_elapsed_ms as f64 / 1000.0,
         st.peak_pct,
         st.worked_grids_all.len(),
@@ -1444,6 +1464,15 @@ fn render_tui(state: &Arc<Mutex<SharedState>>, tui: &TuiState) {
                     "Enter to type exact Hz, ←/→ ±1 kHz",
                 ),
                 (
+                    "Freq Cal (ppm)",
+                    format!(
+                        "{:+.1} ppm ({:+} Hz)",
+                        st.cfg.ppm,
+                        ppm_offset_hz(st.cfg.dial_hz, st.cfg.ppm)
+                    ),
+                    "←/→ ±1 ppm, Enter to type exact ppm",
+                ),
+                (
                     "TX Subchannel",
                     format!("{} ({} Hz)", st.cfg.subch, SUBCHANNELS_HZ[st.cfg.subch]),
                     "←/→ cycle 0..7",
@@ -1572,22 +1601,27 @@ fn adjust_setting(state: &Arc<Mutex<SharedState>>, tui: &mut TuiState, delta: i3
             st.cfg.dial_hz = f;
         }
         4 => {
+            st.cfg.ppm = (st.cfg.ppm + delta as f64).clamp(-200.0, 200.0);
+            let hz = ppm_offset_hz(st.cfg.dial_hz, st.cfg.ppm);
+            tui.set_toast(format!("Freq cal -> {:+.1} ppm ({:+} Hz)", st.cfg.ppm, hz));
+        }
+        5 => {
             let next = (st.cfg.subch as i32 + delta).rem_euclid(SUBCHANNELS_HZ.len() as i32) as usize;
             st.cfg.subch = next;
         }
-        5 => {
+        6 => {
             let next = (st.cfg.lna_db as i32 + delta * 8).clamp(0, 40) as u8;
             st.cfg.lna_db = (next / 8) * 8;
         }
-        6 => {
+        7 => {
             let next = (st.cfg.vga_db as i32 + delta * 2).clamp(0, 62) as u8;
             st.cfg.vga_db = (next / 2) * 2;
         }
-        7 => {
+        8 => {
             st.cfg.tx_vga_db = (st.cfg.tx_vga_db as i32 + delta).clamp(0, 47) as u8;
         }
-        8 => st.cfg.amp = !st.cfg.amp,
-        9 => {
+        9 => st.cfg.amp = !st.cfg.amp,
+        10 => {
             st.cfg.dry_tx = !st.cfg.dry_tx;
             tui.set_toast(if st.cfg.dry_tx {
                 "Dry TX ON (RF suppressed)"
@@ -1595,8 +1629,8 @@ fn adjust_setting(state: &Arc<Mutex<SharedState>>, tui: &mut TuiState, delta: i3
                 "Dry TX OFF — LIVE RF TRANSMIT ENABLED"
             });
         }
-        10 => st.auto_qso = !st.auto_qso,
-        11 => st.cq_parity = 1 - st.cq_parity,
+        11 => st.auto_qso = !st.auto_qso,
+        12 => st.cq_parity = 1 - st.cq_parity,
         _ => {}
     }
 }
@@ -1626,6 +1660,14 @@ fn commit_edit(state: &Arc<Mutex<SharedState>>, tui: &mut TuiState, text: String
                 tui.set_toast(format!("Dial set to {:.3} MHz", f as f64 / 1e6));
             }
             _ => tui.set_toast("Invalid frequency (enter Hz, e.g. 28078000)"),
+        },
+        4 => match text.trim().parse::<f64>() {
+            Ok(p) if (-200.0..=200.0).contains(&p) => {
+                st.cfg.ppm = p;
+                let hz = ppm_offset_hz(st.cfg.dial_hz, p);
+                tui.set_toast(format!("Freq cal set to {:+.1} ppm ({:+} Hz)", p, hz));
+            }
+            _ => tui.set_toast("Invalid ppm (enter -200.0 .. +200.0)"),
         },
         _ => {}
     }
@@ -1704,6 +1746,7 @@ fn main() -> ExitCode {
     let mut call_str = "NQ6N".to_string();
     let mut grid_str = "FN31".to_string();
     let mut dial_hz: u64 = 28_078_000;
+    let mut ppm: f64 = 0.0;
     let mut subch: usize = 0;
     let mut lna_db: u8 = 16;
     let mut vga_db: u8 = 20;
@@ -1748,6 +1791,16 @@ fn main() -> ExitCode {
                     Ok(f) if (1_000_000..=6_000_000_000).contains(&f) => dial_hz = f,
                     _ => {
                         eprintln!("invalid --freq '{}'", args[i]);
+                        return ExitCode::from(2);
+                    }
+                }
+            }
+            "--ppm" if i + 1 < args.len() => {
+                i += 1;
+                match args[i].parse::<f64>() {
+                    Ok(p) if (-200.0..=200.0).contains(&p) => ppm = p,
+                    _ => {
+                        eprintln!("invalid --ppm '{}' (use -200.0 .. +200.0)", args[i]);
                         return ExitCode::from(2);
                     }
                 }
@@ -1819,6 +1872,7 @@ fn main() -> ExitCode {
         grid4,
         grid_str: grid_clean,
         dial_hz,
+        ppm,
         subch,
         lna_db,
         vga_db,
@@ -2020,6 +2074,7 @@ fn main() -> ExitCode {
                                 0 => tui.editing = Some(st.cfg.call_str.clone()),
                                 1 => tui.editing = Some(st.cfg.grid_str.clone()),
                                 3 => tui.editing = Some(st.cfg.dial_hz.to_string()),
+                                4 => tui.editing = Some(format!("{:.1}", st.cfg.ppm)),
                                 _ => {
                                     drop(st);
                                     adjust_setting(&state, &mut tui, 1);
