@@ -265,6 +265,8 @@ pub struct SimCore {
     /// `--cut-restart` (decision 339): the store's writes queued as on the radio, and the next restart after a raw
     /// write is a power cut: what the Storage task hadn't done yet is lost (the stamp, when Console sent it last).
     cut_restart: bool,
+    /// Simulated 8.8 s SOL950 TX burst end timestamp (ms).
+    sol950_tx_end_ms: Option<u32>,
 }
 
 /// One render pass as [`SimCore::watch_passes`] records it.
@@ -426,6 +428,7 @@ impl SimCore {
             gps: None,
             gps_off: false,
             cut_restart: false,
+            sol950_tx_end_ms: None,
         };
         if owner_card {
             ferrite_app::sample::owner_card(s.app.settings_mut());
@@ -641,8 +644,24 @@ impl SimCore {
                 let gps_grid = here.map(|(lat, lon, _)| ferrite_app::gpsdata::pos_to_grid4(lat, lon));
                 h.update_clock(sat_t, (now % 1000) as u16, 40, gps_grid);
             }
+            if let Some((rf_freq, power, _frame)) = app.sol950_take_tx() {
+                send(radio, ferrite_core::msg::RadioCmd::Sol950Tx { freq: rf_freq, power });
+                self.sol950_tx_end_ms = Some(now.saturating_add(8_800));
+            }
+            if self.sol950_tx_end_ms.is_some_and(|end| now >= end) {
+                self.sol950_tx_end_ms = None;
+                send(radio, ferrite_core::msg::RadioCmd::Sol950Abort);
+                if let Some(h) = app.sol950_host_mut() {
+                    h.on_tx_done(true);
+                }
+            }
             app.tick(now, &radio.live, store);
             while let Some(c) = app.pop_cmd() {
+                if matches!(c, ferrite_core::msg::RadioCmd::Sol950Abort) && self.sol950_tx_end_ms.take().is_some() {
+                    if let Some(h) = app.sol950_host_mut() {
+                        h.on_tx_done(false);
+                    }
+                }
                 send(radio, c);
             }
             // The GPS module under the power manager, as the firmware's GPS task runs it (GPS-26).
