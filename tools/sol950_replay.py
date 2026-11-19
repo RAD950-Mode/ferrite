@@ -3,6 +3,7 @@
 
 import argparse
 import hashlib
+import json
 import subprocess
 import sys
 import threading
@@ -17,7 +18,8 @@ FS8M = 8_000_000
 RADTEL_CS8_SHA256 = "d8e8cadb7098a19cd3c3f3d6ddd6c70236b72ff2ba5048a0a467a560d6299c86"
 RADTEL_WAV_SHA256 = "d2b60669f9c7cde7541ad2322bf2e9d24ebc7ec2e531281da7890988d99a1732"
 
-# Exact `RX K1ABC -> NQ6N (snr=-15, ack=0)` 110-tone reference sequence from `usol950::encode_tones`
+# `RX K1ABC -> NQ6N (snr=-14, ack=0)` 110-tone sequence used in the initial unpaired RX suite
+# (kept for provenance; new fixtures should be generated directly by `sol950_wav`).
 RX_K1ABC_TONES = [
     0, 3, 0, 1, 3, 2, 3, 3, 0, 3, 2, 0, 3, 1, 2, 1, 3, 0, 3, 0, 3, 2, 0, 1, 2, 2, 0, 1,
     3, 1, 3, 1, 2, 1, 2, 1, 0, 1, 0, 3, 0, 0, 2, 3, 0, 1, 3, 3, 2, 0, 1, 0, 1, 0, 0, 0,
@@ -299,6 +301,179 @@ def cmd_run_rx_suite(args: argparse.Namespace) -> None:
         port.close()
 
 
+def cmd_make_paired(args: argparse.Namespace) -> None:
+    """Build strictly paired weak-only and weak+neighbor fixtures sharing one noise realization and weak burst per slot."""
+    out_dir = Path(args.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    sr_w, w_full = read_wav(Path(args.weak_wav))
+    assert sr_w == SR24
+    # Rust `sol950_wav rx` places symbol 0 at +0.400 s and ends at +9.200 s (8.80 s = 211,200 samples).
+    w_burst = w_full[int(0.4 * SR24) : int(9.2 * SR24)]
+    w_rms = float(np.sqrt(np.mean(w_burst**2)))
+    sr_a, b_adj = read_wav(Path(args.adj_wav))
+    assert sr_a == SR24
+
+    snr_db = float(args.snr)
+    adj_db = float(args.adj_db)
+    trials = args.trials
+    seed = int(args.seed, 0)
+    sigma_24k = 1.0
+    p_n_2500 = sigma_24k**2 * (2500.0 / 12_000.0)
+    p_weak = p_n_2500 * (10.0 ** (snr_db / 10.0))
+    weak_rms = float(np.sqrt(p_weak))
+    adj_rms = weak_rms * (10.0 ** (adj_db / 20.0))
+    noise_rms_2600 = float(np.sqrt(2600.0 / 12_000.0)) * sigma_24k
+    iq_gain = 18.0 / noise_rms_2600
+    wav_gain = 1_200.0
+
+    slot_len = SR24 * 10
+    pad = SR24 // 2
+    n_tot = pad + trials * slot_len + pad
+    rng = np.random.default_rng(seed)
+    raw_noise = rng.normal(0.0, sigma_24k, n_tot)
+    Xn = np.fft.rfft(raw_noise)
+    fn = np.fft.rfftfreq(n_tot, 1.0 / SR24)
+    Xn[(fn < 200.0) | (fn > 2800.0)] = 0.0
+    base = np.fft.irfft(Xn, n=n_tot)
+
+    weak_only = base.copy()
+    slots_meta = []
+    for ti in range(trials):
+        off0 = pad + ti * slot_len
+        dt_w_ms = -160 + ((ti * 53) % 401)
+        st_w = off0 + ((400 + dt_w_ms) * SR24) // 1000
+        weak_only[st_w : st_w + len(w_burst)] += (w_burst / w_rms) * weak_rms
+        dt_a_ms = -160 + (((ti * 97) + 211) % 401)
+        slots_meta.append({
+            "slot": ti,
+            "t_s0_ms": round(st_w * 1000.0 / SR24, 1),
+            "dt_w_ms": dt_w_ms,
+            "dt_a_ms": dt_a_ms,
+            "t_adj_s0_ms": round((off0 + ((400 + dt_a_ms) * SR24) // 1000) * 1000.0 / SR24, 1),
+        })
+
+    weak_plus_adj = weak_only.copy()
+    for m in slots_meta:
+        off0 = pad + m["slot"] * slot_len
+        st_a = off0 + ((200 + m["dt_a_ms"]) * SR24) // 1000
+        weak_plus_adj[st_a : st_a + len(b_adj)] += (b_adj / 10_000.0) * adj_rms
+
+    write_wav(out_dir / "host_paired_weak.wav", SR24, weak_only * wav_gain)
+    write_wav(out_dir / "host_paired_adj.wav", SR24, weak_plus_adj * wav_gain)
+    pk_w = upconvert_24k_to_plus200k_cs8(weak_only, out_dir / "paired_weak.cs8", iq_gain)
+    pk_a = upconvert_24k_to_plus200k_cs8(weak_plus_adj, out_dir / "paired_adj.cs8", iq_gain)
+    # Also save a short 6 s probe clip from paired_weak for fast AVC-off volume calibration
+    upconvert_24k_to_plus200k_cs8(weak_only[: SR24 * 6], out_dir / "paired_probe.cs8", iq_gain)
+    meta = {
+        "snr_db": snr_db,
+        "adj_db": adj_db,
+        "trials": trials,
+        "seed": hex(seed),
+        "weak_wav_sha256": sha256_file(Path(args.weak_wav)),
+        "adj_wav_sha256": sha256_file(Path(args.adj_wav)),
+        "peak_i8_weak": pk_w,
+        "peak_i8_adj": pk_a,
+        "slots": slots_meta,
+    }
+    (out_dir / "paired_meta.json").write_text(json.dumps(meta, indent=2))
+    print(f"paired ready: snr={snr_db} dB, peak_i8 weak={pk_w}/127 adj={pk_a}/127", flush=True)
+
+
+def cmd_run_paired(args: argparse.Namespace) -> None:
+    """Calibrate AVC-off SI4732 RX_VOLUME to match AVC-on weak-only PA2 RMS, then capture all 4 paired runs."""
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import ferrite_link as fl
+
+    out_dir = Path(args.out_dir)
+    port = fl.Port(args.port)
+    link = fl.Link(port)
+
+    def term_cmd(line: str) -> str:
+        s, r = link.ask(fl.CMD, line.encode("ascii"))
+        chunks = []
+        while True:
+            if s != 0:
+                raise RuntimeError(f"term {line!r}: {fl.why(s, r)}")
+            chunks.append(r[1:].decode("utf-8", "replace"))
+            if r[0] == 0:
+                break
+            s, r = link.ask(fl.MORE)
+        return "".join(chunks).strip()
+
+    def cap_with_tx(cs8: Path, wav: Path, rx_secs: float) -> tuple[float, float]:
+        holder = {}
+
+        def tx() -> None:
+            time.sleep(0.6)
+            holder["p"] = subprocess.Popen(
+                ["hackrf_transfer", "-t", str(cs8), "-f", "27985000", "-s", "8000000", "-a", str(args.amp), "-p", "0", "-x", str(args.x)],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+
+        th = threading.Thread(target=tx)
+        th.start()
+        try:
+            time.sleep(0.15)
+            link.answers()
+            link.raw.clear()
+            fl.raw_audio(link, rx_secs, str(wav), 16000)
+        finally:
+            th.join()
+            p = holder.get("p")
+            if p is not None:
+                p.communicate(timeout=20)
+        _, x = read_wav(wav)
+        # Skip initial 1.2 s settle when computing steady RMS
+        seg = x[min(len(x) // 2, 19200) :]
+        return float(np.sqrt(np.mean(seg**2))), float(np.max(np.abs(x)))
+
+    try:
+        link.hello()
+        term_cmd("si prop 0101 9012")
+        term_cmd("si prop 4000 0038")  # default SI_VOLUME = 56
+        term_cmd("si 40 80 6e 19 00 00 reply 1")
+        term_cmd("si prop 0100 0546")  # +1350 Hz BFO
+
+        probe_cs8 = out_dir / "paired_probe.cs8"
+        ref_rms, ref_max = cap_with_tx(probe_cs8, out_dir / "cal_avcon.wav", 4.5)
+        print(f"cal AVC ON  (vol=56): rms={ref_rms:.1f}, max={ref_max:.0f}", flush=True)
+
+        term_cmd("si prop 0101 8012")  # AVC OFF
+        best_vol, best_err = 44, 1e18
+        for vol in [40, 42, 44, 46]:
+            term_cmd(f"si prop 4000 {vol:04x}")
+            rms, mx = cap_with_tx(probe_cs8, out_dir / f"cal_avcoff_v{vol}.wav", 4.5)
+            err = abs(rms - ref_rms)
+            print(f"cal AVC OFF (vol={vol}): rms={rms:.1f}, max={mx:.0f} (diff={rms - ref_rms:+.1f})", flush=True)
+            if err < best_err:
+                best_err = err
+                best_vol = vol
+        print(f"selected AVC OFF volume = {best_vol} (0x{best_vol:04x}) matching AVC ON rms={ref_rms:.1f}", flush=True)
+
+        cs8_w = out_dir / "paired_weak.cs8"
+        cs8_a = out_dir / "paired_adj.cs8"
+        rx_secs = cs8_w.stat().st_size / (2.0 * FS8M) + 1.5
+        runs = [
+            ("avcon_weak", "9012", 56, cs8_w),
+            ("avcon_adj", "9012", 56, cs8_a),
+            ("avcoff_weak", "8012", best_vol, cs8_w),
+            ("avcoff_adj", "8012", best_vol, cs8_a),
+        ]
+        for label, ssb_mode, vol, cs8 in runs:
+            term_cmd(f"si prop 0101 {ssb_mode}")
+            term_cmd(f"si prop 4000 {vol:04x}")
+            wav = out_dir / f"pa2_{label}.wav"
+            rms, mx = cap_with_tx(cs8, wav, rx_secs)
+            print(f"captured {wav.name}: mode=0x{ssb_mode} vol={vol} rms={rms:.1f} max={mx:.0f}", flush=True)
+
+        term_cmd("si prop 0101 9012")
+        term_cmd("si prop 4000 0038")
+        term_cmd("si prop 0100 0000")
+    finally:
+        port.close()
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -321,6 +496,21 @@ def main() -> None:
     p_run.add_argument("--x", type=int, default=42)
     p_run.add_argument("--amp", type=int, default=1)
 
+    p_mp = sub.add_parser("make-paired")
+    p_mp.add_argument("weak_wav")
+    p_mp.add_argument("adj_wav")
+    p_mp.add_argument("out_dir")
+    p_mp.add_argument("--snr", default="-14")
+    p_mp.add_argument("--adj-db", default="15")
+    p_mp.add_argument("--trials", type=int, default=8)
+    p_mp.add_argument("--seed", default="0x50196000")
+
+    p_rp = sub.add_parser("run-paired")
+    p_rp.add_argument("out_dir")
+    p_rp.add_argument("--port", required=True)
+    p_rp.add_argument("--x", type=int, default=44)
+    p_rp.add_argument("--amp", type=int, default=1)
+
     args = ap.parse_args()
     if args.cmd == "prep":
         cmd_prep(args)
@@ -328,6 +518,10 @@ def main() -> None:
         cmd_make_rx_suite(args)
     elif args.cmd == "run-rx-suite":
         cmd_run_rx_suite(args)
+    elif args.cmd == "make-paired":
+        cmd_make_paired(args)
+    elif args.cmd == "run-paired":
+        cmd_run_paired(args)
 
 
 if __name__ == "__main__":

@@ -202,6 +202,18 @@ impl Receiver {
         self.acquired = false;
     }
 
+    /// Diagnostic hook: bypass blind `S0 + S1` acquisition and pin track 0 to the nearest `(start_sym, phase, q0)`
+    /// for a known burst start time (`start_ms` from slot edge) and base tone (`audio_hz`). Call right after `reset()`.
+    pub fn set_oracle_track(&mut self, start_ms: u32, audio_hz: u32) {
+        let h = ((start_ms + 20) / 40) as usize;
+        let start_sym = (h / 2) as u8;
+        let phase = (h % 2) as u8;
+        let half_bin = ((audio_hz as u64 * (FFT_N as u64 * 2) + (PROC_RATE_HZ as u64 / 2)) / PROC_RATE_HZ as u64) as usize;
+        let q0 = half_bin.saturating_sub(2 * FIRST_BIN).min((N_BINS - 2) * 2) as u16;
+        self.tracks[0] = Track { active: true, start_sym, phase, q0, ..Track::empty() };
+        self.acquired = true;
+    }
+
     #[inline]
     fn ring_offset(sym_mod: usize, phase: usize, bin: usize) -> usize {
         (sym_mod * 2 + phase) * N_BINS + bin

@@ -19,7 +19,7 @@ fn usage() {
     eprintln!("  sol950_wav rx <SENDER> <RECIPIENT> <SNR_DB> <ACK:0|1> <AUDIO_HZ> <OUT.wav>");
     eprintln!("  sol950_wav decode <IN.wav>        (scans both slot-aligned and unaligned bench captures)");
     eprintln!("  sol950_wav tone <IN.wav>          (measures peak carrier Hz and SNR_2500 for BFO/path check)");
-    eprintln!("  sol950_wav sweep <WEAK.wav|synth> <cq|rx> [ADJ.wav|synth:+225 ADJ_DB [TRIALS]]");
+    eprintln!("  sol950_wav sweep <WEAK.wav|synth> <cq|rx> [ADJ.wav|synth:+225 ADJ_DB [TRIALS]] [--oracle]");
 }
 
 fn main() -> ExitCode {
@@ -61,7 +61,7 @@ fn main() -> ExitCode {
         }
         "decode" if args.len() == 3 => decode_wav(&args[2]),
         "tone" if args.len() == 3 => measure_tone(&args[2]),
-        "sweep" if matches!(args.len(), 4 | 6 | 7) => run_sweep(&args[2..]),
+        "sweep" if matches!(args.len(), 4..=8) => run_sweep(&args[2..]),
         _ => {
             usage();
             ExitCode::from(2)
@@ -319,6 +319,12 @@ fn load_norm_burst(spec: &str) -> Option<Vec<i16>> {
 /// Weak and adjacent callers always use distinct payloads (`CQ NQ6N FN31` vs `RX K1ABC -> NQ6N`) and only
 /// recovery of the weak frame is scored.
 fn run_sweep(args: &[String]) -> ExitCode {
+    let oracle = args.iter().any(|a| a == "--oracle");
+    let args: Vec<String> = args.iter().filter(|a| a.as_str() != "--oracle").cloned().collect();
+    if !matches!(args.len(), 2 | 4 | 5) {
+        usage();
+        return ExitCode::from(2);
+    }
     let weak_wav = load_norm_burst(&args[0]);
     let nq6n = Callsign::encode(b"NQ6N").unwrap();
     let k1abc = Callsign::encode(b"K1ABC").unwrap();
@@ -357,8 +363,9 @@ fn run_sweep(args: &[String]) -> ExitCode {
     let p_n_2500 = sigma * sigma * (2500.0 / 12000.0);
     let seed_base = 0x2000_0000_0000_0001u64;
 
-    println!("sol950_wav sweep: trials={trials}, norm_rms=10000, sigma_24k={sigma:.0}, seed_base=0x{seed_base:016x}, weak={:?}", weak_frame);
+    println!("sol950_wav sweep: trials={trials}, norm_rms=10000, sigma_24k={sigma:.0}, seed_base=0x{seed_base:016x}, oracle={oracle}, weak={:?}", weak_frame);
     let mut rates = Vec::with_capacity(snrs.len());
+    let mut orates = Vec::with_capacity(snrs.len());
     for (si, &snr_db) in snrs.iter().enumerate() {
         let p_weak = p_n_2500 * 10f64.powf(snr_db / 10.0);
         let weak_rms = p_weak.sqrt();
@@ -368,6 +375,8 @@ fn run_sweep(args: &[String]) -> ExitCode {
         let mut rng = SweepRng(seed_base + (si as u64) * 997);
         let mut rx = Receiver::new();
         let mut ok = 0usize;
+        let mut ok_oracle = 0usize;
+        let mut rec_of_missed = 0usize;
 
         for t in 0..trials {
             let mut slot = vec![0.0f64; FS * 10];
@@ -375,6 +384,7 @@ fn run_sweep(args: &[String]) -> ExitCode {
                 *s = rng.gauss(sigma);
             }
             let dt_w_ms = -160i32 + ((t as i32 * 53) % 401);
+            let true_start_ms = (400 + dt_w_ms) as u32;
             if let Some(wb) = weak_wav.as_deref() {
                 let start = ((200 + dt_w_ms) as usize * FS) / 1000;
                 let sc = weak_rms / 10_000.0;
@@ -384,7 +394,7 @@ fn run_sweep(args: &[String]) -> ExitCode {
                     }
                 }
             } else {
-                let start = ((400 + dt_w_ms) as usize * FS) / 1000;
+                let start = (true_start_ms as usize * FS) / 1000;
                 let mut m = Modulator::new(weak_tones, RATE_24K, 1037, DEFAULT_SPACING_HZ, weak_amp);
                 let mut i = start;
                 while let Some(v) = m.next_sample() {
@@ -423,17 +433,46 @@ fn run_sweep(args: &[String]) -> ExitCode {
             }
             let mut out = [Decoded { frame: dummy, audio_hz: 0, time_offset_ms: 0, snr_db: 0 }; MAX_DECODED];
             let n = rx.finish_slot(&mut out);
-            if out[..n].iter().any(|d| d.frame == weak_frame) {
+            let blind_hit = out[..n].iter().any(|d| d.frame == weak_frame);
+            if blind_hit {
                 ok += 1;
+            }
+            if oracle {
+                rx.reset();
+                rx.set_oracle_track(true_start_ms, 1037);
+                for blk in pcm.chunks(192) {
+                    rx.push_samples(blk);
+                }
+                let n2 = rx.finish_slot(&mut out);
+                let oracle_hit = out[..n2].iter().any(|d| d.frame == weak_frame);
+                if oracle_hit {
+                    ok_oracle += 1;
+                    if !blind_hit {
+                        rec_of_missed += 1;
+                    }
+                }
             }
         }
         let frac = ok as f64 / trials as f64;
         rates.push((snr_db, frac));
-        println!("  SNR={snr_db:+5.1} dB : {ok:3}/{trials} ({:5.1}%)", 100.0 * frac);
+        if oracle {
+            let ofrac = ok_oracle as f64 / trials as f64;
+            orates.push((snr_db, ofrac));
+            let missed = trials - ok;
+            println!("  SNR={snr_db:+5.1} dB : blind={ok:3}/{trials} ({:5.1}%) | oracle={ok_oracle:3}/{trials} ({:5.1}%) | recovered_of_missed={rec_of_missed:2}/{missed:2}", 100.0 * frac, 100.0 * ofrac);
+        } else {
+            println!("  SNR={snr_db:+5.1} dB : {ok:3}/{trials} ({:5.1}%)", 100.0 * frac);
+        }
     }
     if let Some(w) = rates.windows(2).find(|w| w[0].1 >= 0.5 && w[1].1 <= 0.5 && (w[0].1 - w[1].1).abs() > 1e-9) {
         let snr50 = w[0].0 + (0.5 - w[0].1) / (w[1].1 - w[0].1) * (w[1].0 - w[0].0);
-        println!("  interp_50pct = {snr50:+.2} dB");
+        println!("  interp_50pct_blind  = {snr50:+.2} dB");
+    }
+    if oracle {
+        if let Some(w) = orates.windows(2).find(|w| w[0].1 >= 0.5 && w[1].1 <= 0.5 && (w[0].1 - w[1].1).abs() > 1e-9) {
+            let snr50 = w[0].0 + (0.5 - w[0].1) / (w[1].1 - w[0].1) * (w[1].0 - w[0].0);
+            println!("  interp_50pct_oracle = {snr50:+.2} dB");
+        }
     }
     ExitCode::SUCCESS
 }
