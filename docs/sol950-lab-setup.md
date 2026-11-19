@@ -182,3 +182,15 @@ A carrier capture proves the fixture. For the **SOL950 TX waveform** measurement
         - `cur` (Captured Radtel `CQ`): `-16 dB`: `27 / 53 / 47 -> 47/47 / 47/47 -> 100/100`; `-17 dB`: `4 / 9 / 91 -> 72/91 / 69/91 -> 78/100`; `-18 dB`: `0 / 0 / 100 -> 15/100 / 13/100 -> 13/100`.
         - `ref` (Synthetic `RX`): `-18 dB`: `41 / 74 / 26 -> 26/26 / 26/26 -> 100/100`; `-19 dB`: `9 / 18 / 82 -> 72/82 / 68/82 -> 86/100`.
         - `ref` (Captured Radtel `CQ`): `-18 dB`: `64 / 90 / 10 -> 10/10 / 10/10 -> 100/100`; `-19 dB`: `7 / 17 / 83 -> 80/83 / 80/83 -> 97/100`.
+
+### Live over-the-air two-way verification (`NQ6N` RT-950 Pro ↔ `NQ6NA` HackRF One, 2026-11-19)
+
+- **Setup:** Radtel RT-950 Pro running Ferrite `sol950` (`tx-bench`, layout 3 + SPI parts installed, `dry=0`, TX power `Low`, manual grid `FN31`) placed near a HackRF One (r9, fw `2026.01.3`) driven directly by `digimodes/usol950/examples/rad950_hackrf.rs` (`2.4 MS/s` ↔ `24 kHz` USB DDC).
+- **Frequency calibration:** Carrier probe on 12m (`24.919 MHz`) measured `24,921,300 Hz` (`+2,300 Hz` dial offset) arriving at `1,210 Hz` (`218.3×` SNR ratio), establishing **`+43.7 ppm`** (`--ppm 43.7` on `rad950_hackrf`) between this HackRF One and RT-950 Pro across 12m and 10m.
+- **HackRF One (`NQ6NA`) → RT-950 Pro (`NQ6N`) live OTA RX:**
+  - **12m (`24.919 MHz`, `--ppm 43.7`, `subch 2 = 1050 Hz`):** Decoded **`NQ6NA FN31 NEW +12 dB`** live onto the RT-950 Pro's `RAD950` call list.
+  - **10m (`28.078 MHz`, `--ppm 43.7`, `subch 2 = 1050 Hz`):** Decoded **`NQ6NA FN31 NEW +7 dB`** (and `-6 dB` on repeat), plus `R+RX` (`NQ6N de NQ6NA R+RX -24 dB`) at `-8 dB` on the RT-950 Pro.
+- **RT-950 Pro (`NQ6N`) → HackRF One (`NQ6NA`) live OTA TX:**
+  - Pressed `OK` (Answer) on `NQ6NA` on the RT-950 Pro (`RAD950 QSO`, `28.078 MHz`, `Low` power, `dry=0`).
+  - HackRF One (`rad950_hackrf --band 10m --ppm 43.7 --lna 0 --vga 16 --rx-once`, RF amp off) decoded live over the air: `Rx { sender: NQ6N, recipient: NQ6NA, snr_db: +7, ack: false }` at `938 Hz`, `-24 dB` SNR.
+- **On-MCU stability:** Resolved stack headroom (`ui::task` `12,096 B -> 6,560 B`, `dsp::feed` `5,536 B -> <1,600 B`, `Decoder::switch` `4,800 B -> <100 B`), Low Power Mode 24 MHz DSP starvation, World Map `lcd.rows()` band clipping, and PTT exit behavior; verified 231+ consecutive live 10-second RX slots with zero crashes.
