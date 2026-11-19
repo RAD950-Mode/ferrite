@@ -662,8 +662,7 @@ impl Job {
                         return Step::Line;
                     }
                     if a.signal.is_sol950() {
-                        let g = ferrite_core::txtest::sol950_gains(a.level);
-                        put!(out, "  {}: frozen Tone 1 REG_70 [{},{},{},{}], REG_40 dev {}, TX DC/AF bypassed, TMR5 1.25 ms; restored at unkey", a.signal.name(), g[0], g[1], g[2], g[3], a.baud);
+                        put!(out, "  {}: BK4829 PLL REG_38/39 (50 Hz/tone; cal +500 Hz steps), REG_30 VCO toggle, TMR5 1.25 ms; restored at unkey", a.signal.name());
                         self.st = St::Over;
                         self.line += 1;
                         return Step::Line;

@@ -76,7 +76,8 @@ pub const CW_PITCH_HZ: u32 = 700;
 
 /// HF-19: how the SI4732 tunes a frequency (10 Hz units) in SSB: the whole kHz for its tune command, the
 /// sideband (true = USB; CW is USB), and the rest as the BFO offset in Hz, so a step under 1 kHz only moves the
-/// BFO. CW tunes [`CW_PITCH_HZ`] below. The BFO's sign (the chip hearing tune + BFO) is unverified on air.
+/// BFO. CW tunes [`CW_PITCH_HZ`] below. Bench measurement on USB (`SI4732` `SSB_BFO`) showed positive BFO
+/// lowers zero-beat RF (`f_tune - BFO`, raising USB audio frequency), opposite to the sign assumed here.
 pub fn tune(freq: crate::freq::Freq10, mode_usb: bool, cw: bool) -> (u16, bool, i16) {
     let f = if cw { freq.saturating_sub(CW_PITCH_HZ / 10) } else { freq };
     ((f / 100) as u16, mode_usb || cw, (f % 100 * 10) as i16)

@@ -106,22 +106,32 @@ hackrf_transfer -r radtel-tx.cs8 -f 27985000 -s 8000000 -n 120000000 -a 0 -p 0 -
 
 With the radio configured for conducted 10 m TX, use its lowest supported TX power and a short ordinary carrier first. A carrier at 28.186050 MHz should appear at **+201.050 kHz** in the recording. Check that it disappears on unkey and that an additional known pad changes the measured level accordingly. Look for clipping and check capture overruns before increasing receiver gain. Keep the fixed protective pads installed. Switching Ferrite Dry TX off requires a local action on the radio; subsequent remote PTT uses the normal TX checks. [Ferrite Dry TX controls](../crates/ferrite-app/src/term/cmd.rs) · [Remote PTT behavior](../tools/ferrite_link.py)
 
-A carrier capture proves the fixture. For the **SOL950 TX waveform** measurement, `txtest` includes two non-blocking `TMR5`-paced BK4829 frozen-Tone-1 modes (respecting all normal TX band/power/Dry-TX checks and restoring registers on unkey):
+A carrier capture proves the fixture. For the **SOL950 TX waveform** measurement, `txtest` includes two non-blocking `TMR5`-paced BK4829 direct-PLL modes (respecting all normal TX band/power/Dry-TX checks and restoring registers on unkey). Hardware testing on the RT-950 Pro established that neither frozen Tone 1 (`REG_71 = 0`) nor MCU `DAC1` (`PA4 -> PC12 -> BK4829 mic`, which has an ~22 Hz / ~7.2 ms AC-coupling high-pass) holds static DC across 80 ms symbols, whereas stepping BK4829's `10 Hz`-resolution PLL (`REG_38`/`REG_39`) and latching via `REG_30` VCO toggle produces exact `50.00 Hz` tone steps (`< 0.1 Hz` RMS error):
 
-1. **Calibrate `REG_40` deviation (`sol950-cal`):** Tune the active slot to e.g. `28.186000 MHz` (so upward `REG_70` shifts straddle `28.186050..28.186200 MHz`), start a 6 s HackRF capture, arm the 9-step (`0..=127`, `500 ms`/step = `4.5 s`) staircase, and key:
+1. **Verify PLL latching (`sol950-cal`):** Tune the active slot to `28.186000 MHz`, start a 7 s HackRF capture, arm the `500 ms`/step `+500 Hz` staircase (steps `0..4` toggle `REG_30` bit 15 `0x43FA -> 0xC3FA`; steps `4..9` use `tx_on`), and key:
 
    ```sh
    python3 tools/ferrite_link.py "$PORT" term "txtest sol950-cal 180"
-   python3 tools/ferrite_link.py "$PORT" key --seconds 6
+   python3 tools/ferrite_link.py "$PORT" key --seconds 5.2 --slot b
    ```
 
-   Adjust `DEV` (`180` default, `1..4095`) until `REG_70` gains `[16, 48, 80, 112]` (`ΔG = 32`) produce `50.0 Hz` tone steps (`150.0 Hz` span).
-
-2. **Radiate and decode the 110-symbol `CQ NQ6N FN31` reference burst (`sol950`):** Start a 15 s HackRF RX capture at `-f 27985000`, arm `txtest sol950 <DEV>`, and key for 10 s (`0.20 s` tone-0 lead-in + `8.80 s` 110-symbol burst with `10 ms` raised-cosine ramps and `70 ms` steady holds):
+2. **Radiate and decode the 110-symbol `CQ NQ6N FN31` reference burst (`sol950`):** Tune slot B to `28.18605 MHz` (placing tones `0..3` at `+201,037 .. +201,187 Hz` relative to `27.985 MHz`), start a 13 s HackRF RX capture at `-f 27985000`, arm `txtest sol950`, and key for `10.5 s` (`0.20 s` tone-0 lead-in + `8.80 s` 110-symbol burst at `80 ms`/symbol, `50 Hz`/tone):
 
    ```sh
-   python3 tools/ferrite_link.py "$PORT" term "txtest sol950 180"
-   python3 tools/ferrite_link.py "$PORT" key --seconds 10
+   python3 tools/ferrite_link.py "$PORT" term "txtest sol950"
+   python3 tools/ferrite_link.py "$PORT" key --seconds 10.5 --slot b
    ```
 
-   Mix the captured `radtel-tx.cs8` down by `-200 kHz` (putting `28.185 MHz` at `0 Hz` USB audio), low-pass, decimate to `24 kHz` mono WAV, and run `cargo run -p usol950 --example sol950_wav -- decode radtel-tx.wav` alongside direct inspection of the four tone centers, 10 ms transitions, 70 ms holds, envelope, 99%-power occupied bandwidth, and start-to-end frequency drift. Record the firmware commit, `DEV`, and HackRF clock reference; drift measured with free-running radios includes both oscillators. [BK4829 TX driver](../firmware/src/tasks/radio/afskbk.rs) · [Reference modulator](../digimodes/usol950/src/phy.rs)
+   Mix the captured `radtel-tx.cs8` down by `-200 kHz` (putting `28.185 MHz` at `0 Hz` USB audio), low-pass, decimate to `24 kHz` mono WAV, and run `cargo run -p usol950 --example sol950_wav -- decode radtel-tx.wav` alongside direct inspection of the four tone centers, symbol duration, power envelope, 99%-power occupied bandwidth, and start-to-end frequency drift. [BK4829 TX driver](../firmware/src/tasks/radio/afskbk.rs) · [Reference modulator](../digimodes/usol950/src/phy.rs)
+
+### Measured bench results (`NQ6N FN31`, 2026-11-18)
+
+- **Experiment 1 (Radtel RX via SI4732 USB + HackRF):**
+  - Proved proportional `+48..+54 ppm` SI4732 clock offset (`+766 Hz` at 14.074 MHz, `+1,349 Hz` at 28.185 MHz) and proved positive `SSB_BFO` lowers zero-beat RF (`+100 Hz` USB audio per `+100 Hz` BFO, opposite to [ssb.rs](../crates/ferrite-core/src/ssb.rs)):
+    - `14.074 MHz` control (`BFO +766 Hz`, HackRF `14.075050 MHz`): source-off noise `-26.1 dB`, carrier `1047.27 Hz` at `+9.6 dB`.
+    - `28.185 MHz` (`HackRF 28.186050 MHz`): source-off noise `-26.2 dB`; `BFO +1350 Hz` -> `1050.61 Hz` at `+6.4 dB`; `BFO +1450 Hz` -> `1152.65 Hz` at `+6.0 dB`.
+  - Decoded 15 s injected `CQ NQ6N FN31` captures cleanly (`0` lost frames, `0` missing samples, `0` clips) at both `-x 20` (`t=2360 ms | 1049 Hz | +6 dB | CQ NQ6N FN31 (pwr_code=10)`) and `-x 0` (`t=2360 ms | 1049 Hz | +2 dB | CQ NQ6N FN31 (pwr_code=10)`).
+- **Experiment 2 (Radtel TX via BK4829 #1 PLL -> directional coupler -> 30 dB pad -> HackRF):**
+  - Eliminated frozen Tone 1 (`REG_71 = 0`, zero modulation) and `DAC1` (`PA4 -> PC12 -> BK4829 mic`, ~22 Hz / ~7.2 ms AC-coupling decay).
+  - Verified direct `REG_38/39` PLL stepping in `sol950-cal` (`bit15_only` `0x43FA -> 0xC3FA` on steps `0..4` latched `+500 Hz` steps cleanly with `0.36..0.65` min 0.5 ms narrowband power ratio; `tx_on` on steps `4..9` measured `0.27..0.38`).
+  - `txtest sol950` (`slot B 28.18605 MHz` LOW, HackRF `27.985 MHz`, `24 kHz` mono WAV) decoded `t=1400 ms | 1037 Hz | +8 dB | CQ NQ6N FN31 (pwr_code=10)`, measuring tones `1036.93 / 1086.93 / 1136.94 / 1186.92 Hz` (spacings `49.997 / 50.010 / 49.984 Hz`, `0.086 Hz` RMS error), `80.0104 ms`/symbol, `+0.12 Hz` linear drift over `8.72 s`, `291.25 Hz` (±500 Hz span) / `426.82 Hz` (noise-subtracted ±2 kHz span) 99% OBW, and brief `< 0.5 ms` VCO re-lock transients at symbol changes (`1 ms` dips `0.30..0.47` at `80 ms` boundaries).

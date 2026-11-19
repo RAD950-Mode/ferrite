@@ -237,7 +237,7 @@ fn analyze_tone_samples(rate: u32, samples: &[i16]) -> Option<(f64, f64, usize, 
     let mut sig_plus_n = 0.0f64;
     let mut noise_sum = 0.0f64;
     let mut noise_bins = 0usize;
-    for (k, &pk) in pwr.iter().enumerate().take(hi_bin + 1).skip(300) {
+    for (k, &pk) in pwr.iter().enumerate().take(hi_bin + 1).skip(lo_bin) {
         if k.abs_diff(peak_k) <= 3 {
             if k.abs_diff(peak_k) <= 2 {
                 sig_plus_n += pk;

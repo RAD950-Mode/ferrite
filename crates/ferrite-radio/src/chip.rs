@@ -544,40 +544,36 @@ pub fn afsk_bk_end<B: Bus>(bk: &mut Bk4829<B>) {
 #[cfg(all(feature = "tx", feature = "bench"))]
 #[derive(Clone, Copy)]
 pub struct Sol950Saved {
-    pub regs: [(u8, u16); 7],
+    pub regs: [(u8, u16); 9],
+    pub base_hz: u32,
+    pub narrow: bool,
 }
 
-/// Start SOL950 frozen-tone continuous-phase 4-FSK on the keyed BK4829: saves modified TX/tone registers, enters
-/// `Source::Tones` (`REG_30 = 0xC3FA`, mic off), bypasses TX AF/DC/HPF/pre-emphasis filters, sets `REG_40` low 12
-/// bits to `dev`, and starts Tone 1 at 1 kHz (`g0`); caller waits 250 us (quarter cycle) and calls [`sol950_bk_freeze`].
+/// Start SOL950 bench carrier-stepping on the keyed BK4829: saves modified registers and initial frequency
+/// `base_hz`, enters `Source::Tones` (`REG_30 = 0xC3FA`, mic off, Tone 1 off).
 #[cfg(all(feature = "tx", feature = "bench"))]
-pub fn sol950_bk_prime<B: Bus>(bk: &mut Bk4829<B>, dev: u16, g0: u8, narrow: bool) -> Sol950Saved {
-    let regs = [0x70u8, 0x71, 0x47, 0x7E, 0x29, 0x2B, 0x40].map(|r| (r, bk.read(r)));
-    let get = |r: u8| regs.iter().find(|s| s.0 == r).map_or(0, |s| s.1);
+pub fn sol950_bk_prime<B: Bus>(bk: &mut Bk4829<B>, _dev: u16, _g0: u8, narrow: bool) -> Sol950Saved {
+    let regs = [0x38u8, 0x39, 0x70, 0x71, 0x47, 0x7E, 0x29, 0x2B, 0x40].map(|r| (r, bk.read(r)));
+    let base_hz = bk.freq();
     bk.tx_on(bk4829::tx::Source::Tones, !narrow);
-    bk.write(0x47, get(0x47) | 1); // AF TX filters bypassed
-    bk.write(0x7E, get(0x7E) & !0x0038); // TX DC filter off
-    bk.write(0x29, get(0x29) & !0x0E00); // TX DC filter HPF1 off
-    bk.write(0x2B, get(0x2B) | 0x0007); // TX HPF, LPF1, pre-emphasis off
-    bk.write(0x40, (get(0x40) & 0xF000) | (dev & 0x0FFF));
-    bk.write(0x70, 1 << 15 | ((g0 & 0x7F) as u16) << 8);
-    bk.write(0x71, bk4829::tone_word(1000));
-    Sol950Saved { regs }
+    bk.write(0x70, 0);
+    Sol950Saved { regs, base_hz, narrow }
 }
 
-/// Freeze Tone 1's phase accumulator near its peak (`REG_71 = 0`).
+/// Set SOL950 frequency step (`hz` absolute), latching via VCO bit-15 toggle (`bit15_only = true`:
+/// `0x43FA -> 0xC3FA`) or full `tx_on` (`0x0200 -> 50 us -> 0xC3FA`).
 #[cfg(all(feature = "tx", feature = "bench"))]
-pub fn sol950_bk_freeze<B: Bus>(bk: &mut Bk4829<B>) {
-    bk.write(0x71, 0);
+pub fn sol950_bk_freq<B: Bus>(bk: &mut Bk4829<B>, hz: u32, bit15_only: bool, narrow: bool) {
+    bk.set_freq(hz);
+    if bit15_only {
+        bk.write(bk4829::reg::POWER, 0x43FA);
+        bk.write(bk4829::reg::POWER, 0xC3FA);
+    } else {
+        bk.tx_on(bk4829::tx::Source::Tones, !narrow);
+    }
 }
 
-/// Step Tone 1's frozen output amplitude (`REG_70` bits 14:8).
-#[cfg(all(feature = "tx", feature = "bench"))]
-pub fn sol950_bk_gain<B: Bus>(bk: &mut Bk4829<B>, gain: u8) {
-    bk.write(0x70, 1 << 15 | ((gain & 0x7F) as u16) << 8);
-}
-
-/// Restore all 7 registers saved by [`sol950_bk_prime`] before unkey completes.
+/// Restore all registers saved by [`sol950_bk_prime`] before unkey completes.
 #[cfg(all(feature = "tx", feature = "bench"))]
 pub fn sol950_bk_end<B: Bus>(bk: &mut Bk4829<B>, saved: &Sol950Saved) {
     for &(r, v) in &saved.regs {

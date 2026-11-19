@@ -1863,6 +1863,7 @@ fn debug_txtest_suite() {
     assert!(r.raw().contains("refused: the suite runs 60 s"), "{}", r.raw());
 }
 
+#[cfg(feature = "bench")]
 #[test]
 fn debug_txtest_sol950() {
     use ferrite_core::txtest::{Arm, Ask, Signal, SOL950_DEV_DEFAULT};
@@ -1870,7 +1871,7 @@ fn debug_txtest_sol950() {
     r.cmd("txtest sol950");
     assert_eq!(r.serve(4, regs), vec![DebugReq::TxTest(Ask::Set(Some(Arm::new(Signal::Sol950))))]);
     assert!(r.raw().contains(&std::format!("txtest: sol950 (dev {SOL950_DEV_DEFAULT}) at 100 % armed")), "{}", r.raw());
-    assert!(r.raw().contains("sol950: frozen Tone 1 REG_70 [16,48,80,112]"), "{}", r.raw());
+    assert!(r.raw().contains("sol950: BK4829 PLL REG_38/39 (50 Hz/tone; cal +500 Hz steps), REG_30 VCO toggle"), "{}", r.raw());
     r.send(b"\r");
 
     r.cmd("txtest sol950 220 50");

@@ -61,8 +61,8 @@ pub fn on_interrupt() {
 enum RunMode {
     Afsk,
     Sol950 {
-        gen: Sol950Bk,
-        last_gain: u8,
+        cal: bool,
+        last_step: u32,
         saved: Sol950Saved,
     },
 }
@@ -82,13 +82,8 @@ impl Radio {
     pub(super) fn bk_test_start(&mut self, n: u8, arm: &Arm) {
         if arm.signal.is_sol950() {
             let cal = arm.signal == TxSig::Sol950Cal;
-            let gen = Sol950Bk::new(cal, arm.level);
-            let g0 = gen.gain_at(0);
-            let dev = arm.baud;
             let narrow = self.tx.narrow;
-            let saved = radio_chip::sol950_bk_prime(&mut self.chip(n), dev, g0, narrow);
-            crate::hal::time::delay_us(250); // quarter cycle of 1 kHz -> freeze Tone 1 near peak
-            radio_chip::sol950_bk_freeze(&mut self.chip(n));
+            let saved = radio_chip::sol950_bk_prime(&mut self.chip(n), arm.baud, 0, narrow);
             CHANGES.store(0, Relaxed);
             EDGE.reset();
             let t0 = crate::hal::edge::start(PRIO);
@@ -102,9 +97,9 @@ impl Radio {
                 sent: 0,
                 missed: 0,
                 writes: 1,
-                mode: RunMode::Sol950 { gen, last_gain: g0, saved },
+                mode: RunMode::Sol950 { cal, last_step: 0, saved },
             });
-            log(b"txtest sol950 dev ", dev as u32);
+            log(b"txtest sol950 dev ", arm.baud as u32);
         } else {
             let narrow = self.tx.narrow;
             radio_chip::afsk_bk_begin(&mut self.chip(n), bk_tone(0), bk_gain(arm.level), narrow);
@@ -142,12 +137,32 @@ impl Radio {
                     radio_chip::afsk_bk_tone(&mut self.chip(chip), bk_tone(n));
                     run.writes += 1;
                 }
-                RunMode::Sol950 { gen, last_gain, .. } => {
-                    let g = gen.gain_at(n);
-                    if g != *last_gain {
-                        *last_gain = g;
-                        radio_chip::sol950_bk_gain(&mut self.chip(chip), g);
-                        run.writes += 1;
+                RunMode::Sol950 { cal, last_step, saved } => {
+                    if *cal {
+                        // 500 ms per step: steps 0..4 test bit-15-only VCO toggle (0x43FA->0xC3FA), 4..9 full tx_on
+                        let idx = (n / Sol950Bk::CAL_HOLD_STEPS).min(8);
+                        if idx != *last_step {
+                            *last_step = idx;
+                            let (off_hz, bit15_only) = if idx < 4 { (idx * 500, true) } else { ((idx - 4) * 500, false) };
+                            let hz = saved.base_hz.saturating_add(off_hz);
+                            let narrow = saved.narrow;
+                            radio_chip::sol950_bk_freq(&mut self.chip(chip), hz, bit15_only, narrow);
+                            run.writes += 1;
+                        }
+                    } else if n >= Sol950Bk::LEAD_STEPS {
+                        // 80 ms per symbol (64 * 1.25 ms), 10 Hz resolution (50 Hz/tone -> 0, 50, 100, 150 Hz)
+                        let sym = ((n - Sol950Bk::LEAD_STEPS) / 64) as usize;
+                        if sym < ferrite_core::txtest::SOL950_REF_TONES.len() {
+                            let tone = ferrite_core::txtest::SOL950_REF_TONES[sym] as u32;
+                            let idx = tone + 1;
+                            if idx != *last_step {
+                                *last_step = idx;
+                                let hz = saved.base_hz.saturating_add(tone * 50);
+                                let narrow = saved.narrow;
+                                radio_chip::sol950_bk_freq(&mut self.chip(chip), hz, false, narrow);
+                                run.writes += 1;
+                            }
+                        }
                     }
                 }
             }

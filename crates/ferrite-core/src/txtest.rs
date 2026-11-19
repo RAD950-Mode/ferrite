@@ -89,9 +89,9 @@ pub enum Signal {
     Gmsk,
     /// TERM-33.17: 9600 Bd G3RUH (scrambled PRBS9).
     G3ruh,
-    /// SOL950 110-symbol `CQ NQ6N FN31` reference burst from BK4829 frozen Tone 1 (`REG_70` gain stepped by TMR5).
+    /// SOL950 110-symbol `CQ NQ6N FN31` reference burst via BK4829 PLL stepping (`REG_38/39` + VCO toggle, TMR5).
     Sol950,
-    /// SOL950 9-level `REG_70` gain calibration staircase (`0..=127`, 500 ms/step) timed by TMR5.
+    /// SOL950 BK4829 PLL calibration staircase (`+500 Hz`/step every 500 ms, TMR5).
     Sol950Cal,
 }
 
@@ -218,7 +218,7 @@ impl Signal {
     }
 
     /// The filters when none are named: `data` for the DAC signals; `afsk-bk` and `sol950*` leave the key-up's
-    /// voice settings (`sol950*` saves and restores its own bypassed TX registers).
+    /// voice settings (`sol950*` saves and restores its own BK4829 TX registers).
     pub fn default_filters(self) -> Filters {
         if matches!(self, Signal::AfskBk | Signal::Sol950 | Signal::Sol950Cal) {
             Filters::Voice
