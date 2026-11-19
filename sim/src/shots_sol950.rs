@@ -138,9 +138,13 @@ pub fn run(scale: u32) {
             let col = ferrite_app::sol950::tx_wf_col(1525, tones[sym.min(tones.len() - 1)]);
             h.wf.push(col, k == 0, true);
         }
+        h.tx_in_flight = true;
     }
     step(&mut app, &mut fb, &mut radio, 100, &mut t);
     crate::save(&fb, "sol950-active", scale);
+    if let Some(h) = app.sol950_host_mut() {
+        h.tx_in_flight = false;
+    }
 
     // Return to Operate
     press(&mut app, Key::Digit(0), &mut t);

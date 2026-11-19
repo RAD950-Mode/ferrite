@@ -100,6 +100,11 @@ pub fn page_id(s: &Sol950Scr) -> &'static str {
     }
 }
 
+fn draw_tx_flag(lcd: &mut impl Panel, x: i32, y: i32) {
+    lcd.fill(x, y, 28, 16, RED);
+    lcd.text4(x + 6, y + 12, b"TX", &UI_12B, WHITE, RED);
+}
+
 fn push_khz3<const N: usize>(b: &mut Buf<N>, dial: Freq10) {
     let mhz_i = dial / 100_000;
     let khz_i = (dial % 100_000) / 100;
@@ -599,6 +604,7 @@ impl Sol950Scr {
         let mut rows = [empty_row(); MAX_PEERS];
         let mut n_rows = 0usize;
         let mut rx_distress = None;
+        let mut tx_now = tx_active;
         if let Some(h) = app.sol950_host() {
             id_len = h.profile.format_identity(&mut id_buf);
             (grid_bytes, grid_src) = h.profile.effective_grid(h.gps_grid);
@@ -606,6 +612,7 @@ impl Sol950Scr {
             utc_ok = h.utc_ready();
             coop_rx = h.profile.coop_rx;
             coop_link = h.profile.coop_link;
+            tx_now |= h.tx_in_flight;
             mode_tag = match h.engine.mode() {
                 OpMode::Monitor => 0,
                 OpMode::AutoCq { parity } => 1 + parity as u32,
@@ -622,7 +629,7 @@ impl Sol950Scr {
             .n(dial)
             .n(utc_ok as u32)
             .n(rx_ready as u32)
-            .n(tx_active as u32)
+            .n(tx_now as u32)
             .n(rssi as u32)
             .n(loading as u32)
             .n(mode_tag)
@@ -630,7 +637,7 @@ impl Sol950Scr {
             .n(coop_link as u32)
             .n(rx_distress.map_or(0, |d| d.alert.sender.raw() ^ ((d.status as u32) << 28)))
             .get();
-        if let Some(clear) = app.dirty_shape(R_TOP, top_h, true) {
+        if let Some(clear) = app.dirty_shape(R_TOP, top_h, false) {
             let y0 = TOP_Y;
             redraw_box!(clear, lcd, (0, y0, W, 44, BG), {
                 if let Some(inc) = rx_distress {
@@ -674,13 +681,16 @@ impl Sol950Scr {
                     let g_s = core::str::from_utf8(&grid_bytes).unwrap_or("----");
                     let _ = uwrite!(line1, "{} {} {}", id_s, g_s, src_tag);
                     lcd.text4(8, y0 + 16, line1.as_bytes(), &UI_14, TEXT, BG);
+                    if tx_now {
+                        draw_tx_flag(lcd, W - 36, y0 + 3);
+                    }
 
                     let mut line2 = Buf::<36>::new();
                     push_khz3(&mut line2, dial);
                     let st = if loading < 100 {
                         " LOAD"
-                    } else if tx_active {
-                        " TX"
+                    } else if tx_now {
+                        ""
                     } else if rx_ready {
                         " RX"
                     } else {
@@ -688,7 +698,7 @@ impl Sol950Scr {
                     };
                     let utc_s = if utc_ok { " UTC OK" } else { " NO UTC" };
                     let _ = uwrite!(line2, "{}{}", st, utc_s);
-                    let col = if tx_active { RED } else if utc_ok && rx_ready { GREEN } else { AMBER };
+                    let col = if tx_now { AMBER } else if utc_ok && rx_ready { GREEN } else { AMBER };
                     lcd.text4(8, y0 + 35, line2.as_bytes(), &UI_12, col, BG);
                     if coop_rx == CoopRxMode::Capture {
                         let badge: &[u8] = match coop_link {
@@ -770,7 +780,11 @@ impl Sol950Scr {
             let wf_ht = (WF_ROWS * 2) as i32; // 48 px
             redraw_box!(clear, lcd, (0, y0, W, 70, BG), {
                 lcd.fill(0, y0, W, 1, RULE);
+                lcd.fill(0, y0 + 1, W, 17, BG);
                 lcd.text4(6, y0 + 14, b"586-2344 Hz  225Hz", &UI_12, DIM, BG);
+                if tx_now {
+                    draw_tx_flag(lcd, W - 74, y0 + 1);
+                }
                 let mut tr = Buf::<8>::new();
                 let _ = uwrite!(tr, "T+{}s", slot_sec);
                 lcd.text4(W - 40, y0 + 14, tr.as_bytes(), &UI_12, if tx_now { RED } else { AMBER }, BG);
@@ -813,9 +827,10 @@ impl Sol950Scr {
     }
 
     fn draw_active(self, app: &mut App, lcd: &mut impl Panel, live: &LiveAll) {
-        let tx_active = matches!(live.mode, ModeLive::Sol950 { tx_active: true, .. });
+        let mut tx_active = matches!(live.mode, ModeLive::Sol950 { tx_active: true, .. });
         let mut rows = [empty_row(); MAX_PEERS];
         let (mode, active_row, saved_ack, notice_len) = if let Some(h) = app.sol950_host() {
+            tx_active |= h.tx_in_flight;
             let n = h.engine.activity_rows(&mut rows);
             let matched = h
                 .target_peer
@@ -839,7 +854,7 @@ impl Sol950Scr {
             .n(saved_ack as u32)
             .n(notice_len as u32)
             .get();
-        if let Some(clear) = app.dirty_shape(R_TOP, h, true) {
+        if let Some(clear) = app.dirty_shape(R_TOP, h, false) {
             let y0 = TOP_Y;
             redraw_box!(clear, lcd, (0, y0, W, 180, BG), {
                 let mut peer_line = Buf::<28>::new();
@@ -854,6 +869,9 @@ impl Sol950Scr {
                     let _ = uwrite!(peer_line, "Peer: none");
                 }
                 lcd.text4(10, y0 + 28, peer_line.as_bytes(), &UI_15B, TEXT, BG);
+                if tx_active {
+                    draw_tx_flag(lcd, W - 36, y0 + 13);
+                }
 
                 let act_col = if tx_active { RED } else if saved_ack { GREEN } else { BLUE };
                 lcd.text4(10, y0 + 62, action, &UI_14, act_col, BG);
@@ -997,7 +1015,7 @@ impl Sol950Scr {
         let id_len = prof.format_identity(&mut id_buf);
         let (eff_g, _) = prof.effective_grid(gps_grid);
         let ph = Mix::new().b(&id_buf[..id_len]).b(&eff_g).get();
-        if let Some(clear) = app.dirty_shape(R_NOTE, ph, true) {
+        if let Some(clear) = app.dirty_shape(R_NOTE, ph, false) {
             let y = y0 + SETUP_VISIBLE as i32 * row_h + 6;
             redraw_box!(clear, lcd, (0, y, W, 24, BG), {
                 let mut pv = Buf::<32>::new();
@@ -1131,7 +1149,7 @@ impl Sol950Scr {
             .n(full as u32)
             .b(&filter.unwrap_or(*b"----"))
             .get();
-        if let Some(clear) = app.dirty_shape(R_TOP, th, true) {
+        if let Some(clear) = app.dirty_shape(R_TOP, th, false) {
             let y0 = TOP_Y;
             redraw_box!(clear, lcd, (0, y0, W, 24, BG), {
                 let mut head = Buf::<32>::new();
@@ -1188,7 +1206,7 @@ impl Sol950Scr {
             one[0]
         });
         let h = Mix::new().n(self.sel as u32).n(rec.map_or(0, |r| r.seq)).get();
-        if let Some(clear) = app.dirty_shape(R_TOP, h, true) {
+        if let Some(clear) = app.dirty_shape(R_TOP, h, false) {
             let y0 = TOP_Y + 6;
             redraw_box!(clear, lcd, (0, y0, W, 200, BG), {
                 if let Some(c) = rec {
@@ -1253,7 +1271,7 @@ impl Sol950Scr {
             .n(st.best_rx_snr as u32)
             .n(st.best_tx_snr as u32)
             .get();
-        if let Some(clear) = app.dirty_shape(R_TOP, h, true) {
+        if let Some(clear) = app.dirty_shape(R_TOP, h, false) {
             let y0 = TOP_Y + 6;
             redraw_box!(clear, lcd, (0, y0, W, 200, BG), {
                 let title: &[u8] = if today_mode { b"Today (UTC)" } else { b"All saved" };
@@ -1705,7 +1723,7 @@ impl Sol950Scr {
 
     fn draw_chat(self, app: &mut App, lcd: &mut impl Panel, live: &LiveAll) {
         let Some(h) = app.sol950_host() else { return };
-        let tx_active = matches!(live.mode, ModeLive::Sol950 { tx_active: true, .. });
+        let tx_active = matches!(live.mode, ModeLive::Sol950 { tx_active: true, .. }) || h.tx_in_flight;
         let phase = h.chat.phase;
         let peer = h.chat.peer;
         let secs = h.chat.secs_until_tx(h.utc_sec);
@@ -1738,7 +1756,7 @@ impl Sol950Scr {
             };
             th = th.n(e.from_me as u32).n(st_key).b(e.bytes());
         }
-        if let Some(clear) = app.dirty_shape(R_TOP, th.get(), true) {
+        if let Some(clear) = app.dirty_shape(R_TOP, th.get(), false) {
             let y0 = TOP_Y;
             redraw_box!(clear, lcd, (0, y0, W, 184, BG), {
                 let mut cb = [0u8; 6];
@@ -1748,31 +1766,31 @@ impl Sol950Scr {
                 let _ = uwrite!(hdr, "CHAT {}", ps);
                 lcd.text4(8, y0 + 16, hdr.as_bytes(), &UI_14, TEXT, BG);
 
-                // Make the wait visible on the right of the header.
-                let mut st = Buf::<16>::new();
-                let st_col = match phase {
-                    ChatPhase::Inviting => {
-                        let _ = uwrite!(st, "Inviting...");
-                        AMBER
-                    }
-                    ChatPhase::IncomingInvite => {
-                        let _ = uwrite!(st, "Invite!");
-                        AMBER
-                    }
-                    ChatPhase::Active if tx_active => {
-                        let _ = uwrite!(st, "TX now");
-                        RED
-                    }
-                    ChatPhase::Active => {
-                        let _ = uwrite!(st, "TX in {}s", secs);
-                        GREEN
-                    }
-                    ChatPhase::Idle => {
-                        let _ = uwrite!(st, "Ended");
-                        DIM
-                    }
-                };
-                lcd.text4(W - 76, y0 + 16, st.as_bytes(), &UI_12, st_col, BG);
+                // Make the wait visible on the right of the header; red TX flag when transmitting.
+                if tx_active {
+                    draw_tx_flag(lcd, W - 36, y0 + 3);
+                } else {
+                    let mut st = Buf::<16>::new();
+                    let st_col = match phase {
+                        ChatPhase::Inviting => {
+                            let _ = uwrite!(st, "Inviting...");
+                            AMBER
+                        }
+                        ChatPhase::IncomingInvite => {
+                            let _ = uwrite!(st, "Invite!");
+                            AMBER
+                        }
+                        ChatPhase::Active => {
+                            let _ = uwrite!(st, "TX in {}s", secs);
+                            GREEN
+                        }
+                        ChatPhase::Idle => {
+                            let _ = uwrite!(st, "Ended");
+                            DIM
+                        }
+                    };
+                    lcd.text4(W - 76, y0 + 16, st.as_bytes(), &UI_12, st_col, BG);
+                }
                 lcd.fill(0, y0 + 22, W, 1, RULE);
 
                 if phase == ChatPhase::IncomingInvite {
@@ -1986,7 +2004,7 @@ impl Sol950Scr {
         let mut buf = [0u8; 64];
         let (len, bursts, airtime_s) = h.chat.preview_draft(&mut buf);
         let ph = Mix::new().b(&buf[..len]).n(bursts as u32).n(airtime_s as u32).get();
-        if let Some(clear) = app.dirty_shape(R_TOP, ph, true) {
+        if let Some(clear) = app.dirty_shape(R_TOP, ph, false) {
             let y0 = TOP_Y + 8;
             redraw_box!(clear, lcd, (0, y0, W, 220, BG), {
                 lcd.text4(8, y0 + 16, b"Preview before sending:", &UI_12, DIM, BG);
@@ -2079,7 +2097,7 @@ impl Sol950Scr {
             .b(&id_buf[..id_len])
             .b(&eff_g)
             .get();
-        if let Some(clear) = app.dirty_shape(R_TOP, dh, true) {
+        if let Some(clear) = app.dirty_shape(R_TOP, dh, false) {
             let y0 = TOP_Y + 4;
             redraw_box!(clear, lcd, (0, y0, W, 232, BG), {
                 lcd.fill(0, y0, W, 24, RED);
