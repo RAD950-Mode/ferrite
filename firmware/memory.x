@@ -134,6 +134,9 @@ SECTIONS
      * DSP tasks' `RangeInclusive::contains`), so those stay fast. */
     *(.text.*7ferrite5tasks4aprs*);
     *(.text.*5uaprs?*);
+    /* RAD950 conversation & distress codecs (UI task only; DSP receiver/LDPC stays fast). */
+    *(.text.*7usol9504chat*);
+    *(.text.*7usol9508distress*);
     /* The tone hint (TSRCH-12, -13): the Radio task's step for it and the heard-tone decode, at most once a
      * receive tick, never from an interrupt. */
     *(.text.*8tonehint*);
