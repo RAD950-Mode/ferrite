@@ -653,7 +653,8 @@ fn run_coop(args: &[String]) -> ExitCode {
     println!("SNR   | cur_oracle | ref_demod | rescued(ref) | lost(ref)");
     let mut rx_a = Receiver::new();
     let mut rx_b = Receiver::new();
-    for (si, &snr_db) in [-15.0f64, -16.0, -17.0, -18.0].iter().enumerate() {
+    let mut ref_rates = Vec::new();
+    for (si, &snr_db) in [-15.0f64, -16.0, -17.0, -18.0, -19.0, -20.0].iter().enumerate() {
         let mut rng = SweepRng(seed_base + (si as u64) * 997);
         let (mut cur_ok, mut ref_ok, mut rescued, mut lost) = (0, 0, 0, 0);
         for t in 0..trials {
@@ -668,7 +669,63 @@ fn run_coop(args: &[String]) -> ExitCode {
             if r_hit && !c_hit { rescued += 1; }
             if c_hit && !r_hit { lost += 1; }
         }
+        ref_rates.push((snr_db, ref_ok as f64 / trials as f64));
         println!("{snr_db:+5.1} | {:3}/{trials}    | {:3}/{trials}   | {:3}          | {:3}", cur_ok, ref_ok, rescued, lost);
+    }
+    if let Some(w) = ref_rates.windows(2).find(|w| w[0].1 >= 0.5 && w[1].1 <= 0.5 && (w[0].1 - w[1].1).abs() > 1e-9) {
+        let snr50 = w[0].0 + (0.5 - w[0].1) / (w[1].1 - w[0].1) * (w[1].0 - w[0].0);
+        println!("  interp_50pct_ref_demod = {snr50:+.2} dB");
+    }
+
+    println!("\n=== Part C: Blind acquisition -> Reference demodulation decomposition (trials={trials}) ===");
+    println!("SNR   | blind_cur | in_cands | ref@blind | ref@refined | ref@oracle");
+    for (si, &snr_db) in [-15.0f64, -16.0, -17.0, -18.0, -19.0].iter().enumerate() {
+        let mut rng = SweepRng(seed_base + (si as u64) * 997);
+        let (mut b_cur, mut in_cands, mut r_blind, mut r_ref, mut r_ora) = (0, 0, 0, 0, 0);
+        let dummy = weak_frame;
+        for t in 0..trials {
+            let dt_ms = -160i32 + ((t as i32 * 53) % 401);
+            let true_ms = 400 + dt_ms;
+            let (pcm, s0_samp) = make_slot(&mut rng, snr_db, dt_ms);
+
+            // 1. Blind acquisition via current Receiver
+            rx_a.reset();
+            for blk in pcm.chunks(192) {
+                rx_a.push_samples(blk);
+            }
+            let mut matched: Option<(u32, u32)> = None;
+            for ti in 0..usol950::rx::MAX_TRACKS {
+                if let Some((est_ms, est_hz)) = rx_a.track_coords(ti) {
+                    if (est_ms as i32 - true_ms).abs() <= 60 && (est_hz as i32 - 1037).abs() <= 12 {
+                        matched = Some((est_ms, est_hz));
+                        break;
+                    }
+                }
+            }
+            let mut out = [Decoded { frame: dummy, audio_hz: 0, time_offset_ms: 0, snr_db: 0 }; MAX_DECODED];
+            let n = rx_a.finish_slot(&mut out);
+            if out[..n].iter().any(|d| d.frame == weak_frame) {
+                b_cur += 1;
+            }
+
+            if let Some((est_ms, est_hz)) = matched {
+                in_cands += 1;
+                let est_samp = (est_ms as usize * FS) / 1000;
+                if decode_llrs(&ref_demod_llrs(&pcm, est_samp, est_hz as f64)) == Some(weak_frame) {
+                    r_blind += 1;
+                }
+                // Local S0+S1 refinement around blind candidate (+/-20 ms in 5 ms steps, +/-4 Hz in 1 Hz steps)
+                let (ref_samp, ref_hz) = refine_candidate(&pcm, est_samp, est_hz as f64);
+                if decode_llrs(&ref_demod_llrs(&pcm, ref_samp, ref_hz)) == Some(weak_frame) {
+                    r_ref += 1;
+                }
+            }
+
+            if decode_llrs(&ref_demod_llrs(&pcm, s0_samp, 1037.0)) == Some(weak_frame) {
+                r_ora += 1;
+            }
+        }
+        println!("{snr_db:+5.1} | {:3}/{trials}   | {:3}/{trials}  | {:3}/{trials}   | {:3}/{trials}     | {:3}/{trials}", b_cur, in_cands, r_blind, r_ref, r_ora);
     }
 
     println!("\n=== Part B: Two-radio cooperative soft combining (independent AWGN, trials={trials}) ===");
@@ -711,10 +768,18 @@ fn run_coop(args: &[String]) -> ExitCode {
         }
     }
 
-    // Pure-noise false-accept control across 100 combined pairs
+    // False-accept controls: (1) pure noise full & 4-bit (cur & ref), (2) wrong-caller pairings (CQ + RX)
     let mut rng_n1 = SweepRng(seed_base + 999_001);
     let mut rng_n2 = SweepRng(seed_base + 999_002);
-    let mut false_acc = 0usize;
+    let (mut fa_cur_full, mut fa_cur_4b, mut fa_ref_full, mut fa_ref_4b, mut fa_wrong_4b) = (0, 0, 0, 0, 0);
+    let other_frame = if matches!(weak_frame, Frame::Cq { .. }) {
+        Frame::Rx { sender: k1abc, recipient: nq6n, snr_db: -15, ack: false, reserved: false }
+    } else {
+        Frame::Cq { sender: nq6n, grid4: fn31, tx_pwr: 10, reserved: 0 }
+    };
+    let other_tones = encode_tones(other_frame);
+    let p_m16 = p_n_2500 * 10f64.powf(-16.0 / 10.0);
+    let amp_m16 = (2.0 * p_m16).sqrt() as i16;
     for _ in 0..100 {
         let mut p1 = vec![0i16; FS * 10];
         let mut p2 = vec![0i16; FS * 10];
@@ -722,14 +787,74 @@ fn run_coop(args: &[String]) -> ExitCode {
             *a = rng_n1.gauss(sigma).clamp(-32767.0, 32767.0) as i16;
             *b = rng_n2.gauss(sigma).clamp(-32767.0, 32767.0) as i16;
         }
-        let l1 = get_cur_llrs(&mut rx_a, &p1, 0);
-        let l2 = get_cur_llrs(&mut rx_b, &p2, 0);
-        if decode_llrs(&combine_llrs(&l1, &l2, 1)).is_some() {
-            false_acc += 1;
+        let c1 = get_cur_llrs(&mut rx_a, &p1, 0);
+        let c2 = get_cur_llrs(&mut rx_b, &p2, 0);
+        if decode_llrs(&combine_llrs(&c1, &c2, 1)).is_some() { fa_cur_full += 1; }
+        if decode_llrs(&combine_llrs(&quantize_4bit(&c1, 24.0), &quantize_4bit(&c2, 24.0), 3)).is_some() { fa_cur_4b += 1; }
+        let s0_0 = (400 * FS) / 1000;
+        let r1 = ref_demod_llrs(&p1, s0_0, 1037.0);
+        let r2 = ref_demod_llrs(&p2, s0_0, 1037.0);
+        if decode_llrs(&combine_llrs(&r1, &r2, 1)).is_some() { fa_ref_full += 1; }
+        if decode_llrs(&combine_llrs(&quantize_4bit(&r1, 120.0), &quantize_4bit(&r2, 120.0), 8)).is_some() { fa_ref_4b += 1; }
+
+        // Wrong-caller pairing: slot A carries weak_frame at -16 dB, slot B carries other_frame at -16 dB
+        let (pa, sa) = make_slot(&mut rng_n1, -16.0, 0);
+        let mut pb = vec![0.0f64; FS * 10];
+        for s in &mut pb { *s = rng_n2.gauss(sigma); }
+        let mut m = Modulator::new(other_tones, RATE_24K, 1037, DEFAULT_SPACING_HZ, amp_m16);
+        let mut idx = s0_0;
+        while let Some(v) = m.next_sample() {
+            if idx < pb.len() { pb[idx] += v as f64; }
+            idx += 1;
+        }
+        let pb_i16: Vec<i16> = pb.into_iter().map(|v| v.round().clamp(-32767.0, 32767.0) as i16).collect();
+        let ra = ref_demod_llrs(&pa, sa, 1037.0);
+        let rb = ref_demod_llrs(&pb_i16, s0_0, 1037.0);
+        if let Some(f) = decode_llrs(&combine_llrs(&quantize_4bit(&ra, 120.0), &quantize_4bit(&rb, 120.0), 8)) {
+            if f != weak_frame && f != other_frame {
+                fa_wrong_4b += 1;
+            }
         }
     }
-    println!("\nnoise-only combined false accepts: {false_acc}/100");
+    println!("\nfalse-accept controls (100 pairs): noise cur(full/4b)={fa_cur_full}/{fa_cur_4b}, ref(full/4b)={fa_ref_full}/{fa_ref_4b}, wrong-caller 4b={fa_wrong_4b}");
     ExitCode::SUCCESS
+}
+
+/// Refine a blind `(est_samp, est_hz)` candidate using `S0 + S1` matched-filter energy over `+/-20 ms` (5 ms steps)
+/// and `+/-4 Hz` (1 Hz steps).
+fn refine_candidate(pcm: &[i16], est_samp: usize, est_hz: f64) -> (usize, f64) {
+    use std::f64::consts::TAU;
+    use usol950::phy::{S0, S1};
+    const SYM_N: usize = 1920;
+    let fs = RATE_24K as f64;
+    let mut best_sc = -1.0f64;
+    let mut best = (est_samp, est_hz);
+    for dt_ms in (-20i32..=20).step_by(5) {
+        let s0 = (est_samp as isize + (dt_ms as isize * RATE_24K as isize) / 1000).max(0) as usize;
+        for df_i in -4i32..=4 {
+            let f0 = est_hz + df_i as f64;
+            let mut sc = 0.0f64;
+            for &(base, pat) in &[(0usize, &S0), (18, &S1)] {
+                for (k, &w) in pat.iter().enumerate() {
+                    let a = s0 + (base + k) * SYM_N;
+                    let w_rad = TAU * (f0 + (w as f64) * (DEFAULT_SPACING_HZ as f64)) / fs;
+                    let (mut re, mut im) = (0.0f64, 0.0f64);
+                    for n in (0..SYM_N).step_by(4) {
+                        let x = pcm.get(a + n).copied().unwrap_or(0) as f64;
+                        let ph = w_rad * (n as f64);
+                        re += x * ph.cos();
+                        im += x * ph.sin();
+                    }
+                    sc += re * re + im * im;
+                }
+            }
+            if sc > best_sc {
+                best_sc = sc;
+                best = (s0, f0);
+            }
+        }
+    }
+    best
 }
 
 fn print_decoded(burst_start_ms: i64, d: &Decoded) {

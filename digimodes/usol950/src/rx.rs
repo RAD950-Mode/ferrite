@@ -485,6 +485,17 @@ impl Receiver {
         }
     }
 
+    /// Diagnostic hook: return `(start_ms, audio_hz)` of admitted track `tr_i` on the receiver's `40 ms` / half-bin grid.
+    pub fn track_coords(&self, tr_i: usize) -> Option<(u32, u32)> {
+        if tr_i >= MAX_TRACKS || !self.tracks[tr_i].active {
+            return None;
+        }
+        let tr = &self.tracks[tr_i];
+        let start_ms = tr.start_sym as u32 * 80 + tr.phase as u32 * 40;
+        let audio_hz = ((2 * FIRST_BIN as u32 + tr.q0 as u32) * (PROC_RATE_HZ / 2) + 256) / FFT_N as u32;
+        Some((start_ms, audio_hz))
+    }
+
     /// Diagnostic hook: export track `tr_i`'s zero-drift bit LLRs in canonical LDPC codeword order (`184` bits).
     pub fn track_codeword_llrs(&self, tr_i: usize) -> Option<[i8; N_BITS]> {
         if tr_i >= MAX_TRACKS || !self.tracks[tr_i].active {
