@@ -1008,14 +1008,21 @@ pub async fn task() {
         let now = now_ms();
         lpm_since = if app.low_power() { Some(lpm_since.unwrap_or(now)) } else { None };
         let since_input = now.wrapping_sub(app.last_input());
-        let lpm_wait = lpm_since.map(|t| ferrite_core::clocktree::lpm_low_in(now.wrapping_sub(t), since_input, panel_asleep, LPM_CLOCK_MS, LPM_BOOST_MS));
+        // RAD950's 512-pt FFT + 8-track receiver requires full MCU speed; never throttle to 24 MHz while open,
+        // or the higher-priority DSP task starves thread-mode `ui::task` and trips the watchdog.
+        let sol950_on = app.sol950_open();
+        let lpm_wait = if sol950_on {
+            None
+        } else {
+            lpm_since.map(|t| ferrite_core::clocktree::lpm_low_in(now.wrapping_sub(t), since_input, panel_asleep, LPM_CLOCK_MS, LPM_BOOST_MS))
+        };
         let fixed = app.settings().mcu_fixed;
         let audio = crate::hal::audio::busy();
         let mut why = app.clock_reasons(&live, now);
         if ports.live(&app, now) {
             why |= ferrite_core::clocktree::why::LINK;
         }
-        if audio || crate::hal::clock::AUDIO_WAITING.load(Relaxed) != 0 {
+        if audio || sol950_on || crate::hal::clock::AUDIO_WAITING.load(Relaxed) != 0 {
             why |= ferrite_core::clocktree::why::AUDIO;
         }
         // PWR-26.1: the panel just woke (a key, or a signal with 0 7 4 4's wake on receive): its whole redraw at full
@@ -1442,6 +1449,7 @@ fn linkz_bench() -> [u32; 11] {
 }
 
 /// Static storage for the SOL950 runtime host (initialized once at boot by `ui::task`).
+#[inline(never)]
 fn sol950_host() -> &'static mut ferrite_app::sol950::Sol950Host {
     use core::mem::MaybeUninit;
     use core::sync::atomic::AtomicBool;
@@ -1452,6 +1460,7 @@ fn sol950_host() -> &'static mut ferrite_app::sol950::Sol950Host {
 }
 
 /// Mount `SOL950_CFG` (A/B profile) and `SOL950_LOG` (64 KiB durable contact journal) at boot.
+#[inline(never)]
 fn sol950_mount_flash(store: &crate::store::Store, app: &mut App) -> ferrite_store::sol950::Sol950Journal {
     use ferrite_app::sol950::{GridSource, SavedContact, Sol950Store, MEM_LOG_CAP};
     use ferrite_store::sol950::{load_cfg, Sol950Journal};
@@ -1608,6 +1617,13 @@ async fn sol950_step(
 
     let open = app.sol950_open();
     if open != *dec_on {
+        if open {
+            // Raise MCU clock to full speed BEFORE waking the higher-priority DSP task, even if LPM is active.
+            crate::hal::clock::AUDIO_RAISES.store(!app.settings().mcu_fixed, Relaxed);
+            if crate::hal::clock::is_low() && !crate::hal::audio::busy() {
+                crate::hal::clock::set_tree(crate::hal::clock::NORMAL);
+            }
+        }
         let cmd = if open {
             DspCmd::Decoder(DecoderKind::Sol950)
         } else if app.aprs_on() {

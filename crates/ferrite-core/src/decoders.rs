@@ -72,6 +72,21 @@ impl Decoder {
         d
     }
 
+    #[inline(never)]
+    unsafe fn init_afsk(dst: *mut ManuallyDrop<Afsk>) {
+        dst.write(ManuallyDrop::new(Afsk::new(uafsk::fsk::Config::new(RATE_HZ))));
+    }
+
+    #[inline(never)]
+    unsafe fn init_pocsag(dst: *mut ManuallyDrop<Pocsag>) {
+        dst.write(ManuallyDrop::new(Pocsag::new(RATE_HZ)));
+    }
+
+    #[inline(never)]
+    unsafe fn init_dsc(dst: *mut ManuallyDrop<Dsc>) {
+        dst.write(ManuallyDrop::new(Dsc::new(uafsk::fsk::Config::new(RATE_HZ))));
+    }
+
     /// Switch the active decoder in-place without constructing a `Decoder`-sized temporary on the stack.
     #[inline(never)]
     pub fn switch(&mut self, kind: DecoderKind) {
@@ -80,22 +95,19 @@ impl Decoder {
             DecoderKind::Off => {}
             DecoderKind::Afsk => {
                 unsafe {
-                    core::ptr::addr_of_mut!(self.inner.afsk)
-                        .write(ManuallyDrop::new(Afsk::new(uafsk::fsk::Config::new(RATE_HZ))));
+                    Self::init_afsk(core::ptr::addr_of_mut!(self.inner.afsk));
                 }
                 self.kind = DecoderKind::Afsk;
             }
             DecoderKind::Pocsag => {
                 unsafe {
-                    core::ptr::addr_of_mut!(self.inner.pocsag)
-                        .write(ManuallyDrop::new(Pocsag::new(RATE_HZ)));
+                    Self::init_pocsag(core::ptr::addr_of_mut!(self.inner.pocsag));
                 }
                 self.kind = DecoderKind::Pocsag;
             }
             DecoderKind::Dsc => {
                 unsafe {
-                    core::ptr::addr_of_mut!(self.inner.dsc)
-                        .write(ManuallyDrop::new(Dsc::new(uafsk::fsk::Config::new(RATE_HZ))));
+                    Self::init_dsc(core::ptr::addr_of_mut!(self.inner.dsc));
                 }
                 self.kind = DecoderKind::Dsc;
             }

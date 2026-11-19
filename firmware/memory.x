@@ -134,9 +134,10 @@ SECTIONS
      * DSP tasks' `RangeInclusive::contains`), so those stay fast. */
     *(.text.*7ferrite5tasks4aprs*);
     *(.text.*5uaprs?*);
-    /* RAD950 conversation & distress codecs (UI task only; DSP receiver/LDPC stays fast). */
+    /* RAD950 conversation, distress & extended-frame codecs (UI task only; DSP receiver/LDPC stays fast). */
     *(.text.*7usol9504chat*);
     *(.text.*7usol9508distress*);
+    *(.text.*7usol9503ext*);
     /* The tone hint (TSRCH-12, -13): the Radio task's step for it and the heard-tone decode, at most once a
      * receive tick, never from an interrupt. */
     *(.text.*8tonehint*);
@@ -186,7 +187,9 @@ SECTIONS
  * 68,200 B; the budget is left where it was until lowering it is decided. */
 /* Nov 3, 2026 (Alex): raised to 180 KB. tx-bench reached 147.6 KB with satellite mode's fast-flash prediction loop
  * and the clock-aware LCD strobe; the zero-wait room is 244 KB, so 180 stays a tripwire with real room behind it. */
-__fast_budget = 180K;
+/* Nov 19, 2026: raised to 196 KB for RAD950 (usol950 DSP receiver/LDPC + non-inlined decoder init helpers);
+ * zero-wait room is 244 KB, leaving 48 KB headroom. */
+__fast_budget = 196K;
 ASSERT(__efast_ui - ORIGIN(FLASH) <= __fast_budget, "fast flash over its budget (__fast_budget in memory.x): move code to the slow part or raise the budget");
 
 /* The fast part (code and the other constants) must end inside the zero-wait region (0x08000000 + 256 KB). */

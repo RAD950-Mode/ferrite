@@ -926,6 +926,7 @@ impl Sol950Scr {
     }
 
     /// Scrolling right-to-left horizontal panafall of the `586..2,344 Hz` SOL950 grid (`224 x 48 px`) along the bottom.
+    #[inline(never)]
     fn draw_panafall(self, app: &mut App, lcd: &mut impl Panel) {
         const WF_PALETTE: [u16; 16] = [
             0x0000, 0x0821, 0x0864, 0x08C8, 0x114C, 0x11D1, 0x1A75, 0x1B39,
@@ -1502,6 +1503,7 @@ impl Sol950Scr {
         }
     }
 
+    #[inline(never)]
     fn draw_grids_overview(self, app: &mut App, lcd: &mut impl Panel) {
         use crate::world_map::{is_coast, is_land, MAP_H, MAP_W};
         const OCEAN: u16 = 0x000A;
@@ -1536,6 +1538,27 @@ impl Sol950Scr {
         }
         if app.dirty(R_TOP, h.get()) {
             let y0 = TOP_Y;
+            let sel_lon = (self.field / 18).min(17) as usize;
+            let sel_lat = (self.field % 18).min(17) as usize;
+            let start_lon = (sel_lon as i32 - 3).clamp(0, 12) as usize;
+            let start_lat = (sel_lat as i32 - 2).clamp(0, 12) as usize;
+            // Pre-fetch worked 10x10 square bitmasks ONCE (not per canvas band!) when in 3x Region mode.
+            let mut sq_worked = [[0u32; 4]; 36];
+            if zoom_region {
+                if let Some(host) = app.sol950_host() {
+                    for dl in 0..6usize {
+                        for db in 0..6usize {
+                            let fi = ((start_lon + dl) * 18 + (start_lat + db)) as u16;
+                            let sqs = host.store.field_squares_for_band(fi, band_opt);
+                            for (s, &cnt) in sqs.iter().enumerate() {
+                                if cnt > 0 {
+                                    sq_worked[dl * 6 + db][s / 32] |= 1u32 << (s % 32);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
             redraw_box!(true, lcd, (0, y0, W, 268, BG), {
                 let mut hdr = Buf::<32>::new();
                 let fs = core::str::from_utf8(&fl).unwrap_or("??");
@@ -1552,98 +1575,91 @@ impl Sol950Scr {
                 let my0 = y0 + 48;
                 let mw = 216usize;
                 let mh = 162usize;
-                lcd.window(mx0, my0, mx0 + mw as i32 - 1, my0 + mh as i32 - 1);
+                let (ry0, ry1) = lcd.rows();
+                let py_start = (ry0 - my0).clamp(0, mh as i32) as usize;
+                let py_end = (ry1 - my0).clamp(0, mh as i32) as usize;
 
-                let sel_lon = (self.field / 18).min(17) as usize;
-                let sel_lat = (self.field % 18).min(17) as usize;
-
-                if !zoom_region {
-                    // 1x World Map: 18x18 Maidenhead fields (12x9 px each) over 144x72 coastline map.
+                if py_start < py_end {
+                    lcd.window(mx0, my0 + py_start as i32, mx0 + mw as i32 - 1, my0 + py_end as i32 - 1);
                     let mut line = [OCEAN; 216];
-                    for py in 0..mh {
-                        let lat_f = 17 - (py / 9).min(17);
-                        let fy_in = py % 9;
-                        let my = (py * MAP_H) / mh;
-                        for (px, dst) in line.iter_mut().enumerate() {
-                            let lon_f = (px / 12).min(17);
-                            let fx_in = px % 12;
-                            let mx = (px * MAP_W) / mw;
-                            let land = is_land(mx, my);
-                            let coast = is_coast(mx, my);
-                            let mut c = if coast { COAST } else if land { LAND } else { OCEAN };
-                            if fx_in == 0 || fy_in == 0 {
-                                c = if land { GRID_L } else { GRID_O };
-                            }
-                            let idx = lon_f * 18 + lat_f;
-                            let worked = (mask[idx / 32] & (1u32 << (idx % 32))) != 0;
-                            if worked && (2..=9).contains(&fx_in) && (2..=6).contains(&fy_in) {
-                                c = accent;
-                            }
-                            if home_field == Some(idx as u16) && (5..=6).contains(&fx_in) && (4..=5).contains(&fy_in) {
-                                c = WHITE;
-                            }
-                            if lon_f == sel_lon && lat_f == sel_lat {
-                                if fx_in == 0 || fx_in == 11 || fy_in == 0 || fy_in == 8 {
-                                    c = AMBER;
-                                } else if fx_in == 1 || fx_in == 10 || fy_in == 1 || fy_in == 7 {
+                    if !zoom_region {
+                        // 1x World Map: 18x18 Maidenhead fields (12x9 px each) over 144x72 coastline map.
+                        for py in py_start..py_end {
+                            let lat_f = 17 - (py / 9).min(17);
+                            let fy_in = py % 9;
+                            let my = (py * MAP_H) / mh;
+                            for (px, dst) in line.iter_mut().enumerate() {
+                                let lon_f = (px / 12).min(17);
+                                let fx_in = px % 12;
+                                let mx = (px * MAP_W) / mw;
+                                let land = is_land(mx, my);
+                                let mut c = if land {
+                                    if is_coast(mx, my) { COAST } else { LAND }
+                                } else {
+                                    OCEAN
+                                };
+                                if fx_in == 0 || fy_in == 0 {
+                                    c = if land { GRID_L } else { GRID_O };
+                                }
+                                let idx = lon_f * 18 + lat_f;
+                                let worked = (mask[idx / 32] & (1u32 << (idx % 32))) != 0;
+                                if worked && (2..=9).contains(&fx_in) && (2..=6).contains(&fy_in) {
+                                    c = accent;
+                                }
+                                if home_field == Some(idx as u16) && (5..=6).contains(&fx_in) && (4..=5).contains(&fy_in) {
                                     c = WHITE;
                                 }
-                            }
-                            *dst = c;
-                        }
-                        lcd.push_buf(&line);
-                    }
-                } else {
-                    // 3x Region Map: 6x6 Maidenhead fields (36x27 px each) centered on selected field,
-                    // showing actual 10x10 worked 4-char grid squares directly over the continents!
-                    let start_lon = (sel_lon as i32 - 3).clamp(0, 12) as usize;
-                    let start_lat = (sel_lat as i32 - 2).clamp(0, 12) as usize;
-                    // Pre-fetch worked 10x10 square bitmasks for the 36 visible fields.
-                    let mut sq_worked = [[false; 100]; 36];
-                    if let Some(host) = app.sol950_host() {
-                        for dl in 0..6usize {
-                            for db in 0..6usize {
-                                let fi = ((start_lon + dl) * 18 + (start_lat + db)) as u16;
-                                let sqs = host.store.field_squares_for_band(fi, band_opt);
-                                for s in 0..100usize {
-                                    sq_worked[dl * 6 + db][s] = sqs[s] > 0;
+                                if lon_f == sel_lon && lat_f == sel_lat {
+                                    if fx_in == 0 || fx_in == 11 || fy_in == 0 || fy_in == 8 {
+                                        c = AMBER;
+                                    } else if fx_in == 1 || fx_in == 10 || fy_in == 1 || fy_in == 7 {
+                                        c = WHITE;
+                                    }
                                 }
+                                *dst = c;
                             }
+                            lcd.push_buf(&line);
                         }
-                    }
-                    let mut line = [OCEAN; 216];
-                    for py in 0..mh {
-                        let row_f = 5 - (py / 27).min(5);
-                        let lat_f = start_lat + row_f;
-                        let fy_in = py % 27;
-                        let lat_s = 9 - ((fy_in * 10) / 27).min(9);
-                        // Map pixel to 144x72 world mask (each field = 8x4 world pixels)
-                        let my = (((17 - lat_f) * 4 * 27 + fy_in * 4) / 27).min(MAP_H - 1);
-                        for (px, dst) in line.iter_mut().enumerate() {
-                            let col_f = (px / 36).min(5);
-                            let lon_f = start_lon + col_f;
-                            let fx_in = px % 36;
-                            let lon_s = ((fx_in * 10) / 36).min(9);
-                            let mx = ((lon_f * 8 * 36 + fx_in * 8) / 36).min(MAP_W - 1);
-                            let land = is_land(mx, my);
-                            let coast = is_coast(mx, my);
-                            let mut c = if coast { COAST } else if land { LAND } else { OCEAN };
-                            if fx_in == 0 || fy_in == 0 {
-                                c = if land { GRID_L } else { GRID_O };
-                            }
-                            if sq_worked[col_f * 6 + row_f][lon_s * 10 + lat_s] {
-                                c = accent;
-                            }
-                            if lon_f == sel_lon && lat_f == sel_lat {
-                                if fx_in <= 1 || fx_in >= 34 || fy_in <= 1 || fy_in >= 25 {
-                                    c = AMBER;
-                                } else if fx_in == 2 || fx_in == 33 || fy_in == 2 || fy_in == 24 {
-                                    c = WHITE;
+                    } else {
+                        // 3x Region Map: 6x6 Maidenhead fields (36x27 px each) centered on selected field,
+                        // showing actual 10x10 worked 4-char grid squares directly over the continents!
+                        for py in py_start..py_end {
+                            let row_f = 5 - (py / 27).min(5);
+                            let lat_f = start_lat + row_f;
+                            let fy_in = py % 27;
+                            let lat_s = 9 - ((fy_in * 10) / 27).min(9);
+                            // Map pixel to 144x72 world mask (each field = 8x4 world pixels)
+                            let my = (((17 - lat_f) * 4 * 27 + fy_in * 4) / 27).min(MAP_H - 1);
+                            for (px, dst) in line.iter_mut().enumerate() {
+                                let col_f = (px / 36).min(5);
+                                let lon_f = start_lon + col_f;
+                                let fx_in = px % 36;
+                                let lon_s = ((fx_in * 10) / 36).min(9);
+                                let mx = ((lon_f * 8 * 36 + fx_in * 8) / 36).min(MAP_W - 1);
+                                let land = is_land(mx, my);
+                                let mut c = if land {
+                                    if is_coast(mx, my) { COAST } else { LAND }
+                                } else {
+                                    OCEAN
+                                };
+                                if fx_in == 0 || fy_in == 0 {
+                                    c = if land { GRID_L } else { GRID_O };
                                 }
+                                let sq_i = lon_s * 10 + lat_s;
+                                if (sq_worked[col_f * 6 + row_f][sq_i / 32] & (1u32 << (sq_i % 32))) != 0 {
+                                    c = accent;
+                                }
+                                if lon_f == sel_lon && lat_f == sel_lat {
+                                    if fx_in <= 1 || fx_in >= 34 || fy_in <= 1 || fy_in >= 25 {
+                                        c = AMBER;
+                                    } else if fx_in == 2 || fx_in == 33 || fy_in == 2 || fy_in == 24 {
+                                        c = WHITE;
+                                    }
+                                }
+                                *dst = c;
                             }
-                            *dst = c;
+                            lcd.push_buf(&line);
                         }
-                        lcd.push_buf(&line);
                     }
                 }
 
@@ -1659,6 +1675,7 @@ impl Sol950Scr {
         }
     }
 
+    #[inline(never)]
     fn draw_grids_field(self, app: &mut App, lcd: &mut impl Panel) {
         use crate::world_map::{is_coast, is_land, MAP_H, MAP_W};
         const OCEAN: u16 = 0x000A;
@@ -1703,36 +1720,44 @@ impl Sol950Scr {
                 let mh = 160usize;
                 let lon_f = (self.field / 18).min(17) as usize;
                 let lat_f = (self.field % 18).min(17) as usize;
-                lcd.window(gx, gy, gx + mw as i32 - 1, gy + mh as i32 - 1);
-                let mut line = [OCEAN; 200];
-                for py in 0..mh {
-                    let bs = 9 - (py / 16).min(9);
-                    let sy_in = py % 16;
-                    let my = (((17 - lat_f) * 4 * mh + py * 4) / mh).min(MAP_H - 1);
-                    for (px, dst) in line.iter_mut().enumerate() {
-                        let ls = (px / 20).min(9);
-                        let sx_in = px % 20;
-                        let mx = ((lon_f * 8 * mw + px * 8) / mw).min(MAP_W - 1);
-                        let land = is_land(mx, my);
-                        let coast = is_coast(mx, my);
-                        let mut c = if coast { COAST } else if land { LAND } else { OCEAN };
-                        if sx_in == 0 || sy_in == 0 {
-                            c = if land { GRID_L } else { GRID_O };
-                        }
-                        let idx = ls * 10 + bs;
-                        if sqs[idx] > 0 && (3..=16).contains(&sx_in) && (3..=12).contains(&sy_in) {
-                            c = accent;
-                        }
-                        if idx == sel_sq {
-                            if sx_in == 0 || sx_in == 19 || sy_in == 0 || sy_in == 15 {
-                                c = AMBER;
-                            } else if sx_in == 1 || sx_in == 18 || sy_in == 1 || sy_in == 14 {
-                                c = WHITE;
+                let (ry0, ry1) = lcd.rows();
+                let py_start = (ry0 - gy).clamp(0, mh as i32) as usize;
+                let py_end = (ry1 - gy).clamp(0, mh as i32) as usize;
+                if py_start < py_end {
+                    lcd.window(gx, gy + py_start as i32, gx + mw as i32 - 1, gy + py_end as i32 - 1);
+                    let mut line = [OCEAN; 200];
+                    for py in py_start..py_end {
+                        let bs = 9 - (py / 16).min(9);
+                        let sy_in = py % 16;
+                        let my = (((17 - lat_f) * 4 * mh + py * 4) / mh).min(MAP_H - 1);
+                        for (px, dst) in line.iter_mut().enumerate() {
+                            let ls = (px / 20).min(9);
+                            let sx_in = px % 20;
+                            let mx = ((lon_f * 8 * mw + px * 8) / mw).min(MAP_W - 1);
+                            let land = is_land(mx, my);
+                            let mut c = if land {
+                                if is_coast(mx, my) { COAST } else { LAND }
+                            } else {
+                                OCEAN
+                            };
+                            if sx_in == 0 || sy_in == 0 {
+                                c = if land { GRID_L } else { GRID_O };
                             }
+                            let idx = ls * 10 + bs;
+                            if sqs[idx] > 0 && (3..=16).contains(&sx_in) && (3..=12).contains(&sy_in) {
+                                c = accent;
+                            }
+                            if idx == sel_sq {
+                                if sx_in == 0 || sx_in == 19 || sy_in == 0 || sy_in == 15 {
+                                    c = AMBER;
+                                } else if sx_in == 1 || sx_in == 18 || sy_in == 1 || sy_in == 14 {
+                                    c = WHITE;
+                                }
+                            }
+                            *dst = c;
                         }
-                        *dst = c;
+                        lcd.push_buf(&line);
                     }
-                    lcd.push_buf(&line);
                 }
 
                 let ly = gy + mh as i32 + 16;
@@ -2052,6 +2077,7 @@ impl Sol950Scr {
         }
     }
 
+    #[inline(never)]
     fn draw_chat(self, app: &mut App, lcd: &mut impl Panel, live: &LiveAll) {
         let Some(h) = app.sol950_host() else { return };
         let tx_active = matches!(live.mode, ModeLive::Sol950 { tx_active: true, .. }) || h.tx_in_flight;
@@ -2636,6 +2662,7 @@ impl Sol950Scr {
         app.screen = Screen::Sol950(self);
     }
 
+    #[inline(never)]
     fn draw_rendezvous(self, app: &mut App, lcd: &mut impl Panel, live: &LiveAll) {
         use crate::rad950_rdv::{RdvTurnPlan, RDV_BANDS};
         let Some(h) = app.sol950_host() else { return };
