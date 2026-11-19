@@ -171,7 +171,13 @@ A carrier capture proves the fixture. For the **SOL950 TX waveform** measurement
         - Synthetic `RX`: `-15 dB`: `63 / 100 / 57 / 92 / 100`; `-16 dB`: `26 / 97 / 41 / 81 / 100`; `-17 dB`: `1 / 85 / 26 / 41 / 96`; `-18 dB`: `0 / 71 / 8 / 9 / 42`; `-19 dB`: `0 / 48 / 1 / 1 / 7`.
         - Captured Radtel `CQ`: `-15 dB`: `68 / 100 / 51 / 92 / 100`; `-16 dB`: `28 / 97 / 40 / 82 / 100`; `-17 dB`: `1 / 87 / 22 / 50 / 99`; `-18 dB`: `0 / 71 / 9 / 13 / 69`; `-19 dB`: `0 / 63 / 1 / 0 / 11`.
         - Shows blind `S0+S1` acquisition already admits the true caller `85–87%` of the time at `-17 dB` (`71%` at `-18 dB`); local `S0+S1` timing/frequency refinement (`±20 ms`, `±4 Hz`) + `ref_demod` lifts blind recovery at `-17 dB` from `1/100` to **`50/100`** on the captured Radtel burst (`82/100` at `-16 dB`).
-      - **Two independently impaired receivers (`leader` / `either` / `joint_miss` -> `rescued_full` / `rescued_4bit` -> `total_4bit`; false-accept controls across `100` pairs each: noise `cur(full/4b)=0/0`, `ref(full/4b)=0/0`, wrong-caller 4-bit `0/100`):**
+      - **Priority-ordered blind refinement work budget (`sol950_wav budget`, captured Radtel `CQ`, 100 trials/pt, `0` false frames across all budgets):**
+        - `-15 dB`: `K=1: 87`, `K=2: 91`, `K=4: 92`, `K=8: 92` (winning rank `[87, 4, 1, 0, 0, 0, 0, 0]`, `5.9–46.5 ms/slot` host).
+        - `-16 dB`: `K=1: 72`, `K=2: 77`, `K=4: 81`, `K=8: 82` (winning rank `[72, 5, 4, 0, 1, 0, 0, 0]`).
+        - `-17 dB`: `K=1: 33`, `K=2: 42`, `K=4: 47`, `K=8: 50` (winning rank `[33, 9, 2, 3, 3, 0, 0, 0]`).
+        - `-18 dB`: `K=1: 7`, `K=2: 12`, `K=4: 13`, `K=8: 13` (winning rank `[7, 5, 0, 1, 0, 0, 0, 0]`).
+        - Refining the top `K = 2..4` blind tracks recovers `94–99%` of the `K = 8` blind ceiling with `0` false frames.
+      - **Two independently impaired receivers (`leader` / `either` / `joint_miss` -> `rescued_full` / `rescued_4bit` -> `total_4bit`; false-accept controls across `100` pairs each: noise `cur(full/4b)=0/0`, `ref(full/4b)=0/0`, wrong-caller 4-bit fabricated third `0/100`, misattributed contributor `2/100` — confirming cooperative replies must bind to the decoded frame's own sender rather than track A's prior attribution):**
         - `cur` (Synthetic `RX`): `-16 dB`: `44 / 62 / 38 -> 38/38 / 38/38 -> 100/100`; `-17 dB`: `8 / 10 / 90 -> 68/90 / 69/90 -> 79/100`; `-18 dB`: `0 / 0 / 100 -> 24/100 / 22/100 -> 22/100`.
         - `cur` (Captured Radtel `CQ`): `-16 dB`: `27 / 53 / 47 -> 47/47 / 47/47 -> 100/100`; `-17 dB`: `4 / 9 / 91 -> 72/91 / 69/91 -> 78/100`; `-18 dB`: `0 / 0 / 100 -> 15/100 / 13/100 -> 13/100`.
         - `ref` (Synthetic `RX`): `-18 dB`: `41 / 74 / 26 -> 26/26 / 26/26 -> 100/100`; `-19 dB`: `9 / 18 / 82 -> 72/82 / 68/82 -> 86/100`.

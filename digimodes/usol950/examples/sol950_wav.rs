@@ -21,6 +21,7 @@ fn usage() {
     eprintln!("  sol950_wav tone <IN.wav>          (measures peak carrier Hz and SNR_2500 for BFO/path check)");
     eprintln!("  sol950_wav sweep <WEAK.wav|synth> <cq|rx> [ADJ.wav|synth:+225 ADJ_DB [TRIALS]] [--oracle]");
     eprintln!("  sol950_wav coop <WEAK.wav|synth> <cq|rx> [TRIALS] (bit-confidence & 2-radio soft-combining eval)");
+    eprintln!("  sol950_wav budget <WEAK.wav|synth> <cq|rx> [TRIALS] (priority-ordered blind refinement work budget)");
 }
 
 fn main() -> ExitCode {
@@ -64,6 +65,7 @@ fn main() -> ExitCode {
         "tone" if args.len() == 3 => measure_tone(&args[2]),
         "sweep" if matches!(args.len(), 4..=8) => run_sweep(&args[2..]),
         "coop" if matches!(args.len(), 4 | 5) => run_coop(&args[2..]),
+        "budget" if matches!(args.len(), 4 | 5) => run_budget(&args[2..]),
         _ => {
             usage();
             ExitCode::from(2)
@@ -771,7 +773,7 @@ fn run_coop(args: &[String]) -> ExitCode {
     // False-accept controls: (1) pure noise full & 4-bit (cur & ref), (2) wrong-caller pairings (CQ + RX)
     let mut rng_n1 = SweepRng(seed_base + 999_001);
     let mut rng_n2 = SweepRng(seed_base + 999_002);
-    let (mut fa_cur_full, mut fa_cur_4b, mut fa_ref_full, mut fa_ref_4b, mut fa_wrong_4b) = (0, 0, 0, 0, 0);
+    let (mut fa_cur_full, mut fa_cur_4b, mut fa_ref_full, mut fa_ref_4b, mut fa_third_4b, mut fa_misattrib_4b) = (0, 0, 0, 0, 0, 0);
     let other_frame = if matches!(weak_frame, Frame::Cq { .. }) {
         Frame::Rx { sender: k1abc, recipient: nq6n, snr_db: -15, ack: false, reserved: false }
     } else {
@@ -811,12 +813,115 @@ fn run_coop(args: &[String]) -> ExitCode {
         let ra = ref_demod_llrs(&pa, sa, 1037.0);
         let rb = ref_demod_llrs(&pb_i16, s0_0, 1037.0);
         if let Some(f) = decode_llrs(&combine_llrs(&quantize_4bit(&ra, 120.0), &quantize_4bit(&rb, 120.0), 8)) {
-            if f != weak_frame && f != other_frame {
-                fa_wrong_4b += 1;
+            if f == other_frame {
+                fa_misattrib_4b += 1;
+            } else if f != weak_frame {
+                fa_third_4b += 1;
             }
         }
     }
-    println!("\nfalse-accept controls (100 pairs): noise cur(full/4b)={fa_cur_full}/{fa_cur_4b}, ref(full/4b)={fa_ref_full}/{fa_ref_4b}, wrong-caller 4b={fa_wrong_4b}");
+    println!("\nfalse-accept controls (100 pairs): noise cur(full/4b)={fa_cur_full}/{fa_cur_4b}, ref(full/4b)={fa_ref_full}/{fa_ref_4b}, wrong-caller 4b third={fa_third_4b} misattrib={fa_misattrib_4b}");
+    ExitCode::SUCCESS
+}
+
+/// Priority-ordered blind refinement benchmark under fixed track work budgets `K in [1, 2, 4, 8]`,
+/// refining candidates strictly in `Receiver`'s admission priority order without using true coordinates.
+fn run_budget(args: &[String]) -> ExitCode {
+    use std::time::Instant;
+    let weak_wav = load_norm_burst(&args[0]);
+    let nq6n = Callsign::encode(b"NQ6N").unwrap();
+    let k1abc = Callsign::encode(b"K1ABC").unwrap();
+    let fn31 = encode_grid4(b"FN31").unwrap();
+    let weak_frame = if args[1].eq_ignore_ascii_case("cq") {
+        Frame::Cq { sender: nq6n, grid4: fn31, tx_pwr: 10, reserved: 0 }
+    } else if args[1].eq_ignore_ascii_case("rx") {
+        Frame::Rx { sender: k1abc, recipient: nq6n, snr_db: -15, ack: false, reserved: false }
+    } else {
+        usage();
+        return ExitCode::from(2);
+    };
+    let trials: usize = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(100);
+    let weak_tones = encode_tones(weak_frame);
+    const FS: usize = RATE_24K as usize;
+    let sigma = 1_200.0f64;
+    let p_n_2500 = sigma * sigma * (2500.0 / 12000.0);
+    let seed_base = 0x3000_0000_0000_0001u64;
+
+    println!("=== Priority-ordered blind refinement budget (trials={trials}, seed_base=0x{seed_base:016x}) ===");
+    println!("SNR   | K=1 ok/fa (ms) | K=2 ok/fa (ms) | K=4 ok/fa (ms) | K=8 ok/fa (ms) | winning rank [0..7]");
+    let mut rx = Receiver::new();
+    for (si, &snr_db) in [-15.0f64, -16.0, -17.0, -18.0].iter().enumerate() {
+        let p_weak = p_n_2500 * 10f64.powf(snr_db / 10.0);
+        let weak_rms = p_weak.sqrt();
+        let weak_amp = (2.0 * p_weak).sqrt() as i16;
+        let mut rng = SweepRng(seed_base + (si as u64) * 997);
+
+        let mut ok_k = [0usize; 4]; // K = 1, 2, 4, 8
+        let mut fa_k = [0usize; 4];
+        let mut us_k = [0u128; 4];
+        let mut rank_hist = [0usize; usol950::rx::MAX_TRACKS];
+        const KS: [usize; 4] = [1, 2, 4, 8];
+
+        for t in 0..trials {
+            let dt_ms = -160i32 + ((t as i32 * 53) % 401);
+            let mut slot = vec![0.0f64; FS * 10];
+            for s in &mut slot { *s = rng.gauss(sigma); }
+            if let Some(wb) = weak_wav.as_deref() {
+                let start = ((200 + dt_ms) as usize * FS) / 1000;
+                let sc = weak_rms / 10_000.0;
+                for (k, &v) in wb.iter().enumerate() {
+                    if start + k < slot.len() { slot[start + k] += (v as f64) * sc; }
+                }
+            } else {
+                let start = ((400 + dt_ms) as usize * FS) / 1000;
+                let mut m = Modulator::new(weak_tones, RATE_24K, 1037, DEFAULT_SPACING_HZ, weak_amp);
+                let mut i = start;
+                while let Some(v) = m.next_sample() {
+                    if i < slot.len() { slot[i] += v as f64; }
+                    i += 1;
+                }
+            }
+            let pcm: Vec<i16> = slot.into_iter().map(|v| v.round().clamp(-32767.0, 32767.0) as i16).collect();
+            rx.reset();
+            for blk in pcm.chunks(192) { rx.push_samples(blk); }
+
+            let mut win_rank = None;
+            let mut false_at_rank = [false; usol950::rx::MAX_TRACKS];
+            let mut cum_us = 0u128;
+            for ti in 0..usol950::rx::MAX_TRACKS {
+                if let Some((est_ms, est_hz)) = rx.track_coords(ti) {
+                    let t0 = Instant::now();
+                    let est_samp = (est_ms as usize * FS) / 1000;
+                    let (ref_samp, ref_hz) = refine_candidate(&pcm, est_samp, est_hz as f64);
+                    let dec = decode_llrs(&ref_demod_llrs(&pcm, ref_samp, ref_hz));
+                    cum_us += t0.elapsed().as_micros();
+                    if let Some(f) = dec {
+                        if f == weak_frame {
+                            if win_rank.is_none() { win_rank = Some(ti); }
+                        } else {
+                            false_at_rank[ti] = true;
+                        }
+                    }
+                }
+                for (ki, &k) in KS.iter().enumerate() {
+                    if ti + 1 == k {
+                        us_k[ki] += cum_us;
+                        if win_rank.is_some_and(|r| r < k) { ok_k[ki] += 1; }
+                        if false_at_rank[..k].iter().any(|&b| b) { fa_k[ki] += 1; }
+                    }
+                }
+            }
+            if let Some(r) = win_rank { rank_hist[r] += 1; }
+        }
+        println!(
+            "{snr_db:+5.1} | {:3}/{:<2} ({:4.1}) | {:3}/{:<2} ({:4.1}) | {:3}/{:<2} ({:4.1}) | {:3}/{:<2} ({:4.1}) | {:?}",
+            ok_k[0], fa_k[0], us_k[0] as f64 / (trials as f64 * 1000.0),
+            ok_k[1], fa_k[1], us_k[1] as f64 / (trials as f64 * 1000.0),
+            ok_k[2], fa_k[2], us_k[2] as f64 / (trials as f64 * 1000.0),
+            ok_k[3], fa_k[3], us_k[3] as f64 / (trials as f64 * 1000.0),
+            rank_hist
+        );
+    }
     ExitCode::SUCCESS
 }
 
