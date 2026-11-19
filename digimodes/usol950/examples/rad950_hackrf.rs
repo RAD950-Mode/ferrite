@@ -954,6 +954,7 @@ fn handle_decoded(state: &Arc<Mutex<SharedState>>, slot: u64, frames: &[Decoded]
 }
 
 fn slot_worker(state: Arc<Mutex<SharedState>>) {
+    let mut last_tx_slot: Option<u64> = None;
     loop {
         if !state.lock().unwrap().running {
             break;
@@ -982,12 +983,17 @@ fn slot_worker(state: Arc<Mutex<SharedState>>) {
         let slot = slot_ms / 10_000;
         let utc_sec = slot * 10;
 
+        // Enforce strict alternating TX/RX turns: always listen for at least 1 RX slot after any TX slot.
+        let tx_allowed = last_tx_slot.is_none_or(|prev| slot >= prev + 2);
+
         let (cfg, tx_job) = {
             let mut st = state.lock().unwrap();
             if !st.running {
                 break;
             }
-            let job = if let Some(j) = st.tx_queue.pop_front() {
+            let job = if !tx_allowed {
+                None
+            } else if let Some(j) = st.tx_queue.pop_front() {
                 Some(j)
             } else if st.auto_cq && (slot % 2 == st.cq_parity) {
                 let frame = Frame::Cq {
@@ -1008,6 +1014,7 @@ fn slot_worker(state: Arc<Mutex<SharedState>>) {
         };
 
         if let Some(job) = tx_job {
+            last_tx_slot = Some(slot);
             {
                 let mut st = state.lock().unwrap();
                 st.phase = if cfg.dry_tx { SlotPhase::DryTx } else { SlotPhase::Tx };
@@ -1944,20 +1951,24 @@ fn main() -> ExitCode {
                         }
                         Key::Char('c') => {
                             let mut st = state.lock().unwrap();
-                            let frame = Frame::Cq {
-                                sender: st.cfg.call,
-                                grid4: st.cfg.grid4,
-                                tx_pwr: 10,
-                                reserved: 0,
-                            };
-                            let subch = st.cfg.subch;
-                            let summary = format!("CQ {} {}", st.cfg.call_str, st.cfg.grid_str);
-                            st.tx_queue.push_back(TxJob {
-                                frame,
-                                subch,
-                                summary: summary.clone(),
-                            });
-                            tui.set_toast(format!("Queued CQ for next slot: {summary}"));
+                            if st.tx_queue.iter().any(|j| matches!(j.frame, Frame::Cq { .. })) {
+                                tui.set_toast("CQ already queued for next TX slot");
+                            } else {
+                                let frame = Frame::Cq {
+                                    sender: st.cfg.call,
+                                    grid4: st.cfg.grid4,
+                                    tx_pwr: 10,
+                                    reserved: 0,
+                                };
+                                let subch = st.cfg.subch;
+                                let summary = format!("CQ {} {}", st.cfg.call_str, st.cfg.grid_str);
+                                st.tx_queue.push_back(TxJob {
+                                    frame,
+                                    subch,
+                                    summary: summary.clone(),
+                                });
+                                tui.set_toast(format!("Queued CQ for next TX slot: {summary}"));
+                            }
                         }
                         Key::Char('a') => {
                             let mut st = state.lock().unwrap();
