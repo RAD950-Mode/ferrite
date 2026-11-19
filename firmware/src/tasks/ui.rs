@@ -448,13 +448,13 @@ pub async fn task() {
 
     // Hand-off: the whole screen cleared, then the app draws everything once (HOME-2).
     lcd.0.fill(0, 0, 240, 320, BG);
-    let mut app = App::new(set, store::last_alert());
+    let mut app = init_app(set);
     app.sat_attach(crate::sat::data(store)); // chapter 28a: the satellites (the store's, SAT-2) and their passes
     app.sol950_attach(sol950_host()); // SOL950 10 m weak-signal mode host
-    let mut sol950_journal = sol950_mount_flash(store, &mut app);
+    let mut sol950_journal = sol950_mount_flash(store, app);
     let mut sol950_dec_on = false;
     // The slots as they were saved (frequencies, VFO settings, the channel each is on, watch, Battery Save).
-    store.restore(&mut app);
+    store.restore(app);
     // After the self-test: setup on first boot (BOOT-12); MENU held: the settings reset (PIN-6, BOOT-14), which
     // asks before the PIN; else the PIN if one is set (BOOT-13).
     if cfg!(feature = "bringup") {
@@ -1446,6 +1446,18 @@ fn linkz_bench() -> [u32; 11] {
         (v[5], v[6], v[7]) = (v[5] + n as u32, v[6] + c1.wrapping_sub(c0), v[7] + c2.wrapping_sub(c1));
     }
     v
+}
+
+/// Static storage for `App` (initialized once at boot out-of-line so `App::new`'s return temporary
+/// does not inflate `ui::task`'s steady-state stack frame).
+#[inline(never)]
+fn init_app(set: &'static mut ferrite_app::settings::Settings) -> &'static mut App {
+    use core::mem::MaybeUninit;
+    use core::sync::atomic::AtomicBool;
+    static TAKEN: AtomicBool = AtomicBool::new(false);
+    static mut APP: MaybeUninit<App> = MaybeUninit::uninit();
+    assert!(!TAKEN.swap(true, Relaxed));
+    unsafe { (*core::ptr::addr_of_mut!(APP)).write(App::new(set, store::last_alert())) }
 }
 
 /// Static storage for the SOL950 runtime host (initialized once at boot by `ui::task`).

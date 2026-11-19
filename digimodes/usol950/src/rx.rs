@@ -548,6 +548,7 @@ impl Receiver {
         }
     }
 
+    #[inline(never)]
     fn on_half_symbol(&mut self, sym: usize, phase: usize) {
         let mut z = [0i16; FFT_N];
         let mut idx = self.pcm_pos as usize;
@@ -748,7 +749,8 @@ impl Receiver {
         h
     }
 
-    /// Score one `(s, phase)` pair against all `q0 in 0..n_q` using pre-expanded half-bins (~1.5 ms on 120 MHz M4).
+    /// Score one `(s, phase)` pair against all `q0 in 0..n_q` using one 324 B row at a time (~1.5 ms on 120 MHz M4).
+    #[inline(never)]
     fn acquire_step(&mut self, s: usize, phase: usize) {
         let max_q0 = ((N_BINS - 2) * 2).saturating_sub(self.tone_q_off[3] as usize) as u16;
         let n_q = (max_q0 as usize + 1).min(300);
@@ -756,41 +758,39 @@ impl Receiver {
         let o1 = self.tone_q_off[1] as usize;
         let o2 = self.tone_q_off[2] as usize;
         let o3 = self.tone_q_off[3] as usize;
-        let mut s0_h = [[0u8; N_BINS * 2]; 6];
-        let mut s1_h = [[0u8; N_BINS * 2]; 6];
-        for k in 0..6 {
+        let mut contrast = [0i16; 300];
+        let mut raw_sum = [0u16; 300];
+        for (k, &w) in S0.iter().enumerate() {
             let b0 = self.read_ring_bins((s + k) % RING_SYMS, phase);
+            let row = Self::expand_half_bins(&b0);
+            for q0 in 0..n_q {
+                let e0 = row[q0 + o0] as i32;
+                let e1 = row[q0 + o1] as i32;
+                let e2 = row[q0 + o2] as i32;
+                let e3 = row[q0 + o3] as i32;
+                let arr = [e0, e1, e2, e3];
+                let want = arr[(w as usize) & 3];
+                contrast[q0] += (4 * want - (e0 + e1 + e2 + e3)).clamp(-48, 48) as i16;
+                raw_sum[q0] += want as u16;
+            }
+        }
+        for (k, &w) in S1.iter().enumerate() {
             let b1 = self.read_ring_bins((s + 18 + k) % RING_SYMS, phase);
-            s0_h[k] = Self::expand_half_bins(&b0);
-            s1_h[k] = Self::expand_half_bins(&b1);
+            let row = Self::expand_half_bins(&b1);
+            for q0 in 0..n_q {
+                let e0 = row[q0 + o0] as i32;
+                let e1 = row[q0 + o1] as i32;
+                let e2 = row[q0 + o2] as i32;
+                let e3 = row[q0 + o3] as i32;
+                let arr = [e0, e1, e2, e3];
+                let want = arr[(w as usize) & 3];
+                contrast[q0] += (4 * want - (e0 + e1 + e2 + e3)).clamp(-48, 48) as i16;
+                raw_sum[q0] += want as u16;
+            }
         }
         let sp = ((s as u8) << 1) | (phase as u8);
         for q0 in 0..n_q {
-            let mut contrast = 0i32;
-            let mut raw_sum = 0i32;
-            for (k, &w) in S0.iter().enumerate() {
-                let row = &s0_h[k];
-                let e0 = row[q0 + o0] as i32;
-                let e1 = row[q0 + o1] as i32;
-                let e2 = row[q0 + o2] as i32;
-                let e3 = row[q0 + o3] as i32;
-                let arr = [e0, e1, e2, e3];
-                let want = arr[(w as usize) & 3];
-                contrast += (4 * want - (e0 + e1 + e2 + e3)).clamp(-48, 48);
-                raw_sum += want;
-            }
-            for (k, &w) in S1.iter().enumerate() {
-                let row = &s1_h[k];
-                let e0 = row[q0 + o0] as i32;
-                let e1 = row[q0 + o1] as i32;
-                let e2 = row[q0 + o2] as i32;
-                let e3 = row[q0 + o3] as i32;
-                let arr = [e0, e1, e2, e3];
-                let want = arr[(w as usize) & 3];
-                contrast += (4 * want - (e0 + e1 + e2 + e3)).clamp(-48, 48);
-                raw_sum += want;
-            }
-            let score = contrast * 8 + (raw_sum >> 4);
+            let score = (contrast[q0] as i32) * 8 + ((raw_sum[q0] as i32) >> 4);
             let sc = score.clamp(i16::MIN as i32 + 1, i16::MAX as i32) as i16;
             if sc > self.acq_get_score(q0) {
                 self.acq_set(q0, sc, sp);
@@ -798,6 +798,7 @@ impl Receiver {
         }
     }
 
+    #[inline(never)]
     fn acquire_finish(&mut self) {
         let max_q0 = ((N_BINS - 2) * 2).saturating_sub(self.tone_q_off[3] as usize) as u16;
         let n_q = (max_q0 as usize + 1).min(300);
