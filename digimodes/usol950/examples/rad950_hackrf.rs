@@ -548,13 +548,23 @@ fn check_hackrf_installed(serial: Option<&str>) -> Result<String, String> {
     Ok(ser)
 }
 
-fn make_tx_wf_col(subch: usize, slot_mark: bool) -> WfCol {
-    let mut bins = [1u8; 24];
-    let center = (subch.min(7) * 3 + 1).min(22);
-    bins[center.saturating_sub(1)] = 10;
-    bins[center] = 15;
-    if center + 1 < 24 {
-        bins[center + 1] = 12;
+fn make_tx_wf_col(tones: &[u8; N_SYMBOLS], subch: usize, elapsed_ms: u64, slot_mark: bool) -> WfCol {
+    let mut bins = [0u8; 24];
+    let lead = TX_LEAD_MS as u64;
+    let burst_end = lead + (N_SYMBOLS * SYM_MS) as u64;
+    if elapsed_ms >= lead && elapsed_ms < burst_end {
+        let sym_idx = ((elapsed_ms - lead) / SYM_MS as u64) as usize;
+        let tone = tones[sym_idx.min(N_SYMBOLS - 1)] as f64;
+        let f_hz = SUBCHANNELS_HZ[subch.min(SUBCHANNELS_HZ.len() - 1)] as f64
+            + tone * DEFAULT_SPACING_HZ as f64;
+        // 24 panafall bins span 600..2400 Hz (75 Hz/bin).
+        let pos = ((f_hz - 600.0) / 75.0).clamp(0.0, 23.0);
+        let b0 = pos.floor() as usize;
+        let frac = pos - b0 as f64;
+        bins[b0] = (15.0 * (1.0 - frac * 0.55)).round().clamp(1.0, 15.0) as u8;
+        if b0 + 1 < 24 && frac > 0.05 {
+            bins[b0 + 1] = (15.0 * (0.45 + frac * 0.55)).round().clamp(1.0, 15.0) as u8;
+        }
     }
     WfCol {
         bins,
@@ -564,42 +574,42 @@ fn make_tx_wf_col(subch: usize, slot_mark: bool) -> WfCol {
 }
 
 fn transmit_slot(cfg: &NodeConfig, job: &TxJob, state: &Arc<Mutex<SharedState>>) -> Result<(), String> {
+    let tones = encode_tones(job.frame);
     let cs8 = synthesize_tx_cs8(job.frame, job.subch);
     if cfg.dry_tx {
-        let mut left = 9_200u64;
-        let mut col_idx = 0u32;
-        while left > 0 {
+        let t0 = std::time::Instant::now();
+        let mut first = true;
+        while t0.elapsed() < Duration::from_millis(9_350) {
             if !state.lock().unwrap().running {
                 return Ok(());
             }
-            if col_idx.is_multiple_of(2) {
-                state
-                    .lock()
-                    .unwrap()
-                    .push_wf(make_tx_wf_col(job.subch, col_idx == 0));
-            }
-            col_idx += 1;
-            let d = left.min(100);
-            thread::sleep(Duration::from_millis(d));
-            left -= d;
+            let elapsed_ms = t0.elapsed().as_millis() as u64;
+            state
+                .lock()
+                .unwrap()
+                .push_wf(make_tx_wf_col(&tones, job.subch, elapsed_ms, first));
+            first = false;
+            thread::sleep(Duration::from_millis(160));
         }
         return Ok(());
     }
 
-    // Background ticker to paint live TX red/amber columns onto the panafall while hackrf_transfer transmits.
+    // Background ticker to paint the actual live 4-FSK TX tones onto the panafall while hackrf_transfer transmits.
     let tx_running = Arc::new(std::sync::atomic::AtomicBool::new(true));
     let tx_flag = Arc::clone(&tx_running);
     let tx_state = Arc::clone(state);
     let tx_subch = job.subch;
     let wf_ticker = thread::spawn(move || {
+        let t0 = std::time::Instant::now();
         let mut first = true;
         while tx_flag.load(std::sync::atomic::Ordering::Relaxed) {
+            let elapsed_ms = t0.elapsed().as_millis() as u64;
             tx_state
                 .lock()
                 .unwrap()
-                .push_wf(make_tx_wf_col(tx_subch, first));
+                .push_wf(make_tx_wf_col(&tones, tx_subch, elapsed_ms, first));
             first = false;
-            thread::sleep(Duration::from_millis(200));
+            thread::sleep(Duration::from_millis(160));
         }
     });
 
