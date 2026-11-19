@@ -20,6 +20,7 @@ fn usage() {
     eprintln!("  sol950_wav decode <IN.wav>        (scans both slot-aligned and unaligned bench captures)");
     eprintln!("  sol950_wav tone <IN.wav>          (measures peak carrier Hz and SNR_2500 for BFO/path check)");
     eprintln!("  sol950_wav sweep <WEAK.wav|synth> <cq|rx> [ADJ.wav|synth:+225 ADJ_DB [TRIALS]] [--oracle]");
+    eprintln!("  sol950_wav coop <WEAK.wav|synth> <cq|rx> [TRIALS] (bit-confidence & 2-radio soft-combining eval)");
 }
 
 fn main() -> ExitCode {
@@ -62,6 +63,7 @@ fn main() -> ExitCode {
         "decode" if args.len() == 3 => decode_wav(&args[2]),
         "tone" if args.len() == 3 => measure_tone(&args[2]),
         "sweep" if matches!(args.len(), 4..=8) => run_sweep(&args[2..]),
+        "coop" if matches!(args.len(), 4 | 5) => run_coop(&args[2..]),
         _ => {
             usage();
             ExitCode::from(2)
@@ -474,6 +476,259 @@ fn run_sweep(args: &[String]) -> ExitCode {
             println!("  interp_50pct_oracle = {snr50:+.2} dB");
         }
     }
+    ExitCode::SUCCESS
+}
+
+/// Approximation of `ln(I_0(x))` for `x >= 0` (exact to < 0.01 across all `x`).
+fn ln_bessel_i0(x: f64) -> f64 {
+    if x < 3.75 {
+        let t = (x / 3.75).powi(2);
+        let i0 = 1.0 + t * (3.5156229 + t * (3.0899424 + t * (1.2067492 + t * (0.2659732 + t * (0.0360768 + t * 0.0045813)))));
+        i0.ln()
+    } else {
+        let t = 3.75 / x;
+        let poly = 0.39894228 + t * (0.01328592 + t * (0.00225319 + t * (-0.00157565 + t * (0.00916281 + t * (-0.02057706 + t * (0.02635537 + t * (-0.01647633 + t * 0.00392377)))))));
+        x + (poly / x.sqrt()).ln()
+    }
+}
+
+/// Exact-boundary 4-tone matched-filter reference demodulator using local sync-estimated noise `N0` and `Es/N0`.
+/// Outputs `184` canonical LDPC codeword LLRs (`i8`, positive = bit 0).
+fn ref_demod_llrs(pcm: &[i16], start_samp: usize, f0_hz: f64) -> [i8; usol950::ldpc::N_BITS] {
+    use std::f64::consts::TAU;
+    use usol950::phy::{data_sym_pos, interleave_idx, N_DATA_SYMS, S0, S1, S2};
+
+    const SYM_N: usize = 1920; // 80 ms @ 24 kHz
+    let fs = RATE_24K as f64;
+    let tone_energy = |sym: usize, tone: usize| -> f64 {
+        let a = start_samp + sym * SYM_N;
+        let f = f0_hz + (tone as f64) * (DEFAULT_SPACING_HZ as f64);
+        let w = TAU * f / fs;
+        let mut re = 0.0f64;
+        let mut im = 0.0f64;
+        for n in 0..SYM_N {
+            let x = pcm.get(a + n).copied().unwrap_or(0) as f64;
+            let ph = w * (n as f64);
+            re += x * ph.cos();
+            im += x * ph.sin();
+        }
+        re * re + im * im
+    };
+
+    // Estimate local noise energy N0 and signal-to-noise ratio gamma = Es/N0 from the 18 sync symbols.
+    let mut on_sum = 0.0f64;
+    let mut off_sum = 0.0f64;
+    let mut off_cnt = 0usize;
+    let mut sync_n = 0usize;
+    for &(base, pat) in &[(0usize, &S0), (18, &S1), (104, &S2)] {
+        for (k, &w) in pat.iter().enumerate() {
+            sync_n += 1;
+            for t in 0..4 {
+                let e = tone_energy(base + k, t);
+                if t == w as usize {
+                    on_sum += e;
+                } else {
+                    off_sum += e;
+                    off_cnt += 1;
+                }
+            }
+        }
+    }
+    let n0 = (off_sum / off_cnt.max(1) as f64).max(1.0);
+    let e_on = on_sum / sync_n.max(1) as f64;
+    let gamma = ((e_on / n0) - 1.0).clamp(0.3, 20.0);
+
+    let log_sum_exp = |a: f64, b: f64| -> f64 {
+        let m = a.max(b);
+        m + ((a - m).exp() + (b - m).exp()).ln()
+    };
+
+    let mut raw = [0i8; usol950::ldpc::N_BITS];
+    for d in 0..N_DATA_SYMS {
+        let sym = data_sym_pos(d);
+        let mut lp = [0.0f64; 4];
+        for (t, slot) in lp.iter_mut().enumerate() {
+            let e = tone_energy(sym, t);
+            *slot = ln_bessel_i0(2.0 * (gamma * (e / n0)).sqrt());
+        }
+        let llr0 = log_sum_exp(lp[0], lp[1]) - log_sum_exp(lp[2], lp[3]);
+        let llr1 = log_sum_exp(lp[0], lp[3]) - log_sum_exp(lp[1], lp[2]);
+        raw[2 * d] = (llr0 * 12.0).round().clamp(-120.0, 120.0) as i8;
+        raw[2 * d + 1] = (llr1 * 12.0).round().clamp(-120.0, 120.0) as i8;
+    }
+
+    let mut deinter = [0i8; usol950::ldpc::N_BITS];
+    for ci in 0..usol950::ldpc::N_BITS {
+        deinter[ci] = raw[interleave_idx(ci)];
+    }
+    deinter
+}
+
+fn decode_llrs(llrs: &[i8; usol950::ldpc::N_BITS]) -> Option<Frame> {
+    let mut scratch = usol950::ldpc::BpScratch::new();
+    let bits78 = usol950::ldpc::decode_bp(llrs, &mut scratch, usol950::rx::LDPC_MAX_ITER)?;
+    Frame::from_bits78(&bits78)
+}
+
+/// Signed 4-bit quantizer (`[-7..=+7]`, `0` = no evidence) per `docs/sol950-cooperative-reception.md`.
+fn quantize_4bit(llrs: &[i8; usol950::ldpc::N_BITS], max_abs: f64) -> [i8; usol950::ldpc::N_BITS] {
+    let mut out = [0i8; usol950::ldpc::N_BITS];
+    for (o, &v) in out.iter_mut().zip(llrs.iter()) {
+        *o = ((v as f64 / max_abs) * 7.0).round().clamp(-7.0, 7.0) as i8;
+    }
+    out
+}
+
+fn combine_llrs(a: &[i8; usol950::ldpc::N_BITS], b: &[i8; usol950::ldpc::N_BITS], scale: i16) -> [i8; usol950::ldpc::N_BITS] {
+    let mut out = [0i8; usol950::ldpc::N_BITS];
+    for i in 0..usol950::ldpc::N_BITS {
+        let sum = (a[i] as i16 + b[i] as i16) * scale;
+        out[i] = sum.clamp(-120, 120) as i8;
+    }
+    out
+}
+
+/// Single-radio bit-confidence comparison (current oracle LLRs vs. exact-boundary `ln I_0` reference demodulator)
+/// and two-radio cooperative soft-combining experiment (`full i8` and `4-bit` quantized) at `-15, -16, -17, -18 dB`.
+fn run_coop(args: &[String]) -> ExitCode {
+    let weak_wav = load_norm_burst(&args[0]);
+    let nq6n = Callsign::encode(b"NQ6N").unwrap();
+    let k1abc = Callsign::encode(b"K1ABC").unwrap();
+    let fn31 = encode_grid4(b"FN31").unwrap();
+    let weak_frame = if args[1].eq_ignore_ascii_case("cq") {
+        Frame::Cq { sender: nq6n, grid4: fn31, tx_pwr: 10, reserved: 0 }
+    } else if args[1].eq_ignore_ascii_case("rx") {
+        Frame::Rx { sender: k1abc, recipient: nq6n, snr_db: -15, ack: false, reserved: false }
+    } else {
+        usage();
+        return ExitCode::from(2);
+    };
+    let trials: usize = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(100);
+    let weak_tones = encode_tones(weak_frame);
+    const FS: usize = RATE_24K as usize;
+    let sigma = 1_200.0f64;
+    let p_n_2500 = sigma * sigma * (2500.0 / 12000.0);
+    let seed_base = 0x3000_0000_0000_0001u64;
+
+    let make_slot = |rng: &mut SweepRng, snr_db: f64, dt_ms: i32| -> (Vec<i16>, usize) {
+        let p_weak = p_n_2500 * 10f64.powf(snr_db / 10.0);
+        let weak_rms = p_weak.sqrt();
+        let weak_amp = (2.0 * p_weak).sqrt() as i16;
+        let mut slot = vec![0.0f64; FS * 10];
+        for s in &mut slot {
+            *s = rng.gauss(sigma);
+        }
+        let s0_samp = ((400 + dt_ms) as usize * FS) / 1000;
+        if let Some(wb) = weak_wav.as_deref() {
+            let start = ((200 + dt_ms) as usize * FS) / 1000;
+            let sc = weak_rms / 10_000.0;
+            for (k, &v) in wb.iter().enumerate() {
+                if start + k < slot.len() {
+                    slot[start + k] += (v as f64) * sc;
+                }
+            }
+        } else {
+            let mut m = Modulator::new(weak_tones, RATE_24K, 1037, DEFAULT_SPACING_HZ, weak_amp);
+            let mut i = s0_samp;
+            while let Some(v) = m.next_sample() {
+                if i < slot.len() {
+                    slot[i] += v as f64;
+                }
+                i += 1;
+            }
+        }
+        (slot.into_iter().map(|v| v.round().clamp(-32767.0, 32767.0) as i16).collect(), s0_samp)
+    };
+
+    let get_cur_llrs = |rx: &mut Receiver, pcm: &[i16], dt_ms: i32| -> [i8; usol950::ldpc::N_BITS] {
+        rx.reset();
+        rx.set_oracle_track((400 + dt_ms) as u32, 1037);
+        for blk in pcm.chunks(192) {
+            rx.push_samples(blk);
+        }
+        rx.track_codeword_llrs(0).unwrap()
+    };
+
+    println!("=== Part A: Single-radio known-track LLR comparison (trials={trials}, seed_base=0x{seed_base:016x}) ===");
+    println!("SNR   | cur_oracle | ref_demod | rescued(ref) | lost(ref)");
+    let mut rx_a = Receiver::new();
+    let mut rx_b = Receiver::new();
+    for (si, &snr_db) in [-15.0f64, -16.0, -17.0, -18.0].iter().enumerate() {
+        let mut rng = SweepRng(seed_base + (si as u64) * 997);
+        let (mut cur_ok, mut ref_ok, mut rescued, mut lost) = (0, 0, 0, 0);
+        for t in 0..trials {
+            let dt_ms = -160i32 + ((t as i32 * 53) % 401);
+            let (pcm, s0_samp) = make_slot(&mut rng, snr_db, dt_ms);
+            let c_llrs = get_cur_llrs(&mut rx_a, &pcm, dt_ms);
+            let r_llrs = ref_demod_llrs(&pcm, s0_samp, 1037.0);
+            let c_hit = decode_llrs(&c_llrs) == Some(weak_frame);
+            let r_hit = decode_llrs(&r_llrs) == Some(weak_frame);
+            if c_hit { cur_ok += 1; }
+            if r_hit { ref_ok += 1; }
+            if r_hit && !c_hit { rescued += 1; }
+            if c_hit && !r_hit { lost += 1; }
+        }
+        println!("{snr_db:+5.1} | {:3}/{trials}    | {:3}/{trials}   | {:3}          | {:3}", cur_ok, ref_ok, rescued, lost);
+    }
+
+    println!("\n=== Part B: Two-radio cooperative soft combining (independent AWGN, trials={trials}) ===");
+    println!("Mode | SNR   | leader | either | joint_miss | rescued_full | rescued_4bit | total_4bit");
+    for (mode_name, use_ref, qmax, qscale) in [("cur", false, 24.0, 3i16), ("ref", true, 120.0, 8i16)] {
+        for (si, &snr_db) in [-15.0f64, -16.0, -17.0, -18.0, -19.0].iter().enumerate() {
+            let mut rng_a = SweepRng(seed_base + 100_000 + (si as u64) * 997);
+            let mut rng_b = SweepRng(seed_base + 200_000 + (si as u64) * 997);
+            let (mut lead_ok, mut either_ok, mut jm, mut res_full, mut res_4b) = (0, 0, 0, 0, 0);
+            for t in 0..trials {
+                let dt_a = -160i32 + ((t as i32 * 53) % 401);
+                let dt_b = -160i32 + (((t as i32 * 97) + 173) % 401);
+                let (pcm_a, s0_a) = make_slot(&mut rng_a, snr_db, dt_a);
+                let (pcm_b, s0_b) = make_slot(&mut rng_b, snr_db, dt_b);
+                let llr_a = if use_ref { ref_demod_llrs(&pcm_a, s0_a, 1037.0) } else { get_cur_llrs(&mut rx_a, &pcm_a, dt_a) };
+                let llr_b = if use_ref { ref_demod_llrs(&pcm_b, s0_b, 1037.0) } else { get_cur_llrs(&mut rx_b, &pcm_b, dt_b) };
+                let ha = decode_llrs(&llr_a) == Some(weak_frame);
+                let hb = decode_llrs(&llr_b) == Some(weak_frame);
+                if ha { lead_ok += 1; }
+                if ha || hb {
+                    either_ok += 1;
+                } else {
+                    jm += 1;
+                    let comb_full = combine_llrs(&llr_a, &llr_b, 1);
+                    if decode_llrs(&comb_full) == Some(weak_frame) {
+                        res_full += 1;
+                    }
+                    let qa = quantize_4bit(&llr_a, qmax);
+                    let qb = quantize_4bit(&llr_b, qmax);
+                    let comb_4b = combine_llrs(&qa, &qb, qscale);
+                    if decode_llrs(&comb_4b) == Some(weak_frame) {
+                        res_4b += 1;
+                    }
+                }
+            }
+            println!(
+                "{mode_name:4} | {snr_db:+5.1} | {:3}/{trials} | {:3}/{trials} | {:3}        | {:3}/{:<3}      | {:3}/{:<3}      | {:3}/{trials}",
+                lead_ok, either_ok, jm, res_full, jm, res_4b, jm, either_ok + res_4b
+            );
+        }
+    }
+
+    // Pure-noise false-accept control across 100 combined pairs
+    let mut rng_n1 = SweepRng(seed_base + 999_001);
+    let mut rng_n2 = SweepRng(seed_base + 999_002);
+    let mut false_acc = 0usize;
+    for _ in 0..100 {
+        let mut p1 = vec![0i16; FS * 10];
+        let mut p2 = vec![0i16; FS * 10];
+        for (a, b) in p1.iter_mut().zip(p2.iter_mut()) {
+            *a = rng_n1.gauss(sigma).clamp(-32767.0, 32767.0) as i16;
+            *b = rng_n2.gauss(sigma).clamp(-32767.0, 32767.0) as i16;
+        }
+        let l1 = get_cur_llrs(&mut rx_a, &p1, 0);
+        let l2 = get_cur_llrs(&mut rx_b, &p2, 0);
+        if decode_llrs(&combine_llrs(&l1, &l2, 1)).is_some() {
+            false_acc += 1;
+        }
+    }
+    println!("\nnoise-only combined false accepts: {false_acc}/100");
     ExitCode::SUCCESS
 }
 

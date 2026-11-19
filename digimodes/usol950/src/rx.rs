@@ -485,6 +485,18 @@ impl Receiver {
         }
     }
 
+    /// Diagnostic hook: export track `tr_i`'s zero-drift bit LLRs in canonical LDPC codeword order (`184` bits).
+    pub fn track_codeword_llrs(&self, tr_i: usize) -> Option<[i8; N_BITS]> {
+        if tr_i >= MAX_TRACKS || !self.tracks[tr_i].active {
+            return None;
+        }
+        let mut out = [0i8; N_BITS];
+        for code_i in 0..N_BITS {
+            out[code_i] = self.tracks[tr_i].llr_zero[interleave_idx(code_i)];
+        }
+        Some(out)
+    }
+
     /// Run serial normalized min-sum LDPC + CRC-14 decoding across all admitted tracks at end of slot, reusing
     /// `self.work` (`[i16; 4800]`) for `post` (`184`) and `c2v` (`525`) scratch and ranking drift branches by `S2`.
     pub fn finish_slot(&mut self, out: &mut [Decoded; MAX_DECODED]) -> usize {
