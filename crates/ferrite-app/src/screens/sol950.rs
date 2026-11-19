@@ -7,7 +7,7 @@ use super::shared::*;
 use super::{Cx, Hints, View};
 use crate::chan::ChannelStore;
 use crate::keys::{KeyEvent, Press};
-use crate::sol950::{GridSource, DIALS_10M};
+use crate::sol950::{field_letters, GridSource, SavedContact, Sol950Store, DIALS_10M};
 use crate::{App, Screen};
 use ferrite_core::freq::Freq10;
 use ferrite_core::keys::Key;
@@ -25,8 +25,14 @@ use ufmt::uwrite;
 pub const PAGE_OPERATE: u8 = 0;
 pub const PAGE_ACTIVE: u8 = 1;
 pub const PAGE_SETUP: u8 = 2;
+pub const PAGE_LOG: u8 = 3;
+pub const PAGE_LOG_DETAIL: u8 = 4;
+pub const PAGE_STATS: u8 = 5;
+pub const PAGE_GRIDS_OVERVIEW: u8 = 6;
+pub const PAGE_GRIDS_FIELD: u8 = 7;
 
 const OPERATE_ROWS: usize = 5;
+const LOG_ROWS: usize = 6;
 const SETUP_ROWS: usize = 8;
 const TOP_Y: i32 = w::SBAR_H;
 
@@ -44,6 +50,10 @@ impl Sol950Scr {
     pub const OPERATE: Self = Self { page: PAGE_OPERATE, sel: 0, top: 0, field: 0, sub: 0 };
     pub const ACTIVE: Self = Self { page: PAGE_ACTIVE, sel: 0, top: 0, field: 0, sub: 0 };
     pub const SETUP: Self = Self { page: PAGE_SETUP, sel: 0, top: 0, field: 0, sub: 0 };
+    pub const LOG: Self = Self { page: PAGE_LOG, sel: 0, top: 0, field: 0, sub: 0 };
+    pub const STATS: Self = Self { page: PAGE_STATS, sel: 0, top: 0, field: 0, sub: 0 };
+    /// Default cursor on `FN` (`lon_f = 5, lat_f = 13 -> 5 * 18 + 13 = 103`).
+    pub const GRIDS: Self = Self { page: PAGE_GRIDS_OVERVIEW, sel: 0, top: 0, field: 103, sub: 31 };
 }
 
 /// `MENU 0 3 7`: open SOL950; refused while transmitting or repeating.
@@ -64,6 +74,11 @@ pub fn page_id(s: &Sol950Scr) -> &'static str {
         PAGE_OPERATE => "sol950.operate",
         PAGE_ACTIVE => "sol950.active",
         PAGE_SETUP => "sol950.setup",
+        PAGE_LOG => "sol950.log",
+        PAGE_LOG_DETAIL => "sol950.log_detail",
+        PAGE_STATS => "sol950.stats",
+        PAGE_GRIDS_OVERVIEW => "sol950.grids",
+        PAGE_GRIDS_FIELD => "sol950.grids_field",
         _ => "sol950.operate",
     }
 }
@@ -118,6 +133,9 @@ impl View for Sol950Scr {
         match self.page {
             PAGE_ACTIVE => "SOL950 QSO",
             PAGE_SETUP => "SOL950 Setup",
+            PAGE_LOG | PAGE_LOG_DETAIL => "SOL950 Log",
+            PAGE_STATS => "SOL950 Stats",
+            PAGE_GRIDS_OVERVIEW | PAGE_GRIDS_FIELD => "SOL950 Grids",
             _ => "SOL950",
         }
     }
@@ -126,6 +144,9 @@ impl View for Sol950Scr {
         let t: &[u8] = match self.page {
             PAGE_ACTIVE => b"SOL QSO",
             PAGE_SETUP => b"SOL SET",
+            PAGE_LOG | PAGE_LOG_DETAIL => b"SOL LOG",
+            PAGE_STATS => b"SOL STAT",
+            PAGE_GRIDS_OVERVIEW | PAGE_GRIDS_FIELD => b"SOL MAP",
             _ => b"SOL950",
         };
         b.set(t);
@@ -143,6 +164,11 @@ impl View for Sol950Scr {
             PAGE_OPERATE => self.key_operate(app, e.key),
             PAGE_ACTIVE => self.key_active(app, e.key),
             PAGE_SETUP => self.key_setup(app, e.key),
+            PAGE_LOG => self.key_log(app, e.key),
+            PAGE_LOG_DETAIL => self.key_log_detail(app, e.key),
+            PAGE_STATS => self.key_stats(app, e.key),
+            PAGE_GRIDS_OVERVIEW => self.key_grids_overview(app, e.key),
+            PAGE_GRIDS_FIELD => self.key_grids_field(app, e.key),
             _ => app.screen = Screen::Sol950(Sol950Scr::OPERATE),
         }
     }
@@ -163,15 +189,25 @@ impl View for Sol950Scr {
             PAGE_OPERATE => self.draw_operate(app, lcd, cx.live),
             PAGE_ACTIVE => self.draw_active(app, lcd, cx.live),
             PAGE_SETUP => self.draw_setup(app, lcd),
+            PAGE_LOG => self.draw_log(app, lcd),
+            PAGE_LOG_DETAIL => self.draw_log_detail(app, lcd),
+            PAGE_STATS => self.draw_stats(app, lcd),
+            PAGE_GRIDS_OVERVIEW => self.draw_grids_overview(app, lcd),
+            PAGE_GRIDS_FIELD => self.draw_grids_field(app, lcd),
             _ => self.draw_operate(app, lcd, cx.live),
         }
     }
 
     fn hints(self, _app: &App) -> Hints {
         match self.page {
-            PAGE_OPERATE => Hints::new(&[("OK", "Answer"), ("1", "CQ"), ("*", "Setup")]),
+            PAGE_OPERATE => Hints::new(&[("OK", "Answer"), ("1", "CQ"), ("2-4", "Log/Map")]),
             PAGE_ACTIVE => Hints::new(&[("0", "Stop"), ("*", "Setup"), ("BACK", "List")]),
             PAGE_SETUP => Hints::new(&[(ARROWS_LR, "Change"), ("BACK", "Done")]),
+            PAGE_LOG => Hints::new(&[("OK", "Detail"), ("BACK", "Back")]),
+            PAGE_LOG_DETAIL => Hints::new(&[("BACK", "Log")]),
+            PAGE_STATS => Hints::new(&[(ARROWS_LR, "Scope"), ("BACK", "Back")]),
+            PAGE_GRIDS_OVERVIEW => Hints::new(&[(ARROWS_4, "Field"), ("OK", "Zoom"), ("BACK", "Back")]),
+            PAGE_GRIDS_FIELD => Hints::new(&[(ARROWS_4, "Grid"), ("OK", "Log"), ("BACK", "Map")]),
             _ => Hints::new(&[("BACK", "Back")]),
         }
     }
@@ -236,6 +272,21 @@ impl Sol950Scr {
                     h.target_peer = None;
                 }
                 app.out.push(RadioCmd::Sol950Abort);
+            }
+            Key::Digit(2) => {
+                if let Some(h) = app.sol950_host_mut() {
+                    h.log_grid_filter = None;
+                }
+                app.screen = Screen::Sol950(Sol950Scr::LOG);
+                return;
+            }
+            Key::Digit(3) => {
+                app.screen = Screen::Sol950(Sol950Scr::STATS);
+                return;
+            }
+            Key::Digit(4) => {
+                app.screen = Screen::Sol950(Sol950Scr::GRIDS);
+                return;
             }
             Key::Star => {
                 app.screen = Screen::Sol950(Sol950Scr::SETUP);
@@ -568,6 +619,389 @@ impl Sol950Scr {
                 let g_s = core::str::from_utf8(&eff_g).unwrap_or("----");
                 let _ = uwrite!(pv, "On air: {} {}", id_s, g_s);
                 lcd.text4(8, y + 16, pv.as_bytes(), &UI_12, GREEN, BG);
+            });
+        }
+    }
+
+    // ---- Log, Stats, and Worked Grids (Milestone 2) ----
+
+    fn key_log(mut self, app: &mut App, k: Key) {
+        let total = app.sol950_host().map_or(0, |h| {
+            let mut tmp = [None; 32];
+            h.store.read_newest(0, h.log_grid_filter, &mut tmp)
+        });
+        match k {
+            Key::Exit => {
+                if let Some(h) = app.sol950_host_mut() {
+                    h.log_grid_filter = None;
+                }
+                app.screen = Screen::Sol950(Sol950Scr::OPERATE);
+                return;
+            }
+            Key::Up if total > 0 => {
+                self.sel = if self.sel == 0 { (total - 1) as u8 } else { self.sel - 1 };
+                if (self.sel as usize) < self.top as usize {
+                    self.top = self.sel;
+                } else if (self.sel as usize) >= self.top as usize + LOG_ROWS {
+                    self.top = (self.sel as usize + 1 - LOG_ROWS) as u8;
+                }
+            }
+            Key::Down if total > 0 => {
+                self.sel = ((self.sel as usize + 1) % total) as u8;
+                if (self.sel as usize) < self.top as usize {
+                    self.top = self.sel;
+                } else if (self.sel as usize) >= self.top as usize + LOG_ROWS {
+                    self.top = (self.sel as usize + 1 - LOG_ROWS) as u8;
+                }
+            }
+            Key::Menu if (self.sel as usize) < total => {
+                app.screen = Screen::Sol950(Sol950Scr { page: PAGE_LOG_DETAIL, ..self });
+                return;
+            }
+            _ => {}
+        }
+        app.screen = Screen::Sol950(self);
+    }
+
+    fn key_log_detail(self, app: &mut App, k: Key) {
+        if k == Key::Exit {
+            app.screen = Screen::Sol950(Sol950Scr { page: PAGE_LOG, ..self });
+        }
+    }
+
+    fn key_stats(mut self, app: &mut App, k: Key) {
+        match k {
+            Key::Exit => {
+                app.screen = Screen::Sol950(Sol950Scr::OPERATE);
+                return;
+            }
+            Key::Left | Key::Right | Key::Menu => {
+                self.sel ^= 1;
+            }
+            _ => {}
+        }
+        app.screen = Screen::Sol950(self);
+    }
+
+    fn key_grids_overview(mut self, app: &mut App, k: Key) {
+        let mut lon_f = (self.field / 18).min(17) as i32;
+        let mut lat_f = (self.field % 18) as i32;
+        match k {
+            Key::Exit => {
+                app.screen = Screen::Sol950(Sol950Scr::OPERATE);
+                return;
+            }
+            Key::Left => lon_f = (lon_f - 1).rem_euclid(18),
+            Key::Right => lon_f = (lon_f + 1).rem_euclid(18),
+            Key::Up => lat_f = (lat_f + 1).rem_euclid(18), // north is higher lat_f
+            Key::Down => lat_f = (lat_f - 1).rem_euclid(18),
+            Key::Menu => {
+                app.screen = Screen::Sol950(Sol950Scr { page: PAGE_GRIDS_FIELD, field: self.field, sub: 55, ..self });
+                return;
+            }
+            _ => {}
+        }
+        self.field = (lon_f * 18 + lat_f) as u16;
+        app.screen = Screen::Sol950(self);
+    }
+
+    fn key_grids_field(mut self, app: &mut App, k: Key) {
+        let mut lon_s = (self.sub / 10).min(9) as i32;
+        let mut lat_s = (self.sub % 10) as i32;
+        match k {
+            Key::Exit => {
+                app.screen = Screen::Sol950(Sol950Scr { page: PAGE_GRIDS_OVERVIEW, field: self.field, ..self });
+                return;
+            }
+            Key::Left => lon_s = (lon_s - 1).rem_euclid(10),
+            Key::Right => lon_s = (lon_s + 1).rem_euclid(10),
+            Key::Up => lat_s = (lat_s + 1).rem_euclid(10),
+            Key::Down => lat_s = (lat_s - 1).rem_euclid(10),
+            Key::Menu => {
+                let fl = field_letters(self.field);
+                let g4 = [fl[0], fl[1], b'0' + lon_s as u8, b'0' + lat_s as u8];
+                if let Some(h) = app.sol950_host_mut() {
+                    h.log_grid_filter = Some(g4);
+                }
+                app.screen = Screen::Sol950(Sol950Scr::LOG);
+                return;
+            }
+            _ => {}
+        }
+        self.sub = (lon_s * 10 + lat_s) as u8;
+        app.screen = Screen::Sol950(self);
+    }
+
+    fn draw_log(self, app: &mut App, lcd: &mut impl Panel) {
+        let mut page = [None; LOG_ROWS];
+        let (n, count, full, filter) = if let Some(h) = app.sol950_host() {
+            let n = h.store.read_newest(self.top as u16, h.log_grid_filter, &mut page);
+            (n, h.store.count(), h.store.is_full(), h.log_grid_filter)
+        } else {
+            (0, 0, false, None)
+        };
+        let th = Mix::new()
+            .n(count as u32)
+            .n(full as u32)
+            .b(&filter.unwrap_or(*b"----"))
+            .get();
+        if let Some(clear) = app.dirty_shape(R_TOP, th, true) {
+            let y0 = TOP_Y;
+            redraw_box!(clear, lcd, (0, y0, W, 24, BG), {
+                let mut head = Buf::<32>::new();
+                if let Some(gf) = filter {
+                    let gs = core::str::from_utf8(&gf).unwrap_or("----");
+                    let _ = uwrite!(head, "Log grid {} ({})", gs, n);
+                } else if full {
+                    let _ = uwrite!(head, "Log FULL ({} saved)", count);
+                } else {
+                    let _ = uwrite!(head, "Saved contacts: {}", count);
+                }
+                let col = if full { AMBER } else { TEXT };
+                lcd.text4(8, y0 + 16, head.as_bytes(), &UI_12B, col, BG);
+                lcd.fill(0, y0 + 23, W, 1, RULE);
+            });
+        }
+        let list_y = TOP_Y + 26;
+        let row_h = 30;
+        for (i, &row) in page.iter().enumerate() {
+            let idx = self.top as usize + i;
+            let selected = idx == self.sel as usize && i < n;
+            let mut rh = Mix::new().n(selected as u32).n(idx as u32);
+            if let Some(c) = row {
+                rh = rh.n(c.seq).b(&c.peer_id).b(&c.peer_grid);
+            }
+            if let Some(clear) = app.dirty_shape(R_ROW + i, rh.get(), selected) {
+                let y = list_y + i as i32 * row_h;
+                let bg = if selected { BLUE } else { BG };
+                let fg = if selected { BLUE_FG } else { TEXT };
+                let dim = if selected { BLUE_FG } else { DIM };
+                redraw_box!(clear || selected, lcd, (0, y, W, row_h, bg), {
+                    if let Some(c) = row {
+                        let ps = core::str::from_utf8(c.peer_bytes()).unwrap_or("?");
+                        let gs = core::str::from_utf8(&c.peer_grid).unwrap_or("----");
+                        let mut left = Buf::<24>::new();
+                        let _ = uwrite!(left, "{} {}", ps, gs);
+                        lcd.text4(8, y + 20, left.as_bytes(), &UI_14, fg, bg);
+
+                        let mut right = Buf::<16>::new();
+                        let _ = uwrite!(right, "{}/{}dB", c.rx_snr_db, c.tx_snr_db);
+                        lcd.text4(W - 76, y + 20, right.as_bytes(), &UI_12, dim, bg);
+                    } else if i == 0 && n == 0 {
+                        lcd.text4(8, y + 20, b"No saved contacts", &UI_12, DIM, BG);
+                    }
+                });
+            }
+        }
+    }
+
+    fn draw_log_detail(self, app: &mut App, lcd: &mut impl Panel) {
+        let mut one = [None; 1];
+        let rec: Option<SavedContact> = app.sol950_host().and_then(|h| {
+            h.store.read_newest(self.sel as u16, h.log_grid_filter, &mut one);
+            one[0]
+        });
+        let h = Mix::new().n(self.sel as u32).n(rec.map_or(0, |r| r.seq)).get();
+        if let Some(clear) = app.dirty_shape(R_TOP, h, true) {
+            let y0 = TOP_Y + 6;
+            redraw_box!(clear, lcd, (0, y0, W, 200, BG), {
+                if let Some(c) = rec {
+                    let ps = core::str::from_utf8(c.peer_bytes()).unwrap_or("?");
+                    let ms = core::str::from_utf8(c.my_bytes()).unwrap_or("?");
+                    let pg = core::str::from_utf8(&c.peer_grid).unwrap_or("----");
+                    let mg = core::str::from_utf8(&c.my_grid).unwrap_or("----");
+                    let mut l1 = Buf::<28>::new();
+                    let _ = uwrite!(l1, "{} ({})", ps, pg);
+                    lcd.text4(10, y0 + 18, l1.as_bytes(), &UI_15B, TEXT, BG);
+
+                    let mut l2 = Buf::<28>::new();
+                    let _ = uwrite!(l2, "My: {} ({})", ms, mg);
+                    lcd.text4(10, y0 + 46, l2.as_bytes(), &UI_12, DIM, BG);
+
+                    let mut l3 = Buf::<28>::new();
+                    let _ = uwrite!(l3, "SNR RX {} / TX {} dB", c.rx_snr_db, c.tx_snr_db);
+                    lcd.text4(10, y0 + 72, l3.as_bytes(), &UI_12, GREEN, BG);
+
+                    let mut l4 = Buf::<24>::new();
+                    l4.push(b"Dial: ");
+                    push_khz3(&mut l4, c.dial_hz10);
+                    l4.push(b" MHz");
+                    lcd.text4(10, y0 + 98, l4.as_bytes(), &UI_12, TEXT, BG);
+
+                    let mut l5 = Buf::<28>::new();
+                    let hh = (c.utc_sec / 3600) % 24;
+                    let mm = (c.utc_sec / 60) % 60;
+                    let ss = c.utc_sec % 60;
+                    let _ = uwrite!(l5, "UTC {}:{}:{} #{}", hh, mm, ss, c.seq);
+                    lcd.text4(10, y0 + 124, l5.as_bytes(), &UI_12, DIM, BG);
+                } else {
+                    lcd.text4(10, y0 + 20, b"Record unavailable", &UI_12, DIM, BG);
+                }
+            });
+        }
+    }
+
+    fn draw_stats(self, app: &mut App, lcd: &mut impl Panel) {
+        let today_mode = (self.sel & 1) != 0;
+        let (st, utc_known) = if let Some(h) = app.sol950_host() {
+            let day = if today_mode {
+                (h.utc_sec != 0).then_some(h.utc_sec / 86_400)
+            } else {
+                None
+            };
+            let st = if today_mode && day.is_none() {
+                crate::sol950::SavedStats::default()
+            } else {
+                h.store.stats(day)
+            };
+            (st, h.utc_sec != 0)
+        } else {
+            (crate::sol950::SavedStats::default(), false)
+        };
+        let h = Mix::new()
+            .n(today_mode as u32)
+            .n(utc_known as u32)
+            .n(st.contacts as u32)
+            .n(st.unique_stations as u32)
+            .n(st.unique_grids as u32)
+            .n(st.best_rx_snr as u32)
+            .n(st.best_tx_snr as u32)
+            .get();
+        if let Some(clear) = app.dirty_shape(R_TOP, h, true) {
+            let y0 = TOP_Y + 6;
+            redraw_box!(clear, lcd, (0, y0, W, 200, BG), {
+                let title: &[u8] = if today_mode { b"Today (UTC)" } else { b"All saved" };
+                lcd.text4(10, y0 + 18, title, &UI_15B, BLUE, BG);
+                if today_mode && !utc_known {
+                    lcd.text4(10, y0 + 50, b"Waiting for UTC date", &UI_12, AMBER, BG);
+                } else {
+                    let mut b1 = Buf::<28>::new();
+                    let _ = uwrite!(b1, "Contacts:  {}", st.contacts);
+                    lcd.text4(10, y0 + 52, b1.as_bytes(), &UI_14, TEXT, BG);
+
+                    let mut b2 = Buf::<28>::new();
+                    let _ = uwrite!(b2, "Stations:  {}", st.unique_stations);
+                    lcd.text4(10, y0 + 80, b2.as_bytes(), &UI_14, TEXT, BG);
+
+                    let mut b3 = Buf::<28>::new();
+                    let _ = uwrite!(b3, "Grids:     {}", st.unique_grids);
+                    lcd.text4(10, y0 + 108, b3.as_bytes(), &UI_14, GREEN, BG);
+
+                    let mut b4 = Buf::<32>::new();
+                    if st.has_snr {
+                        let _ = uwrite!(b4, "Best SNR: {} / {} dB", st.best_rx_snr, st.best_tx_snr);
+                    } else {
+                        let _ = uwrite!(b4, "Best SNR: --");
+                    }
+                    lcd.text4(10, y0 + 138, b4.as_bytes(), &UI_12, DIM, BG);
+                }
+            });
+        }
+    }
+
+    fn draw_grids_overview(self, app: &mut App, lcd: &mut impl Panel) {
+        let mask = app.sol950_host().map_or([0u32; 11], |h| *h.store.field_mask());
+        let worked_fields: u32 = mask.iter().map(|w| w.count_ones()).sum();
+        let fl = field_letters(self.field);
+        let sel_worked = {
+            let i = self.field as usize;
+            i < 324 && (mask[i / 32] & (1u32 << (i % 32))) != 0
+        };
+        let mut h = Mix::new().n(self.field as u32).n(worked_fields);
+        for w_word in mask {
+            h = h.n(w_word);
+        }
+        if let Some(clear) = app.dirty_shape(R_TOP, h.get(), true) {
+            let y0 = TOP_Y;
+            redraw_box!(clear, lcd, (0, y0, W, 240, BG), {
+                let mut hdr = Buf::<32>::new();
+                let fs = core::str::from_utf8(&fl).unwrap_or("??");
+                let st = if sel_worked { "worked" } else { "empty" };
+                let _ = uwrite!(hdr, "Field {} ({})  {}/324", fs, st, worked_fields);
+                lcd.text4(8, y0 + 16, hdr.as_bytes(), &UI_12B, TEXT, BG);
+
+                // 18x18 Maidenhead field grid: lon A..R left-to-right, lat R..A top-to-bottom (north up).
+                // Non-color-dependent: hollow 1px frame = empty, filled inner block + bright border = worked,
+                // double-frame = selected cursor.
+                let gx = 12i32;
+                let gy = y0 + 24;
+                let cw = 12i32;
+                let ch = 11i32;
+                for lon_f in 0..18usize {
+                    for lat_f in 0..18usize {
+                        let idx = lon_f * 18 + lat_f;
+                        let x = gx + lon_f as i32 * cw;
+                        let y = gy + (17 - lat_f) as i32 * ch;
+                        let worked = (mask[idx / 32] & (1u32 << (idx % 32))) != 0;
+                        let sel = idx == self.field as usize;
+                        // Outer 1px border
+                        let border = if sel { AMBER } else if worked { TEXT } else { LINE };
+                        lcd.fill(x, y, cw - 1, 1, border);
+                        lcd.fill(x, y + ch - 2, cw - 1, 1, border);
+                        lcd.fill(x, y, 1, ch - 1, border);
+                        lcd.fill(x + cw - 2, y, 1, ch - 1, border);
+                        if worked {
+                            lcd.fill(x + 2, y + 2, cw - 5, ch - 5, GREEN);
+                        }
+                        if sel {
+                            // Inner second frame for selected cell (non-color-dependent)
+                            lcd.fill(x + 1, y + 1, cw - 3, 1, WHITE);
+                            lcd.fill(x + 1, y + ch - 3, cw - 3, 1, WHITE);
+                        }
+                    }
+                }
+            });
+        }
+    }
+
+    fn draw_grids_field(self, app: &mut App, lcd: &mut impl Panel) {
+        let sqs = app.sol950_host().map_or([0u16; 100], |h| h.store.field_squares(self.field));
+        let fl = field_letters(self.field);
+        let sel_sq = (self.sub as usize).min(99);
+        let sel_cnt = sqs[sel_sq];
+        let lon_s = sel_sq / 10;
+        let lat_s = sel_sq % 10;
+        let g4 = [fl[0], fl[1], b'0' + lon_s as u8, b'0' + lat_s as u8];
+        let mut h = Mix::new().n(self.field as u32).n(self.sub as u32);
+        for &c in &sqs {
+            if c != 0 {
+                h = h.n(c as u32);
+            }
+        }
+        if let Some(clear) = app.dirty_shape(R_TOP, h.get(), true) {
+            let y0 = TOP_Y;
+            redraw_box!(clear, lcd, (0, y0, W, 240, BG), {
+                let mut hdr = Buf::<32>::new();
+                let gs = core::str::from_utf8(&g4).unwrap_or("----");
+                let _ = uwrite!(hdr, "Grid {}: {} QSO", gs, sel_cnt);
+                lcd.text4(8, y0 + 16, hdr.as_bytes(), &UI_12B, TEXT, BG);
+
+                // 10x10 square grid inside selected field: lon 0..9 L->R, lat 9..0 top->bottom.
+                let gx = 20i32;
+                let gy = y0 + 26;
+                let cw = 20i32;
+                let ch = 18i32;
+                for ls in 0..10usize {
+                    for bs in 0..10usize {
+                        let idx = ls * 10 + bs;
+                        let x = gx + ls as i32 * cw;
+                        let y = gy + (9 - bs) as i32 * ch;
+                        let worked = sqs[idx] > 0;
+                        let sel = idx == sel_sq;
+                        let border = if sel { AMBER } else if worked { TEXT } else { LINE };
+                        lcd.fill(x, y, cw - 1, 1, border);
+                        lcd.fill(x, y + ch - 2, cw - 1, 1, border);
+                        lcd.fill(x, y, 1, ch - 1, border);
+                        lcd.fill(x + cw - 2, y, 1, ch - 1, border);
+                        if worked {
+                            lcd.fill(x + 3, y + 3, cw - 7, ch - 7, GREEN);
+                        }
+                        if sel {
+                            lcd.fill(x + 1, y + 1, cw - 3, 1, WHITE);
+                            lcd.fill(x + 1, y + ch - 3, cw - 3, 1, WHITE);
+                        }
+                    }
+                }
             });
         }
     }

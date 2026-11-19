@@ -1080,6 +1080,7 @@ mod remote_edges;
 mod aprs_text;
 /// Satellite mode's radio commands, alarm and mark (chapter 28a).
 mod sat;
+mod sol950;
 
 /// Group D's screens: setup, PIN, key test, link, FM broadcast, HF mode, alert, the menu's groups.
 #[path = "tests_d.rs"]

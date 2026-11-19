@@ -30,8 +30,8 @@ pub const HF_STATE: Range<u32> = 0x00_5000..0x00_6000;
 pub const SATELLITES: Range<u32> = 0x00_6000..0x00_8000;
 /// The SI4732 SSB patch (15,832 B with its 64-byte header): imported from the owner's stock firmware, never shipped.
 pub const SSB_PATCH: Range<u32> = 0x00_8000..0x00_C000;
-/// Free: room for the settings and records above to grow.
-pub const CONFIG_FREE: Range<u32> = 0x00_C000..0x00_E000;
+/// SOL950 station profile & settings (copies A and B, 4 KiB each).
+pub const SOL950_CFG: Range<u32> = 0x00_C000..0x00_E000;
 /// The migration mark (decision 339, LINK-62): while Console moves the chip's data raw, a mark here says the move
 /// isn't finished, so a restart at any point waits for Console (UPD-16) and never formats; the stamp clears it.
 /// Records of 16 bytes (ferrite-store `store`), a new one in the next erased place each move.
@@ -60,8 +60,10 @@ pub const TEXT_PACK: Range<u32> = 0x09_0000..0x0A_0000;
 pub const MAILBOX: Range<u32> = 0x0A_0000..0x0B_0000;
 /// Predictive text's words (decision 345): an SPI part, with room for a bigger dictionary.
 pub const DICTIONARY: Range<u32> = 0x0B_0000..0x0C_0000;
+/// SOL950 durable append-only contact journal: 16 sectors (64 KiB) of 64 B records (1,008 contacts, non-overwriting).
+pub const SOL950_LOG: Range<u32> = 0x0C_0000..0x0D_0000;
 /// Free (what goes here is for a later decision).
-pub const FREE: Range<u32> = 0x0C_0000..0x0E_0000;
+pub const FREE: Range<u32> = 0x0D_0000..0x0E_0000;
 /// The stock bootloader's fonts (decision 404): its update screen draws "UPDATE" and its messages with the GB2312
 /// glyphs from 0x0E0000 (75 bytes each, to 0x15BED0) and the ASCII ones at 0x15C000 (39 bytes each), read from here
 /// at every update (rt950pro_bootloader.bin 0x08002212, 0x08002232). Never written: not in [`WRITABLE`]. An SSTV
@@ -104,7 +106,7 @@ pub static WRITABLE: [Range<u32>; 3] =
 pub const DATA: Range<u32> = 0..UPDATE_AREA.start;
 
 /// Every region in address order, with its name as the developer page and the build report show it.
-pub const REGIONS: [(&str, Range<u32>); 29] = [
+pub const REGIONS: [(&str, Range<u32>); 30] = [
     ("Layout header", LAYOUT_HEADER),
     ("Settings and slots", SETTINGS),
     ("User trims", TRIMS),
@@ -112,7 +114,7 @@ pub const REGIONS: [(&str, Range<u32>); 29] = [
     ("HF state (planned)", HF_STATE),
     ("Satellites", SATELLITES),
     ("SSB patch", SSB_PATCH),
-    ("Free: config growth", CONFIG_FREE),
+    ("SOL950 profile", SOL950_CFG),
     ("Migration mark", MIGRATE_MARK),
     ("Factory calibration", CALIBRATION),
     ("Channels", CHANNELS),
@@ -125,6 +127,7 @@ pub const REGIONS: [(&str, Range<u32>); 29] = [
     ("Text pack", TEXT_PACK),
     ("Packet mailbox (held)", MAILBOX),
     ("Dictionary", DICTIONARY),
+    ("SOL950 contact log", SOL950_LOG),
     ("Free", FREE),
     ("Stock bootloader's fonts (kept)", BOOT_FONTS),
     ("Free", FREE_HIGH),
@@ -189,7 +192,8 @@ mod tests {
         assert_eq!((sectors(&CONTACTS) * 127, sectors(&WAYPOINTS) * 127), (1016, 2032));
         assert_eq!((sectors(&HEARD) * 31, sectors(&MESSAGES) * 31, sectors(&EVENT_LOG) * 31), (496, 496, 992));
         assert_eq!(sectors(&SCRATCH_RING), 32);
-        assert_eq!((SSB_PATCH.len(), LANGUAGES.len(), FREE.len() + FREE_HIGH.len()), (16 << 10, 512 << 10, (1024 << 10) - BOOT_FONTS.len()));
+        assert_eq!(sectors(&SOL950_LOG) * 63, 1008);
+        assert_eq!((SSB_PATCH.len(), LANGUAGES.len(), SOL950_LOG.len() + FREE.len() + FREE_HIGH.len()), (16 << 10, 512 << 10, (1024 << 10) - BOOT_FONTS.len()));
         assert!(!overlaps(&V2_HEADER, &LAYOUT_HEADER) && CHANNELS.contains(&V2_HEADER.start), "layout 2's header sits where channels go now");
         assert_eq!(DATA.end, UPDATE_AREA.start);
     }

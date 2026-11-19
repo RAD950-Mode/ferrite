@@ -24,6 +24,255 @@ pub enum GridSource {
     Unset,
 }
 
+/// Compact contact record shared between `Sol950Host`, UI Log/Stats/Grids screens, and flash storage.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SavedContact {
+    pub utc_sec: u32,
+    pub dial_hz10: Freq10,
+    pub peer_id: [u8; 16],
+    pub my_id: [u8; 16],
+    pub peer_grid: [u8; 4],
+    pub my_grid: [u8; 4],
+    pub rx_snr_db: i8,
+    pub tx_snr_db: i8,
+    pub my_grid_src: GridSource,
+    pub slot: u32,
+    pub seq: u32,
+}
+
+impl SavedContact {
+    pub const EMPTY: Self = Self {
+        utc_sec: 0,
+        dial_hz10: 0,
+        peer_id: [0; 16],
+        my_id: [0; 16],
+        peer_grid: *b"----",
+        my_grid: *b"----",
+        rx_snr_db: 0,
+        tx_snr_db: 0,
+        my_grid_src: GridSource::Unset,
+        slot: 0,
+        seq: 0,
+    };
+
+    pub fn peer_bytes(&self) -> &[u8] {
+        let n = self.peer_id.iter().position(|&b| b == 0).unwrap_or(self.peer_id.len());
+        &self.peer_id[..n]
+    }
+
+    pub fn my_bytes(&self) -> &[u8] {
+        let n = self.my_id.iter().position(|&b| b == 0).unwrap_or(self.my_id.len());
+        &self.my_id[..n]
+    }
+}
+
+/// Aggregated contact statistics (`All saved` or `Today (UTC)`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SavedStats {
+    pub contacts: u16,
+    pub unique_stations: u16,
+    pub unique_grids: u16,
+    pub best_rx_snr: i8,
+    pub best_tx_snr: i8,
+    pub has_snr: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SaveOutcome {
+    Saved(u32),
+    Duplicate,
+    LogFull,
+    Error,
+}
+
+/// Parse a 4-char Maidenhead grid into `(field_idx 0..324, square_idx 0..100)`.
+pub fn grid4_to_field_square(g: &[u8; 4]) -> Option<(u16, u8)> {
+    let lf = g[0].to_ascii_uppercase();
+    let bf = g[1].to_ascii_uppercase();
+    if !(b'A'..=b'R').contains(&lf) || !(b'A'..=b'R').contains(&bf) {
+        return None;
+    }
+    if !g[2].is_ascii_digit() || !g[3].is_ascii_digit() {
+        return None;
+    }
+    let lon_f = (lf - b'A') as u16;
+    let lat_f = (bf - b'A') as u16;
+    let lon_s = g[2] - b'0';
+    let lat_s = g[3] - b'0';
+    Some((lon_f * 18 + lat_f, lon_s * 10 + lat_s))
+}
+
+/// Format a Maidenhead field index (`0..324`) as `[lon_letter, lat_letter]`.
+pub fn field_letters(field_idx: u16) -> [u8; 2] {
+    let lon_f = (field_idx / 18).min(17) as u8;
+    let lat_f = (field_idx % 18) as u8;
+    [b'A' + lon_f, b'A' + lat_f]
+}
+
+/// Storage backend trait for SOL950 Log, Stats, and Worked Grids (implemented by flash journal or RAM store).
+pub trait Sol950Store {
+    fn count(&self) -> u16;
+    fn is_full(&self) -> bool;
+    fn field_mask(&self) -> &[u32; 11];
+    fn read_newest(&self, skip: u16, grid_filter: Option<[u8; 4]>, out: &mut [Option<SavedContact>]) -> usize;
+    fn stats(&self, today_utc_day: Option<u32>) -> SavedStats;
+    fn field_squares(&self, field_idx: u16) -> [u16; 100];
+    fn save_contact(&mut self, c: &SavedContact) -> SaveOutcome;
+}
+
+pub const MEM_LOG_CAP: usize = 32;
+
+/// Compact in-memory store (used as default in simulator/tests and RAM cache when flash backend isn't attached).
+pub struct MemSol950Store {
+    rows: [SavedContact; MEM_LOG_CAP],
+    len: u16,
+    cap: u16,
+    field_mask: [u32; 11],
+}
+
+impl Default for MemSol950Store {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl MemSol950Store {
+    pub const fn new() -> Self {
+        Self {
+            rows: [SavedContact::EMPTY; MEM_LOG_CAP],
+            len: 0,
+            cap: MEM_LOG_CAP as u16,
+            field_mask: [0; 11],
+        }
+    }
+
+    pub fn set_capacity(&mut self, cap: u16) {
+        self.cap = cap.min(MEM_LOG_CAP as u16);
+    }
+}
+
+impl Sol950Store for MemSol950Store {
+    fn count(&self) -> u16 {
+        self.len
+    }
+
+    fn is_full(&self) -> bool {
+        self.len >= self.cap
+    }
+
+    fn field_mask(&self) -> &[u32; 11] {
+        &self.field_mask
+    }
+
+    fn read_newest(&self, skip: u16, grid_filter: Option<[u8; 4]>, out: &mut [Option<SavedContact>]) -> usize {
+        for slot in out.iter_mut() {
+            *slot = None;
+        }
+        let mut skipped = 0u16;
+        let mut written = 0usize;
+        for idx in (0..self.len as usize).rev() {
+            if written >= out.len() {
+                break;
+            }
+            let c = self.rows[idx];
+            if let Some(gf) = grid_filter {
+                if !c.peer_grid.eq_ignore_ascii_case(&gf) {
+                    continue;
+                }
+            }
+            if skipped < skip {
+                skipped += 1;
+                continue;
+            }
+            out[written] = Some(c);
+            written += 1;
+        }
+        written
+    }
+
+    fn stats(&self, today_utc_day: Option<u32>) -> SavedStats {
+        let mut st = SavedStats { best_rx_snr: i8::MIN, best_tx_snr: i8::MIN, ..SavedStats::default() };
+        for i in 0..self.len as usize {
+            let c = self.rows[i];
+            if let Some(day) = today_utc_day {
+                if c.utc_sec / 86_400 != day {
+                    continue;
+                }
+            }
+            st.contacts = st.contacts.saturating_add(1);
+            if !st.has_snr {
+                st.best_rx_snr = c.rx_snr_db;
+                st.best_tx_snr = c.tx_snr_db;
+                st.has_snr = true;
+            } else {
+                st.best_rx_snr = st.best_rx_snr.max(c.rx_snr_db);
+                st.best_tx_snr = st.best_tx_snr.max(c.tx_snr_db);
+            }
+            let mut seen_peer = false;
+            let has_grid = grid4_to_field_square(&c.peer_grid).is_some();
+            let mut seen_grid = !has_grid;
+            for &p in self.rows.iter().take(i) {
+                if let Some(day) = today_utc_day {
+                    if p.utc_sec / 86_400 != day {
+                        continue;
+                    }
+                }
+                if p.peer_id == c.peer_id {
+                    seen_peer = true;
+                }
+                if has_grid && p.peer_grid.eq_ignore_ascii_case(&c.peer_grid) {
+                    seen_grid = true;
+                }
+            }
+            if !seen_peer {
+                st.unique_stations = st.unique_stations.saturating_add(1);
+            }
+            if !seen_grid {
+                st.unique_grids = st.unique_grids.saturating_add(1);
+            }
+        }
+        if !st.has_snr {
+            st.best_rx_snr = 0;
+            st.best_tx_snr = 0;
+        }
+        st
+    }
+
+    fn field_squares(&self, field_idx: u16) -> [u16; 100] {
+        let mut sqs = [0u16; 100];
+        for row in self.rows.iter().take(self.len as usize) {
+            if let Some((f, sq)) = grid4_to_field_square(&row.peer_grid) {
+                if f == field_idx {
+                    sqs[sq as usize] = sqs[sq as usize].saturating_add(1);
+                }
+            }
+        }
+        sqs
+    }
+
+    fn save_contact(&mut self, c: &SavedContact) -> SaveOutcome {
+        for i in (0..self.len as usize).rev() {
+            let e = self.rows[i];
+            if e.peer_id == c.peer_id && c.slot.abs_diff(e.slot) < 30 {
+                return SaveOutcome::Duplicate;
+            }
+        }
+        if self.is_full() {
+            return SaveOutcome::LogFull;
+        }
+        let idx = self.len as usize;
+        let mut rec = *c;
+        rec.seq = (idx + 1) as u32;
+        self.rows[idx] = rec;
+        self.len += 1;
+        if let Some((f, _)) = grid4_to_field_square(&rec.peer_grid) {
+            let fi = f as usize;
+            self.field_mask[fi / 32] |= 1u32 << (fi % 32);
+        }
+        SaveOutcome::Saved(rec.seq)
+    }
+}
+
 /// Station identity and radio configuration for SOL950.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Sol950Profile {
@@ -188,6 +437,10 @@ pub struct Sol950Host {
     pub last_qso: Option<QsoRecord>,
     /// Peer currently targeted by Answer (for Active screen display).
     pub target_peer: Option<Callsign>,
+    /// Optional 4-char grid filter when opening Log from Worked Grids drill-down.
+    pub log_grid_filter: Option<[u8; 4]>,
+    /// In-memory / mirrored durable contact store for Log, Stats, and Worked Grids.
+    pub store: MemSol950Store,
     pub notice: [u8; 28],
     pub notice_len: u8,
 }
@@ -202,7 +455,7 @@ impl Sol950Host {
     pub fn new() -> Self {
         let profile = Sol950Profile::new();
         let cfg = Config {
-            my_call: Callsign::encode(b"N0CALL").unwrap(),
+            my_call: Callsign::from_raw(0).unwrap(),
             my_grid4: GRID_UNKNOWN,
             tx_pwr: 0,
             mode: OpMode::Monitor,
@@ -225,6 +478,8 @@ impl Sol950Host {
             log_full: false,
             last_qso: None,
             target_peer: None,
+            log_grid_filter: None,
+            store: MemSol950Store::new(),
             notice: [0; 28],
             notice_len: 0,
         }
@@ -246,7 +501,7 @@ impl Sol950Host {
 
     /// Push the current profile + effective grid into the underlying `Engine`.
     pub fn sync_engine_config(&mut self) {
-        let my_call = self.profile.callsign().unwrap_or_else(|| Callsign::encode(b"N0CALL").unwrap());
+        let my_call = self.profile.callsign().unwrap_or_else(|| Callsign::from_raw(0).unwrap());
         let (grid_bytes, src) = self.profile.effective_grid(self.gps_grid);
         let my_grid4 = if src == GridSource::Unset {
             GRID_UNKNOWN
@@ -305,6 +560,47 @@ impl Sol950Host {
         }
     }
 
+    fn persist_qso(&mut self, rec: QsoRecord) {
+        self.last_qso = Some(rec);
+        let mut peer_id = [0u8; 16];
+        let mut cb = [0u8; 6];
+        let cn = rec.peer.decode(&mut cb);
+        peer_id[..cn].copy_from_slice(&cb[..cn]);
+        let mut my_id = [0u8; 16];
+        let my_n = self.profile.format_identity(&mut my_id);
+        let _ = my_n;
+        let peer_grid = ferrite_core::sol950::usol950::frame::decode_grid4(rec.peer_grid4).unwrap_or(*b"----");
+        let (my_grid, my_grid_src) = self.profile.effective_grid(self.gps_grid);
+        let contact = SavedContact {
+            utc_sec: self.utc_sec,
+            dial_hz10: rec.window,
+            peer_id,
+            my_id,
+            peer_grid,
+            my_grid,
+            rx_snr_db: rec.sent_snr,
+            tx_snr_db: rec.rcvd_snr,
+            my_grid_src,
+            slot: rec.completed_slot,
+            seq: 0,
+        };
+        match self.store.save_contact(&contact) {
+            SaveOutcome::Saved(_) | SaveOutcome::Duplicate => {
+                self.saved_ack = true;
+                self.log_full = self.store.is_full();
+            }
+            SaveOutcome::LogFull => {
+                self.saved_ack = false;
+                self.log_full = true;
+                self.set_notice(b"Log full - not saved");
+            }
+            SaveOutcome::Error => {
+                self.saved_ack = false;
+                self.set_notice(b"Save failed");
+            }
+        }
+    }
+
     pub fn on_rx_frame(&mut self, d: Decoded) {
         let mut logs = [None; 4];
         let w = self.profile.dial();
@@ -312,8 +608,7 @@ impl Sol950Host {
         let n = self.engine.on_rx_frames(slot, w, &[d], &mut logs);
         if n > 0 {
             if let Some(rec) = logs[0] {
-                self.last_qso = Some(rec);
-                self.saved_ack = false;
+                self.persist_qso(rec);
             }
         }
     }
@@ -323,8 +618,7 @@ impl Sol950Host {
         let slot = if self.last_slot == u32::MAX { 0 } else { self.last_slot };
         if ok {
             if let Some(rec) = self.engine.confirm_tx_completed(slot) {
-                self.last_qso = Some(rec);
-                self.saved_ack = false;
+                self.persist_qso(rec);
             }
         } else {
             self.engine.on_tx_missed_deadline(slot);

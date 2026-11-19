@@ -25,6 +25,7 @@ pub mod restore;
 pub mod sats;
 pub mod scratch;
 pub mod settings;
+pub mod sol950;
 pub mod ssb;
 pub mod store;
 
