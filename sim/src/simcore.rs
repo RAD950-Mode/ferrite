@@ -265,8 +265,12 @@ pub struct SimCore {
     /// `--cut-restart` (decision 339): the store's writes queued as on the radio, and the next restart after a raw
     /// write is a power cut: what the Storage task hadn't done yet is lost (the stamp, when Console sent it last).
     cut_restart: bool,
-    /// Simulated 8.8 s SOL950 TX burst end timestamp (ms).
-    sol950_tx_end_ms: Option<u32>,
+    /// Simulated 8.8 s SOL950 TX burst end timestamp (ms) and the frame being transmitted.
+    sol950_tx_end_ms: Option<(u32, ferrite_core::sol950::usol950::Frame)>,
+    /// Last TX frame completed in the simulator (used to generate realistic peer replies on the next RX slot).
+    sol950_last_tx: Option<ferrite_core::sol950::usol950::Frame>,
+    /// Counter for rotating simulated SOL950 stations in the interactive simulator.
+    sol950_sim_idx: u8,
 }
 
 /// One render pass as [`SimCore::watch_passes`] records it.
@@ -429,6 +433,8 @@ impl SimCore {
             gps_off: false,
             cut_restart: false,
             sol950_tx_end_ms: None,
+            sol950_last_tx: None,
+            sol950_sim_idx: 0,
         };
         if owner_card {
             ferrite_app::sample::owner_card(s.app.settings_mut());
@@ -644,15 +650,79 @@ impl SimCore {
                 let gps_grid = here.map(|(lat, lon, _)| ferrite_app::gpsdata::pos_to_grid4(lat, lon));
                 h.update_clock(sat_t, (now % 1000) as u16, 40, gps_grid);
             }
-            if let Some((rf_freq, power, _frame)) = app.sol950_take_tx() {
+            if let Some((rf_freq, power, frame)) = app.sol950_take_tx() {
                 send(radio, ferrite_core::msg::RadioCmd::Sol950Tx { freq: rf_freq, power });
-                self.sol950_tx_end_ms = Some(now.saturating_add(8_800));
+                self.sol950_tx_end_ms = Some((now.saturating_add(8_800), frame));
             }
-            if self.sol950_tx_end_ms.is_some_and(|end| now >= end) {
-                self.sol950_tx_end_ms = None;
-                send(radio, ferrite_core::msg::RadioCmd::Sol950Abort);
+            if let Some((end, frame)) = self.sol950_tx_end_ms {
+                if now >= end {
+                    self.sol950_tx_end_ms = None;
+                    self.sol950_last_tx = Some(frame);
+                    send(radio, ferrite_core::msg::RadioCmd::Sol950Abort);
+                    if let Some(h) = app.sol950_host_mut() {
+                        h.on_tx_done(true);
+                    }
+                }
+            }
+            if app.sol950_take_finish() && app.sol950_open() {
+                use ferrite_core::sol950::usol950::frame::encode_grid4;
+                use ferrite_core::sol950::usol950::{Callsign, Decoded, Frame};
+                const ROSTER: [(&[u8], [u8; 4], i8, u16); 4] = [
+                    (b"K1ABC", *b"FN31", -12, 1130),
+                    (b"W6XYZ", *b"CM87", -15, 1380),
+                    (b"G4DEF", *b"IO91", -17, 1620),
+                    (b"JA1GHI", *b"PM95", -19, 1850),
+                ];
                 if let Some(h) = app.sol950_host_mut() {
-                    h.on_tx_done(true);
+                    let my_call = h.profile.callsign();
+                    // If we just transmitted in the previous slot, have the peer answer on this RX slot!
+                    if let (Some(tx_frame), Some(me)) = (self.sol950_last_tx.take(), my_call) {
+                        match tx_frame {
+                            Frame::Cq { .. } => {
+                                let (call, grid, snr, hz) = ROSTER[self.sol950_sim_idx as usize % ROSTER.len()];
+                                self.sol950_sim_idx = self.sol950_sim_idx.wrapping_add(1);
+                                let peer = Callsign::encode(call).unwrap();
+                                // Feed both a CQ (so grid is known) and a directed RX reply to our CQ.
+                                h.on_rx_frame(Decoded {
+                                    frame: Frame::Cq { sender: peer, grid4: encode_grid4(&grid).unwrap(), tx_pwr: 10, reserved: 0 },
+                                    audio_hz: hz,
+                                    time_offset_ms: 20,
+                                    snr_db: snr,
+                                });
+                                h.on_rx_frame(Decoded {
+                                    frame: Frame::Rx { sender: peer, recipient: me, snr_db: snr + 1, ack: false, reserved: false },
+                                    audio_hz: hz,
+                                    time_offset_ms: 20,
+                                    snr_db: snr,
+                                });
+                            }
+                            Frame::Rx { recipient, ack: false, .. } => {
+                                // Peer acknowledges our report with R+RX (`ack: true`) so QSO logs cleanly!
+                                h.on_rx_frame(Decoded {
+                                    frame: Frame::Rx { sender: recipient, recipient: me, snr_db: -13, ack: true, reserved: false },
+                                    audio_hz: 1130,
+                                    time_offset_ms: 20,
+                                    snr_db: -14,
+                                });
+                            }
+                            _ => {}
+                        }
+                    } else {
+                        // Normal RX slot: hear one CQ caller from the rotating band roster.
+                        let (call, grid, snr, hz) = ROSTER[self.sol950_sim_idx as usize % ROSTER.len()];
+                        self.sol950_sim_idx = self.sol950_sim_idx.wrapping_add(1);
+                        h.on_rx_frame(Decoded {
+                            frame: Frame::Cq {
+                                sender: Callsign::encode(call).unwrap(),
+                                grid4: encode_grid4(&grid).unwrap(),
+                                tx_pwr: 10,
+                                reserved: 0,
+                            },
+                            audio_hz: hz,
+                            time_offset_ms: 40,
+                            snr_db: snr,
+                        });
+                    }
                 }
             }
             app.tick(now, &radio.live, store);
