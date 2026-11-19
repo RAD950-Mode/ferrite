@@ -508,7 +508,7 @@ fn keep(to: TextFor, app: &mut App, store: &impl ChannelStore) {
         }
         TextFor::Sol950Chat => {
             if t.as_bytes().is_empty() {
-                return app.show_toast(b"Chat message", b"Type a short message", false);
+                return app.show_toast(b"Chat message", b"Enter a message", false);
             }
             if let Some(h) = app.sol950_host_mut() {
                 h.chat.set_literal_draft(t.as_bytes());

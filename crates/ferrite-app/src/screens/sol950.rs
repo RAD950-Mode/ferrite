@@ -330,8 +330,9 @@ impl View for Sol950Scr {
 
     fn ptt(mut self, app: &mut App, down: bool) {
         if self.page != PAGE_DISTRESS {
+            // Never close RAD950 or jump to FM voice when PTT is pressed inside RAD950.
             if down {
-                super::nav::transmit(app);
+                app.show_toast(b"RAD950 active", b"Use 1/OK to TX", false);
             }
             return;
         }
@@ -493,7 +494,7 @@ impl Sol950Scr {
             }
             Key::Menu => {
                 if app.sol950_host().is_some_and(|h| h.profile.coop_rx == CoopRxMode::Capture) {
-                    app.show_toast(b"Coop Capture", b"RX only - host collects", false);
+                    app.show_toast(b"Coop Capture", b"RX only mode", false);
                     return;
                 }
                 if let Some(row) = rows.get(self.sel as usize).filter(|_| (self.sel as usize) < n) {
@@ -510,7 +511,7 @@ impl Sol950Scr {
             }
             Key::Digit(1) => {
                 if app.sol950_host().is_some_and(|h| h.profile.coop_rx == CoopRxMode::Capture) {
-                    app.show_toast(b"Coop Capture", b"RX only - host collects", false);
+                    app.show_toast(b"Coop Capture", b"RX only mode", false);
                     return;
                 }
                 if let Some(h) = app.sol950_host_mut() {
