@@ -257,6 +257,40 @@ pub enum SaveOutcome {
     Error,
 }
 
+/// Award classification for a Maidenhead 4-char grid relative to the saved log.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GridAward {
+    /// Grid has already been worked on this band (or grid is unknown).
+    None,
+    /// Grid was worked on another band, but is new on the current band.
+    NewBandGrid,
+    /// Grid has never been worked on any band.
+    NewGrid,
+}
+
+/// Call-list badge status for a heard peer relative to the saved log on the active band.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PeerCallStatus {
+    /// True if a QSO with this station is already saved on the current band (or this session).
+    pub worked: bool,
+    /// New-grid / new-band-grid status (for unworked stations: what working them yields;
+    /// for worked stations: whether working them yielded a new grid or new band grid).
+    pub award: GridAward,
+}
+
+/// Band identifier in meters (`10, 12, 15, 17`) for a RAD950 USB dial.
+pub const fn dial_band_m(dial_hz10: Freq10) -> u8 {
+    if dial_hz10 >= 2_800_000 {
+        10
+    } else if dial_hz10 >= 2_400_000 {
+        12
+    } else if dial_hz10 >= 2_100_000 {
+        15
+    } else {
+        17
+    }
+}
+
 /// Parse a 4-char Maidenhead grid into `(field_idx 0..324, square_idx 0..100)`.
 pub fn grid4_to_field_square(g: &[u8; 4]) -> Option<(u16, u8)> {
     let lf = g[0].to_ascii_uppercase();
@@ -320,6 +354,58 @@ impl MemSol950Store {
 
     pub fn set_capacity(&mut self, cap: u16) {
         self.cap = cap.min(MEM_LOG_CAP as u16);
+    }
+
+    /// Classify a heard peer's worked status and New Grid / New Band Grid award against the saved log.
+    pub fn classify_peer(&self, call: &[u8], grid: [u8; 4], dial_hz10: Freq10, session_logged: bool) -> PeerCallStatus {
+        let cur_band = dial_band_m(dial_hz10);
+        let valid_grid = grid4_to_field_square(&grid).is_some();
+        let mut worked = session_logged;
+        let mut grid_any_count = 0u16;
+        let mut grid_band_count = 0u16;
+        let mut peer_in_grid_any = false;
+        let mut peer_in_grid_band = false;
+
+        for c in self.rows.iter().take(self.len as usize) {
+            let same_band = dial_band_m(c.dial_hz10) == cur_band;
+            let same_call = c.peer_bytes().eq_ignore_ascii_case(call);
+            if same_call && same_band {
+                worked = true;
+            }
+            if valid_grid && c.peer_grid.eq_ignore_ascii_case(&grid) {
+                grid_any_count += 1;
+                if same_call {
+                    peer_in_grid_any = true;
+                }
+                if same_band {
+                    grid_band_count += 1;
+                    if same_call {
+                        peer_in_grid_band = true;
+                    }
+                }
+            }
+        }
+
+        let award = if !valid_grid {
+            GridAward::None
+        } else if !worked {
+            if grid_any_count == 0 {
+                GridAward::NewGrid
+            } else if grid_band_count == 0 {
+                GridAward::NewBandGrid
+            } else {
+                GridAward::None
+            }
+        } else if peer_in_grid_any && grid_any_count == 1 {
+            // This QSO is the sole (first) contact in this grid all-time!
+            GridAward::NewGrid
+        } else if peer_in_grid_band && grid_band_count == 1 {
+            // This QSO is the sole (first) contact in this grid on this band!
+            GridAward::NewBandGrid
+        } else {
+            GridAward::None
+        };
+        PeerCallStatus { worked, award }
     }
 }
 
@@ -623,6 +709,8 @@ pub struct Sol950Host {
     pub log_full: bool,
     /// Most recently completed QSO record (awaiting or confirmed in durable storage).
     pub last_qso: Option<QsoRecord>,
+    /// Whether `last_qso` earned a New Grid or New Band Grid award.
+    pub last_qso_award: GridAward,
     /// Peer currently targeted by Answer (for Active screen display).
     pub target_peer: Option<Callsign>,
     /// Optional 4-char grid filter when opening Log from Worked Grids drill-down.
@@ -691,6 +779,7 @@ impl Sol950Host {
             saved_ack: false,
             log_full: false,
             last_qso: None,
+            last_qso_award: GridAward::None,
             target_peer: None,
             log_grid_filter: None,
             profile_dirty: false,
@@ -871,6 +960,9 @@ impl Sol950Host {
         let _ = my_n;
         let peer_grid = ferrite_core::sol950::usol950::frame::decode_grid4(rec.peer_grid4).unwrap_or(*b"----");
         let (my_grid, my_grid_src) = self.profile.effective_grid(self.gps_grid);
+        // Classify award BEFORE saving so we know whether this QSO earned a New Grid / New Band Grid.
+        let pre = self.store.classify_peer(&cb[..cn], peer_grid, rec.window, false);
+        self.last_qso_award = pre.award;
         let contact = SavedContact {
             utc_sec: self.utc_sec,
             dial_hz10: rec.window,

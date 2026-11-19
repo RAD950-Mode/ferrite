@@ -104,9 +104,70 @@ pub fn page_id(s: &Sol950Scr) -> &'static str {
     }
 }
 
+const CYAN: u16 = 0x07FF;
+
 fn draw_tx_flag(lcd: &mut impl Panel, x: i32, y: i32) {
     lcd.fill(x, y, 28, 16, RED);
     lcd.text4(x + 6, y + 12, b"TX", &UI_12B, WHITE, RED);
+}
+
+/// Crisp 16x16 status icon for a call-list row:
+/// - Worked station: green checkmark badge (with amber/cyan corner pip if it earned a New Grid / New Band Grid)
+/// - Unworked New Grid (all-time): gold 4-point star
+/// - Unworked New Band Grid: cyan plus/target icon
+/// - Normal unworked: subtle hollow square
+fn draw_peer_icon(
+    lcd: &mut impl Panel,
+    x: i32,
+    y: i32,
+    st: crate::sol950::PeerCallStatus,
+    selected: bool,
+) {
+    use crate::sol950::GridAward;
+    if st.worked {
+        let box_col = if selected { WHITE } else { GREEN };
+        let chk_col = BG;
+        lcd.fill(x, y, 15, 15, box_col);
+        // Checkmark stroke inside the 15x15 badge
+        lcd.fill(x + 3, y + 7, 2, 2, chk_col);
+        lcd.fill(x + 5, y + 9, 2, 2, chk_col);
+        lcd.fill(x + 7, y + 7, 2, 2, chk_col);
+        lcd.fill(x + 9, y + 5, 2, 2, chk_col);
+        lcd.fill(x + 11, y + 3, 2, 2, chk_col);
+        // Corner pip indicating New Grid (amber) or New Band Grid (cyan) earned by this QSO
+        match st.award {
+            GridAward::NewGrid => lcd.fill(x + 11, y, 4, 4, AMBER),
+            GridAward::NewBandGrid => lcd.fill(x + 11, y, 4, 4, CYAN),
+            GridAward::None => {}
+        }
+    } else {
+        match st.award {
+            GridAward::NewGrid => {
+                // Bright gold 4-point star (needed all-time grid!)
+                let col = if selected { WHITE } else { AMBER };
+                lcd.fill(x + 6, y + 1, 3, 13, col);
+                lcd.fill(x + 1, y + 6, 13, 3, col);
+                lcd.fill(x + 4, y + 4, 7, 7, col);
+            }
+            GridAward::NewBandGrid => {
+                // Bright cyan plus inside frame (needed on this band!)
+                let col = if selected { WHITE } else { CYAN };
+                lcd.fill(x + 2, y + 2, 11, 1, col);
+                lcd.fill(x + 2, y + 12, 11, 1, col);
+                lcd.fill(x + 2, y + 2, 1, 11, col);
+                lcd.fill(x + 12, y + 2, 1, 11, col);
+                lcd.fill(x + 6, y + 4, 3, 7, col);
+                lcd.fill(x + 4, y + 6, 7, 3, col);
+            }
+            GridAward::None => {
+                let col = if selected { BLUE_FG } else { DIM };
+                lcd.fill(x + 4, y + 4, 7, 1, col);
+                lcd.fill(x + 4, y + 10, 7, 1, col);
+                lcd.fill(x + 4, y + 4, 1, 7, col);
+                lcd.fill(x + 10, y + 4, 1, 7, col);
+            }
+        }
+    }
 }
 
 fn push_khz3<const N: usize>(b: &mut Buf<N>, dial: Freq10) {
@@ -742,34 +803,83 @@ impl Sol950Scr {
             let idx = self.top as usize + i;
             let selected = idx == self.sel as usize && idx < n_rows;
             let row = (idx < n_rows).then(|| rows[idx]);
-            let mut rh = Mix::new().n(selected as u32).n(idx as u32);
-            if let Some(r) = row {
+            let peer_status = row.map(|r| {
+                let mut cb = [0u8; 6];
+                let cn = r.peer.decode(&mut cb);
+                let gb = decode_grid4(r.grid4).unwrap_or(*b"----");
+                app.sol950_host().map_or(
+                    crate::sol950::PeerCallStatus { worked: r.logged, award: crate::sol950::GridAward::None },
+                    |h| h.store.classify_peer(&cb[..cn], gb, dial, r.logged),
+                )
+            });
+            let mut rh = Mix::new().n(selected as u32).n(idx as u32).n(dial);
+            if let (Some(r), Some(st)) = (row, peer_status) {
                 rh = rh
                     .n(r.peer.raw())
                     .n(r.grid4 as u32)
                     .n(r.snr_db as u32)
-                    .n(r.logged as u32);
+                    .n(st.worked as u32)
+                    .n(st.award as u32);
             }
             if app.dirty(R_ROW + i, rh.get()) {
+                use crate::sol950::GridAward;
                 let y = list_y + i as i32 * row_h;
                 let bg = if selected { BLUE } else { BG };
                 let fg = if selected { BLUE_FG } else { TEXT };
                 let dim = if selected { BLUE_FG } else { DIM };
                 redraw_box!(true, lcd, (0, y, W, row_h, bg), {
-                    if let Some(r) = row {
+                    if let (Some(r), Some(st)) = (row, peer_status) {
                         let mut cb = [0u8; 6];
                         let cn = r.peer.decode(&mut cb);
                         let cs = core::str::from_utf8(&cb[..cn]).unwrap_or("?");
                         let gb = decode_grid4(r.grid4).unwrap_or(*b"----");
                         let gs = core::str::from_utf8(&gb).unwrap_or("----");
-                        let mut left = Buf::<24>::new();
-                        let kind = if r.logged { "OK" } else if r.owed_reply.is_some() { "RX" } else { "CQ" };
-                        let _ = uwrite!(left, "{} {} {}", kind, cs, gs);
-                        lcd.text4(8, y + 22, left.as_bytes(), &UI_14, fg, bg);
+
+                        // 16x16 icon: green checkmark (worked), gold star (new grid), cyan plus (new band grid)
+                        draw_peer_icon(lcd, 8, y + 9, st, selected);
+
+                        let call_col = if selected {
+                            BLUE_FG
+                        } else if st.worked {
+                            GREEN
+                        } else {
+                            fg
+                        };
+                        let grid_col = if selected {
+                            BLUE_FG
+                        } else if st.worked {
+                            GREEN
+                        } else {
+                            match st.award {
+                                GridAward::NewGrid => AMBER,
+                                GridAward::NewBandGrid => CYAN,
+                                GridAward::None => DIM,
+                            }
+                        };
+                        lcd.text4(30, y + 22, cs.as_bytes(), &UI_14, call_col, bg);
+                        lcd.text4(104, y + 22, gs.as_bytes(), &UI_14, grid_col, bg);
+
+                        // Compact badge tag (NEW / BND / WKD* / WKD+ / WKD)
+                        let (tag, tcol): (&[u8], u16) = if st.worked {
+                            match st.award {
+                                GridAward::NewGrid => (b"WKD*", if selected { BLUE_FG } else { AMBER }),
+                                GridAward::NewBandGrid => (b"WKD+", if selected { BLUE_FG } else { CYAN }),
+                                GridAward::None => (b"WKD", if selected { BLUE_FG } else { GREEN }),
+                            }
+                        } else {
+                            match st.award {
+                                GridAward::NewGrid => (b"NEW", if selected { BLUE_FG } else { AMBER }),
+                                GridAward::NewBandGrid => (b"BND", if selected { BLUE_FG } else { CYAN }),
+                                GridAward::None => (b"", dim),
+                            }
+                        };
+                        if !tag.is_empty() {
+                            lcd.text4(150, y + 22, tag, &UI_12B, tcol, bg);
+                        }
 
                         let mut right = Buf::<12>::new();
                         let _ = uwrite!(right, "{}dB", r.snr_db);
-                        lcd.text4(W - 48, y + 22, right.as_bytes(), &UI_12, dim, bg);
+                        lcd.text4(W - 44, y + 22, right.as_bytes(), &UI_12, dim, bg);
                     } else if i == 0 && n_rows == 0 {
                         let mut empty = Buf::<28>::new();
                         let _ = uwrite!(empty, "Listening on {} USB...", band_label(dial));
@@ -906,7 +1016,14 @@ impl Sol950Scr {
                     lcd.text4(10, y0 + 90, sline.as_bytes(), &UI_12, DIM, BG);
                 }
                 if saved_ack {
-                    lcd.text4(10, y0 + 118, b"Saved to flash log", &UI_14, GREEN, BG);
+                    use crate::sol950::GridAward;
+                    let award = app.sol950_host().map_or(GridAward::None, |h| h.last_qso_award);
+                    let (msg, col): (&[u8], u16) = match award {
+                        GridAward::NewGrid => (b"Saved - NEW GRID!", AMBER),
+                        GridAward::NewBandGrid => (b"Saved - NEW BAND GRID!", CYAN),
+                        GridAward::None => (b"Saved to flash log", GREEN),
+                    };
+                    lcd.text4(10, y0 + 118, msg, &UI_14, col, BG);
                 }
                 if let Some(host) = app.sol950_host() {
                     let nb = host.notice_bytes();
