@@ -427,6 +427,28 @@ impl Receiver {
     }
 
     #[inline]
+    fn read_ring_bin(&self, sym_mod: usize, phase: usize, bin: usize) -> u8 {
+        let off = Self::ring_offset(sym_mod, phase, bin);
+        let [lo, hi] = self.work[off >> 1].to_le_bytes();
+        if (off & 1) == 0 { lo } else { hi }
+    }
+
+    #[inline]
+    fn sample_ring_tone(&self, sym_mod: usize, phase: usize, q0: u16, tone: usize) -> i32 {
+        let q = (q0 + self.tone_q_off[tone]) as usize;
+        let b = q >> 1;
+        if b >= N_BINS {
+            return 0;
+        }
+        let v0 = self.read_ring_bin(sym_mod, phase, b) as i32;
+        if (q & 1) == 0 || b + 1 >= N_BINS {
+            v0
+        } else {
+            (v0 + self.read_ring_bin(sym_mod, phase, b + 1) as i32 + 1) >> 1
+        }
+    }
+
+    #[inline]
     fn read_ring_bins(&self, sym_mod: usize, phase: usize) -> [u8; N_BINS] {
         let base = Self::ring_offset(sym_mod, phase, 0) >> 1;
         let mut out = [0u8; N_BINS];
@@ -739,16 +761,14 @@ impl Receiver {
             let s_usize = start_sym as usize;
             let ph_usize = phase as usize;
             // Refine sub-bin frequency (`df_q2`) and sub-half-symbol timing (`dt_q4`) via 3-point
-            // parabolic interpolation on `S0 + S1` log-power in `work` before `work` is reused.
+            // parabolic interpolation on `S0 + S1` log-power in `work` (direct single-bin reads).
             let sync_log_sum = |s_a: usize, ph_a: usize, q_a: u16| -> f32 {
                 let mut acc = 0i32;
                 for (k, &w) in S0.iter().enumerate() {
-                    let b = self.read_ring_bins((s_a + k) % RING_SYMS, ph_a);
-                    acc += Self::sample_tone(&b, q_a, &self.tone_q_off, w as usize);
+                    acc += self.sample_ring_tone((s_a + k) % RING_SYMS, ph_a, q_a, w as usize);
                 }
                 for (k, &w) in S1.iter().enumerate() {
-                    let b = self.read_ring_bins((s_a + 18 + k) % RING_SYMS, ph_a);
-                    acc += Self::sample_tone(&b, q_a, &self.tone_q_off, w as usize);
+                    acc += self.sample_ring_tone((s_a + 18 + k) % RING_SYMS, ph_a, q_a, w as usize);
                 }
                 acc as f32
             };
@@ -815,10 +835,10 @@ impl Receiver {
                     if d >= N_DATA_SYMS {
                         continue;
                     }
-                    let bins = self.read_ring_bins(sym % RING_SYMS, ph_usize);
+                    let sym_mod = sym % RING_SYMS;
                     let mut lp = [0.0f32; 4];
                     for (t, slot) in lp.iter_mut().enumerate() {
-                        let b = Self::sample_tone(&bins, q_u16, &self.tone_q_off, t).clamp(0, 255) as u8;
+                        let b = self.sample_ring_tone(sym_mod, ph_usize, q_u16, t).clamp(0, 255) as u8;
                         let ratio = lin_power(b) as f32 / n0;
                         *slot = ln_bessel_i0_f32(2.0 * sqrt_f32(gamma * ratio));
                     }
