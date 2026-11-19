@@ -657,13 +657,13 @@ impl SimCore {
                 let gps_grid = here.map(|(lat, lon, _)| ferrite_app::gpsdata::pos_to_grid4(lat, lon));
                 h.update_clock(sat_t, (now % 1000) as u16, 40, gps_grid);
                 let wf_tick = now / 200;
-                if sol_open && wf_tick != self.sol950_wf_tick {
+                if sol_open && !h.tx_in_flight && wf_tick != self.sol950_wf_tick {
                     self.sol950_wf_tick = wf_tick;
                     if self.sol950_wf_seq.is_empty() {
                         self.sol950_wf_seq = crate::sol950_wf::sample_panafall();
                     }
                     let (col, edge) = self.sol950_wf_seq[(wf_tick as usize) % self.sol950_wf_seq.len()];
-                    h.wf.push(col, edge);
+                    h.wf.push(col, edge, false);
                 }
             }
             if let Some((rf_freq, power, frame)) = app.sol950_take_tx() {

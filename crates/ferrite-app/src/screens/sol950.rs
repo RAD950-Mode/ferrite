@@ -497,10 +497,15 @@ impl Sol950Scr {
             0x0000, 0x0821, 0x0864, 0x08C8, 0x114C, 0x11D1, 0x1A75, 0x1B39,
             0x2439, 0x2554, 0x366D, 0x5728, 0x9FA4, 0xDF02, 0xFD60, 0xFFE6,
         ];
+        const TX_PALETTE: [u16; 16] = [
+            0x1000, 0x2000, 0x3000, 0x4000, 0x5800, 0x7000, 0x8800, 0xA000,
+            0xB800, 0xD000, 0xE820, 0xF880, 0xFA04, 0xFBA8, 0xFD8E, 0xFEF6,
+        ];
         let Some(h) = app.sol950_host() else { return };
         let seq = h.wf.seq;
+        let tx_now = h.tx_in_flight;
         let slot_sec = if h.utc_sec == 0 { 0 } else { (h.utc_sec % 10) as u8 };
-        let wf_h = Mix::new().n(seq).n(slot_sec as u32).get();
+        let wf_h = Mix::new().n(seq).n(slot_sec as u32).n(tx_now as u32).get();
         if let Some(clear) = app.dirty_shape(R_NOTE, wf_h, true) {
             let y0 = 210i32;
             let wf_x = 12i32;
@@ -512,7 +517,7 @@ impl Sol950Scr {
                 lcd.text4(6, y0 + 14, b"586-2344 Hz  225Hz", &UI_12, DIM, BG);
                 let mut tr = Buf::<8>::new();
                 let _ = uwrite!(tr, "T+{}s", slot_sec);
-                lcd.text4(W - 40, y0 + 14, tr.as_bytes(), &UI_12, AMBER, BG);
+                lcd.text4(W - 40, y0 + 14, tr.as_bytes(), &UI_12, if tx_now { RED } else { AMBER }, BG);
 
                 // Subtle 225 Hz grid channel ticks along the left margin (every 3 rows ~ 220 Hz).
                 for ch in 0..8i32 {
@@ -534,11 +539,12 @@ impl Sol950Scr {
                     let is_grid_line = r_top % 3 == 0 && r_top > 0;
                     for col in 0..WF_COLS {
                         let lvl = host.wf.level(col, bin) as usize;
-                        let mut px = WF_PALETTE[lvl & 15];
+                        let is_tx = host.wf.is_tx_col(col);
+                        let mut px = if is_tx { TX_PALETTE[lvl & 15] } else { WF_PALETTE[lvl & 15] };
                         if host.wf.is_slot_mark(col) && lvl < 4 {
-                            px = 0x2945; // subtle vertical 10 s slot divider scrolling left
+                            px = if is_tx { 0x6000 } else { 0x2945 }; // vertical 10 s slot divider
                         } else if is_grid_line && lvl < 2 {
-                            px = 0x1082; // faint horizontal 225 Hz channel guide
+                            px = if is_tx { 0x2800 } else { 0x1082 }; // faint 225 Hz channel guide
                         }
                         line[col * 2] = px;
                         line[col * 2 + 1] = px;

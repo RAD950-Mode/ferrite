@@ -114,7 +114,7 @@ pub fn run(scale: u32) {
         let wf_seq = ferrite_sim::sol950_wf::sample_panafall();
         for i in 0..112usize {
             let (col, edge) = wf_seq[i % wf_seq.len()];
-            h.wf.push(col, edge);
+            h.wf.push(col, edge, false);
         }
     }
 
@@ -122,8 +122,23 @@ pub fn run(scale: u32) {
     step(&mut app, &mut fb, &mut radio, 100, &mut t);
     crate::save(&fb, "sol950-operate", scale);
 
-    // 2. Active QSO screen (answering selected peer)
+    // 2. Active QSO screen (answering selected peer, showing live red TX 4-FSK trace scrolling in!)
     press(&mut app, Key::Menu, &mut t);
+    if let Some(h) = app.sol950_host_mut() {
+        let tx_frame = Frame::Rx {
+            sender: Callsign::encode(b"NQ6N").unwrap(),
+            recipient: Callsign::encode(b"K1ABC").unwrap(),
+            snr_db: -12,
+            ack: false,
+            reserved: false,
+        };
+        let tones = ferrite_core::sol950::usol950::encode_tones(tx_frame);
+        for k in 0..35usize {
+            let sym = (k * 200) / 80;
+            let col = ferrite_app::sol950::tx_wf_col(1525, tones[sym.min(tones.len() - 1)]);
+            h.wf.push(col, k == 0, true);
+        }
+    }
     step(&mut app, &mut fb, &mut radio, 100, &mut t);
     crate::save(&fb, "sol950-active", scale);
 

@@ -47,10 +47,11 @@ pub const WF_COLS: usize = 112;
 pub const WF_ROWS: usize = 24;
 pub const WF_COL_BYTES: usize = WF_ROWS / 2; // 12 bytes (two 4-bit bins per byte)
 
-/// Compact right-to-left scrolling waterfall ring (`1,364` bytes, zero heap allocation).
+/// Compact right-to-left scrolling waterfall ring (`1,378` bytes, zero heap allocation).
 pub struct Sol950Waterfall {
     cols: [[u8; WF_COL_BYTES]; WF_COLS],
     slot_marks: [u8; WF_COLS / 8],
+    tx_marks: [u8; WF_COLS / 8],
     head: u8,
     pub seq: u32,
 }
@@ -66,6 +67,7 @@ impl Sol950Waterfall {
         Self {
             cols: [[0; WF_COL_BYTES]; WF_COLS],
             slot_marks: [0; WF_COLS / 8],
+            tx_marks: [0; WF_COLS / 8],
             head: 0,
             seq: 0,
         }
@@ -74,12 +76,13 @@ impl Sol950Waterfall {
     pub fn clear(&mut self) {
         self.cols = [[0; WF_COL_BYTES]; WF_COLS];
         self.slot_marks = [0; WF_COLS / 8];
+        self.tx_marks = [0; WF_COLS / 8];
         self.head = 0;
         self.seq = self.seq.wrapping_add(1);
     }
 
     /// Append the newest 24-bin spectrum slice at the right edge (scrolling older columns left).
-    pub fn push(&mut self, col: [u8; WF_COL_BYTES], slot_edge: bool) {
+    pub fn push(&mut self, col: [u8; WF_COL_BYTES], slot_edge: bool, is_tx: bool) {
         let idx = self.head as usize;
         self.cols[idx] = col;
         let byte = idx >> 3;
@@ -88,6 +91,11 @@ impl Sol950Waterfall {
             self.slot_marks[byte] |= bit;
         } else {
             self.slot_marks[byte] &= !bit;
+        }
+        if is_tx {
+            self.tx_marks[byte] |= bit;
+        } else {
+            self.tx_marks[byte] &= !bit;
         }
         self.head = if idx + 1 == WF_COLS { 0 } else { (idx + 1) as u8 };
         self.seq = self.seq.wrapping_add(1);
@@ -108,6 +116,41 @@ impl Sol950Waterfall {
         let idx = (self.head as usize + x_col) % WF_COLS;
         (self.slot_marks[idx >> 3] & (1u8 << (idx & 7))) != 0
     }
+
+    /// True if column `x_col` was recorded while transmitting (rendered in warm red TX palette).
+    #[inline]
+    pub fn is_tx_col(&self, x_col: usize) -> bool {
+        let idx = (self.head as usize + x_col) % WF_COLS;
+        (self.tx_marks[idx >> 3] & (1u8 << (idx & 7))) != 0
+    }
+}
+
+/// Build a 24-bin packed 4-bit waterfall column for our own transmitted 4-FSK tone at `subchannel_hz + tone * 50`.
+pub fn tx_wf_col(subchannel_hz: u16, tone: u8) -> [u8; WF_COL_BYTES] {
+    let mut col = [0u8; WF_COL_BYTES];
+    let f_hz = (subchannel_hz as i32) + (tone as i32 & 3) * 50;
+    // Map `586..2344 Hz` (1,758 Hz span) across `0..24` rows.
+    let pos_x16 = ((f_hz - 586).clamp(0, 1757) * (WF_ROWS as i32 * 16)) / 1758;
+    let center = (pos_x16 >> 4).clamp(0, WF_ROWS as i32 - 1) as usize;
+    let frac = (pos_x16 & 15) as usize;
+    let mut set = |r: usize, v: u8| {
+        if r < WF_ROWS {
+            let cur = if (r & 1) == 0 { col[r >> 1] & 0x0F } else { col[r >> 1] >> 4 };
+            let nv = cur.max(v & 0x0F);
+            if (r & 1) == 0 {
+                col[r >> 1] = (col[r >> 1] & 0xF0) | nv;
+            } else {
+                col[r >> 1] = (col[r >> 1] & 0x0F) | (nv << 4);
+            }
+        }
+    };
+    set(center, 15);
+    if frac >= 8 && center + 1 < WF_ROWS {
+        set(center + 1, 9);
+    } else if frac < 8 && center > 0 {
+        set(center - 1, 9);
+    }
+    col
 }
 
 /// Effective grid source displayed in the SOL950 header and saved with contacts.
@@ -545,6 +588,10 @@ pub struct Sol950Host {
     pub diag: [u32; 4],
     /// Live right-to-left scrolling passband panafall (`224 x 48 px`).
     pub wf: Sol950Waterfall,
+    /// Active TX burst subchannel (Hz), encoded 110-symbol tone sequence, and last 200 ms TX waterfall tick.
+    tx_subch_hz: u16,
+    tx_tones: [u8; ferrite_core::sol950::usol950::phy::N_SYMBOLS],
+    tx_wf_tick: u32,
 }
 
 impl Default for Sol950Host {
@@ -588,6 +635,9 @@ impl Sol950Host {
             notice_len: 0,
             diag: [0; 4],
             wf: Sol950Waterfall::new(),
+            tx_subch_hz: 1100,
+            tx_tones: [0; ferrite_core::sol950::usol950::phy::N_SYMBOLS],
+            tx_wf_tick: u32::MAX,
         }
     }
 
@@ -638,6 +688,21 @@ impl Sol950Host {
         }
         let slot = utc_sec / 10;
         let sec_in_slot = utc_sec % 10;
+        // While transmitting, push our own live 4-FSK tone trace onto the panafall at 5 Hz (200 ms).
+        if self.tx_in_flight {
+            let slot_ms = sec_in_slot * 1000 + ms_in_sec as u32;
+            let tick = slot * 50 + (slot_ms / 200);
+            if tick != self.tx_wf_tick {
+                self.tx_wf_tick = tick;
+                let sym = (slot_ms / 80) as usize;
+                let col = if sym < self.tx_tones.len() {
+                    tx_wf_col(self.tx_subch_hz, self.tx_tones[sym])
+                } else {
+                    [0; WF_COL_BYTES]
+                };
+                self.wf.push(col, slot_ms < 220, true);
+            }
+        }
         // Finish the RX slot decoder at `+9.55 s` (after the latest valid burst at `start_sym=9` ends at `+9.52 s`).
         // On the 120 MHz M4, 8-track x 3-branch LDPC `finish_slot()` takes ~420 ms, so `Receiver::reset()` +
         // `audio::capture_start()` land right at `+9.97..10.00 s` (aligned with the `0.00 s` UTC slot edge).
@@ -661,6 +726,8 @@ impl Sol950Host {
             if let SlotPlan::Tx { window, subchannel_hz, frame } = plan {
                 if utc_ok && !self.tx_in_flight {
                     let rf_freq = window.saturating_add(subchannel_hz as u32 / 10);
+                    self.tx_subch_hz = subchannel_hz;
+                    self.tx_tones = ferrite_core::sol950::usol950::encode_tones(frame);
                     self.pending_tx = Some((rf_freq, self.profile.tx_power, frame));
                 } else {
                     self.engine.on_tx_missed_deadline(slot);
