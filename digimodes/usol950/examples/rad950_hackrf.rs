@@ -7,10 +7,10 @@
 //!   cargo run --release -p usol950 --example rad950_hackrf -- --call NQ6N --grid FN31 --band 10m --dry-tx
 //!   cargo run --release -p usol950 --example rad950_hackrf -- --loopback
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::env;
 use std::f64::consts::TAU;
-use std::fs::OpenOptions;
+use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write};
 use std::process::{Command, ExitCode, Stdio};
 use std::sync::{Arc, Mutex};
@@ -83,6 +83,40 @@ struct NodeConfig {
     log_path: String,
 }
 
+/// Exact same 16-level RX and TX RGB565 palettes as the RT-950 Pro `draw_panafall`.
+const WF_PALETTE: [u16; 16] = [
+    0x0000, 0x0821, 0x0864, 0x08C8, 0x114C, 0x11D1, 0x1A75, 0x1B39,
+    0x2439, 0x2554, 0x366D, 0x5728, 0x9FA4, 0xDF02, 0xFD60, 0xFFE6,
+];
+const TX_PALETTE: [u16; 16] = [
+    0x1000, 0x2000, 0x3000, 0x4000, 0x5800, 0x7000, 0x8800, 0xA000,
+    0xB800, 0xD000, 0xE820, 0xF880, 0xFA04, 0xFBA8, 0xFD8E, 0xFEF6,
+];
+
+const WF_HISTORY_MAX: usize = 160;
+
+#[derive(Clone, Copy, Default)]
+struct WfCol {
+    bins: [u8; 24],
+    is_tx: bool,
+    slot_mark: bool,
+}
+
+fn rgb565_to_rgb888(c: u16) -> (u8, u8, u8) {
+    let r = (((c >> 11) & 0x1F) as u32 * 255 / 31) as u8;
+    let g = (((c >> 5) & 0x3F) as u32 * 255 / 63) as u8;
+    let b = ((c & 0x1F) as u32 * 255 / 31) as u8;
+    (r, g, b)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WorkedBadge {
+    None,
+    Worked,
+    WorkedNewBand,
+    WorkedNewGrid,
+}
+
 #[derive(Clone)]
 struct HeardEntry {
     call: Callsign,
@@ -92,7 +126,7 @@ struct HeardEntry {
     tone_hz: u16,
     last_slot: u64,
     kind: &'static str,
-    worked: bool,
+    worked: WorkedBadge,
 }
 
 #[derive(Clone)]
@@ -121,11 +155,14 @@ struct SharedState {
     tx_queue: VecDeque<TxJob>,
     heard: Vec<HeardEntry>,
     qso_log: Vec<QsoLogEntry>,
+    worked_calls: HashSet<String>,
+    worked_grids_all: HashSet<String>,
+    worked_grids_band: HashSet<(String, String)>, // (band_name, grid)
     events: VecDeque<String>,
     phase: SlotPhase,
     phase_note: String,
     peak_pct: f32,
-    wf_bins: [u8; 24],
+    wf_hist: VecDeque<WfCol>,
     hackrf_banner: String,
     slots_rx: u64,
     slots_tx: u64,
@@ -139,6 +176,60 @@ impl SharedState {
             self.events.pop_front();
         }
     }
+
+    fn push_wf(&mut self, col: WfCol) {
+        self.wf_hist.push_back(col);
+        while self.wf_hist.len() > WF_HISTORY_MAX {
+            self.wf_hist.pop_front();
+        }
+    }
+
+    fn record_qso(&mut self, qso: QsoLogEntry) -> WorkedBadge {
+        let band = band_name(qso.dial_hz).to_string();
+        let valid_grid = qso.grid.len() == 4 && qso.grid != "----";
+        let badge = if valid_grid && !self.worked_grids_all.contains(&qso.grid) {
+            WorkedBadge::WorkedNewGrid
+        } else if valid_grid && !self.worked_grids_band.contains(&(band.clone(), qso.grid.clone())) {
+            WorkedBadge::WorkedNewBand
+        } else {
+            WorkedBadge::Worked
+        };
+        self.worked_calls.insert(qso.peer.clone());
+        if valid_grid {
+            self.worked_grids_all.insert(qso.grid.clone());
+            self.worked_grids_band.insert((band, qso.grid.clone()));
+        }
+        append_qso_log(&self.cfg.log_path, &qso);
+        self.qso_log.push(qso);
+        badge
+    }
+}
+
+fn load_existing_log(
+    path: &str,
+) -> (HashSet<String>, HashSet<String>, HashSet<(String, String)>) {
+    let mut calls = HashSet::new();
+    let mut grids_all = HashSet::new();
+    let mut grids_band = HashSet::new();
+    if let Ok(content) = fs::read_to_string(path) {
+        for line in content.lines() {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            // Format: HH:MM:SSZ  28.078 MHz  CALL  grid=FN31  rx=-10dB  tx=-12dB
+            if parts.len() >= 5 {
+                let mhz: f64 = parts[1].parse().unwrap_or(28.078);
+                let band = band_name((mhz * 1_000_000.0) as u64).to_string();
+                let peer = parts[3].to_string();
+                calls.insert(peer);
+                if let Some(g) = parts[4].strip_prefix("grid=") {
+                    if g.len() == 4 && g != "----" {
+                        grids_all.insert(g.to_string());
+                        grids_band.insert((band, g.to_string()));
+                    }
+                }
+            }
+        }
+    }
+    (calls, grids_all, grids_band)
 }
 
 fn usage() {
@@ -457,20 +548,60 @@ fn check_hackrf_installed(serial: Option<&str>) -> Result<String, String> {
     Ok(ser)
 }
 
+fn make_tx_wf_col(subch: usize, slot_mark: bool) -> WfCol {
+    let mut bins = [1u8; 24];
+    let center = (subch.min(7) * 3 + 1).min(22);
+    bins[center.saturating_sub(1)] = 10;
+    bins[center] = 15;
+    if center + 1 < 24 {
+        bins[center + 1] = 12;
+    }
+    WfCol {
+        bins,
+        is_tx: true,
+        slot_mark,
+    }
+}
+
 fn transmit_slot(cfg: &NodeConfig, job: &TxJob, state: &Arc<Mutex<SharedState>>) -> Result<(), String> {
     let cs8 = synthesize_tx_cs8(job.frame, job.subch);
     if cfg.dry_tx {
         let mut left = 9_200u64;
+        let mut col_idx = 0u32;
         while left > 0 {
             if !state.lock().unwrap().running {
                 return Ok(());
             }
+            if col_idx.is_multiple_of(2) {
+                state
+                    .lock()
+                    .unwrap()
+                    .push_wf(make_tx_wf_col(job.subch, col_idx == 0));
+            }
+            col_idx += 1;
             let d = left.min(100);
             thread::sleep(Duration::from_millis(d));
             left -= d;
         }
         return Ok(());
     }
+
+    // Background ticker to paint live TX red/amber columns onto the panafall while hackrf_transfer transmits.
+    let tx_running = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let tx_flag = Arc::clone(&tx_running);
+    let tx_state = Arc::clone(state);
+    let tx_subch = job.subch;
+    let wf_ticker = thread::spawn(move || {
+        let mut first = true;
+        while tx_flag.load(std::sync::atomic::Ordering::Relaxed) {
+            tx_state
+                .lock()
+                .unwrap()
+                .push_wf(make_tx_wf_col(tx_subch, first));
+            first = false;
+            thread::sleep(Duration::from_millis(200));
+        }
+    });
 
     let center_hz = (cfg.dial_hz as i64 - RF_OFFSET_HZ).max(1_000_000) as u64;
     let mut cmd = Command::new("hackrf_transfer");
@@ -495,21 +626,27 @@ fn transmit_slot(cfg: &NodeConfig, job: &TxJob, state: &Arc<Mutex<SharedState>>)
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
 
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| format!("failed to spawn hackrf_transfer TX: {e}"))?;
-    if let Some(mut stdin) = child.stdin.take() {
-        let _ = stdin.write_all(&cs8);
-        let _ = stdin.flush();
-    }
-    let out = child
-        .wait_with_output()
-        .map_err(|e| format!("hackrf_transfer TX wait failed: {e}"))?;
-    if !out.status.success() {
-        let err = String::from_utf8_lossy(&out.stderr);
-        return Err(format!("hackrf_transfer TX exited {}: {}", out.status, err.trim()));
-    }
-    Ok(())
+    let res = (|| -> Result<(), String> {
+        let mut child = cmd
+            .spawn()
+            .map_err(|e| format!("failed to spawn hackrf_transfer TX: {e}"))?;
+        if let Some(mut stdin) = child.stdin.take() {
+            let _ = stdin.write_all(&cs8);
+            let _ = stdin.flush();
+        }
+        let out = child
+            .wait_with_output()
+            .map_err(|e| format!("hackrf_transfer TX wait failed: {e}"))?;
+        if !out.status.success() {
+            let err = String::from_utf8_lossy(&out.stderr);
+            return Err(format!("hackrf_transfer TX exited {}: {}", out.status, err.trim()));
+        }
+        Ok(())
+    })();
+
+    tx_running.store(false, std::sync::atomic::Ordering::Relaxed);
+    let _ = wf_ticker.join();
+    res
 }
 
 fn receive_slot(cfg: &NodeConfig, state: &Arc<Mutex<SharedState>>) -> Result<(Vec<Decoded>, f32), String> {
@@ -555,6 +692,7 @@ fn receive_slot(cfg: &NodeConfig, state: &Arc<Mutex<SharedState>>) -> Result<(Ve
     let mut peak_abs: i16 = 0;
     let mut chunk_peak: i16 = 0;
     let mut chunks = 0u32;
+    let mut first_wf = true;
 
     loop {
         if !state.lock().unwrap().running {
@@ -597,10 +735,17 @@ fn receive_slot(cfg: &NodeConfig, state: &Arc<Mutex<SharedState>>) -> Result<(Ve
             let mut st = state.lock().unwrap();
             st.peak_pct = pct;
             if let Some(packed) = wf_opt {
+                let mut bins = [0u8; 24];
                 for b in 0..12 {
-                    st.wf_bins[b * 2] = packed[b] & 0x0F;
-                    st.wf_bins[b * 2 + 1] = (packed[b] >> 4) & 0x0F;
+                    bins[b * 2] = packed[b] & 0x0F;
+                    bins[b * 2 + 1] = (packed[b] >> 4) & 0x0F;
                 }
+                st.push_wf(WfCol {
+                    bins,
+                    is_tx: false,
+                    slot_mark: first_wf,
+                });
+                first_wf = false;
             }
         }
     }
@@ -641,7 +786,6 @@ fn handle_decoded(state: &Arc<Mutex<SharedState>>, slot: u64, frames: &[Decoded]
     let my_call = st.cfg.call;
     let my_subch = st.cfg.subch;
     let dial_hz = st.cfg.dial_hz;
-    let log_path = st.cfg.log_path.clone();
     let utc_sec = slot * 10;
 
     for d in frames {
@@ -688,13 +832,19 @@ fn handle_decoded(state: &Arc<Mutex<SharedState>>, slot: u64, frames: &[Decoded]
         ));
 
         if let Some(sc) = sender_call {
-            let already_worked = st.qso_log.iter().any(|q| q.peer == sender_str);
+            let already_worked = if st.worked_calls.contains(&sender_str) {
+                WorkedBadge::Worked
+            } else {
+                WorkedBadge::None
+            };
             if let Some(existing) = st.heard.iter_mut().find(|h| h.call == sc) {
                 existing.snr_db = d.snr_db;
                 existing.tone_hz = d.audio_hz;
                 existing.last_slot = slot;
                 existing.kind = kind;
-                existing.worked = already_worked;
+                if existing.worked == WorkedBadge::None {
+                    existing.worked = already_worked;
+                }
                 if grid_str != "----" {
                     existing.grid_str = grid_str.clone();
                 }
@@ -756,17 +906,16 @@ fn handle_decoded(state: &Arc<Mutex<SharedState>>, slot: u64, frames: &[Decoded]
                         rx_snr: d.snr_db,
                         tx_snr: their_rpt_for_us,
                     };
+                    let badge = st.record_qso(qso);
                     st.push_event(format!(
                         "[{}] QSO logged {} (rx={:+}dB tx={:+}dB) -> R+RX queued",
                         format_utc_hms(utc_sec),
-                        qso.peer,
-                        qso.rx_snr,
-                        qso.tx_snr
+                        sender_str,
+                        d.snr_db,
+                        their_rpt_for_us
                     ));
-                    append_qso_log(&log_path, &qso);
-                    st.qso_log.push(qso);
                     if let Some(h) = st.heard.iter_mut().find(|h| h.call == sender) {
-                        h.worked = true;
+                        h.worked = badge;
                     }
                 } else {
                     let qso = QsoLogEntry {
@@ -777,17 +926,16 @@ fn handle_decoded(state: &Arc<Mutex<SharedState>>, slot: u64, frames: &[Decoded]
                         rx_snr: d.snr_db,
                         tx_snr: their_rpt_for_us,
                     };
+                    let badge = st.record_qso(qso);
                     st.push_event(format!(
                         "[{}] QSO complete & logged {} (rx={:+}dB tx={:+}dB)",
                         format_utc_hms(utc_sec),
-                        qso.peer,
-                        qso.rx_snr,
-                        qso.tx_snr
+                        sender_str,
+                        d.snr_db,
+                        their_rpt_for_us
                     ));
-                    append_qso_log(&log_path, &qso);
-                    st.qso_log.push(qso);
                     if let Some(h) = st.heard.iter_mut().find(|h| h.call == sender) {
-                        h.worked = true;
+                        h.worked = badge;
                     }
                 }
             }
@@ -1086,26 +1234,21 @@ fn render_tui(state: &Arc<Mutex<SharedState>>, tui: &TuiState) {
     );
     buf.push_str(&format!("\x1b[1;37;44m{header}{tx_badge}{cq_badge}\x1b[K\x1b[0m\r\n"));
 
-    // 2. Slot progress bar + Audio Peak + Spectrum
+    // 2. Slot progress bar + Audio Peak
     let (phase_col, phase_lbl) = match st.phase {
         SlotPhase::Waiting => ("\x1b[33m", "WAIT  "),
         SlotPhase::Rx => ("\x1b[32m", "RX    "),
         SlotPhase::Tx => ("\x1b[1;31m", "TX    "),
         SlotPhase::DryTx => ("\x1b[1;33m", "DRY-TX"),
     };
-    let bar_w = 24usize;
+    let bar_w = 26usize;
     let filled = ((slot_elapsed_ms as usize * bar_w) / 10_000).min(bar_w);
     let bar: String = "█".repeat(filled) + &"░".repeat(bar_w - filled);
-    let blocks = [' ', '▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
-    let mut spec = String::with_capacity(24 * 3);
-    for &v in &st.wf_bins {
-        let idx = ((v as usize) * (blocks.len() - 1) / 15).min(blocks.len() - 1);
-        spec.push(blocks[idx]);
-    }
     let line2 = format!(
-        " {phase_col}{phase_lbl}\x1b[0m [{phase_col}{bar}\x1b[0m] {:4.1}s/10s  Peak:{:3.0}%  Spec:\x1b[36m[{spec}]\x1b[0m  Q:{}",
+        " {phase_col}{phase_lbl}\x1b[0m [{phase_col}{bar}\x1b[0m] {:4.1}s/10s  Peak:{:3.0}%  Grids:{}  Q:{}",
         slot_elapsed_ms as f64 / 1000.0,
         st.peak_pct,
+        st.worked_grids_all.len(),
         st.tx_queue.len()
     );
     buf.push_str(&format!("{line2}\x1b[K\r\n"));
@@ -1135,11 +1278,71 @@ fn render_tui(state: &Arc<Mutex<SharedState>>, tui: &TuiState) {
 
     match tui.view {
         View::Operate => {
-            let heard_rows = (body_rows / 2).max(5);
-            let event_rows = body_rows.saturating_sub(heard_rows + 2);
+            // Radio-style 2D True-Color Panafall (24 frequency bins rendered via Unicode half-blocks `▀`,
+            // high freq at top, newest column at right, matching RT-950 Pro WF_PALETTE & TX_PALETTE).
+            let wf_term_rows: usize = if body_rows >= 22 { 12 } else { 6 };
+            let wf_cols = cols.saturating_sub(8).min(WF_HISTORY_MAX);
+            let remaining = body_rows.saturating_sub(wf_term_rows + 1);
+            let heard_rows = (remaining * 3 / 5).max(4);
+            let event_rows = remaining.saturating_sub(heard_rows + 1);
 
             buf.push_str(&format!(
-                "\x1b[1;36m HEARD STATIONS ({}) — ↑/↓ select, Enter=Answer\x1b[0m\x1b[K\r\n",
+                "\x1b[1;36m PANAFALL (600–2400 Hz)\x1b[0m  \x1b[2m{}\x1b[0m\x1b[K\r\n",
+                trunc(&st.phase_note, cols.saturating_sub(28))
+            ));
+            let empty_col = WfCol::default();
+            let hist_len = st.wf_hist.len();
+            let wf_pixel_color = |col: &WfCol, r_top: usize| -> (u8, u8, u8) {
+                let bin = 23usize.saturating_sub(r_top);
+                let lvl = col.bins[bin] as usize;
+                let is_grid_line = r_top.is_multiple_of(3) && r_top > 0;
+                let mut px = if col.is_tx {
+                    TX_PALETTE[lvl & 15]
+                } else {
+                    WF_PALETTE[lvl & 15]
+                };
+                if col.slot_mark && lvl < 4 {
+                    px = if col.is_tx { 0x6000 } else { 0x2945 };
+                } else if is_grid_line && lvl < 2 {
+                    px = if col.is_tx { 0x2800 } else { 0x1082 };
+                }
+                rgb565_to_rgb888(px)
+            };
+
+            for tr in 0..wf_term_rows {
+                let r_hi = if wf_term_rows == 12 { tr * 2 } else { tr * 4 };
+                let r_lo = if wf_term_rows == 12 { tr * 2 + 1 } else { tr * 4 + 2 };
+                let lbl = if tr == 0 {
+                    "2.4k "
+                } else if tr == wf_term_rows / 2 {
+                    "1.5k "
+                } else if tr + 1 == wf_term_rows {
+                    "0.6k "
+                } else {
+                    "     "
+                };
+                buf.push_str("\x1b[2m ");
+                buf.push_str(lbl);
+                buf.push_str("\x1b[0m");
+                for x in 0..wf_cols {
+                    let col = if x + hist_len < wf_cols {
+                        &empty_col
+                    } else {
+                        &st.wf_hist[x + hist_len - wf_cols]
+                    };
+                    let (fr, fg, fb) = wf_pixel_color(col, r_hi);
+                    let (br, bg, bb) = wf_pixel_color(col, r_lo);
+                    buf.push_str(&format!(
+                        "\x1b[38;2;{fr};{fg};{fb};48;2;{br};{bg};{bb}m▀"
+                    ));
+                }
+                buf.push_str("\x1b[0m\x1b[K\r\n");
+            }
+
+            // Heard Stations with exact radio icons & color coding (★ NEW, + BND, ✓ WKD★/WKD+/WKD)
+            let cur_band = band_name(st.cfg.dial_hz).to_string();
+            buf.push_str(&format!(
+                "\x1b[1;36m HEARD ({})\x1b[0m  \x1b[1;33m★NEW\x1b[0m \x1b[1;36m+BND\x1b[0m \x1b[1;32m✓WKD\x1b[0m  \x1b[2m↑/↓ select, Enter=Answer\x1b[0m\x1b[K\r\n",
                 st.heard.len()
             ));
             if st.heard.is_empty() {
@@ -1153,23 +1356,38 @@ fn render_tui(state: &Arc<Mutex<SharedState>>, tui: &TuiState) {
                     if let Some(h) = st.heard.get(i) {
                         let age_s = cur_slot.saturating_sub(h.last_slot) * 10;
                         let sel = i == tui.heard_sel;
-                        let wkd = if h.worked { "✓WKD" } else { " NEW" };
+                        let has_grid = h.grid_str.len() == 4 && h.grid_str != "----";
+                        let is_new_all = has_grid && !st.worked_grids_all.contains(&h.grid_str);
+                        let is_new_band = has_grid
+                            && !is_new_all
+                            && !st
+                                .worked_grids_band
+                                .contains(&(cur_band.clone(), h.grid_str.clone()));
+
+                        let (icon, tag, col_ansi) = match h.worked {
+                            WorkedBadge::WorkedNewGrid => ("✓", "WKD★", "\x1b[1;32m"),
+                            WorkedBadge::WorkedNewBand => ("✓", "WKD+", "\x1b[1;32m"),
+                            WorkedBadge::Worked => ("✓", "WKD ", "\x1b[32m"),
+                            WorkedBadge::None if is_new_all => ("★", "NEW ", "\x1b[1;33m"),
+                            WorkedBadge::None if is_new_band => ("+", "BND ", "\x1b[1;36m"),
+                            WorkedBadge::None => ("□", "    ", "\x1b[0m"),
+                        };
                         let row = format!(
-                            " {:>2}. {:<8} {:<4}  {:+3} dB  {:4} Hz  {:<4}  {}  {:>4}s",
+                            " {:>2}. {} {:<8} {:<4}  {:+3} dB  {:4} Hz  {:<4}  {}  {:>4}s",
                             i + 1,
+                            icon,
                             h.call_str,
                             h.grid_str,
                             h.snr_db,
                             h.tone_hz,
                             h.kind,
-                            wkd,
+                            tag,
                             age_s
                         );
                         if sel {
                             buf.push_str(&format!("\x1b[1;30;47m{}\x1b[K\x1b[0m\r\n", trunc(&row, cols)));
                         } else {
-                            let col = if h.worked { "\x1b[32m" } else { "\x1b[0m" };
-                            buf.push_str(&format!("{col}{}\x1b[0m\x1b[K\r\n", trunc(&row, cols)));
+                            buf.push_str(&format!("{col_ansi}{}\x1b[0m\x1b[K\r\n", trunc(&row, cols)));
                         }
                     } else {
                         buf.push_str("\x1b[K\r\n");
@@ -1177,17 +1395,16 @@ fn render_tui(state: &Arc<Mutex<SharedState>>, tui: &TuiState) {
                 }
             }
 
-            buf.push_str(&format!(
-                "\x1b[1;36m ACTIVITY FEED\x1b[0m  \x1b[2m{}\x1b[0m\x1b[K\r\n",
-                trunc(&st.phase_note, cols.saturating_sub(18))
-            ));
-            let ev_len = st.events.len();
-            let start = ev_len.saturating_sub(event_rows);
-            for i in 0..event_rows {
-                if let Some(ev) = st.events.get(start + i) {
-                    buf.push_str(&format!(" {}\x1b[K\r\n", trunc(ev, cols.saturating_sub(2))));
-                } else {
-                    buf.push_str("\x1b[K\r\n");
+            if event_rows > 0 {
+                buf.push_str("\x1b[1;36m ACTIVITY FEED\x1b[0m\x1b[K\r\n");
+                let ev_len = st.events.len();
+                let start = ev_len.saturating_sub(event_rows);
+                for i in 0..event_rows {
+                    if let Some(ev) = st.events.get(start + i) {
+                        buf.push_str(&format!(" {}\x1b[K\r\n", trunc(ev, cols.saturating_sub(2))));
+                    } else {
+                        buf.push_str("\x1b[K\r\n");
+                    }
                 }
             }
         }
@@ -1595,6 +1812,8 @@ fn main() -> ExitCode {
         log_path,
     };
 
+    let (worked_calls, worked_grids_all, worked_grids_band) = load_existing_log(&cfg.log_path);
+
     let state = Arc::new(Mutex::new(SharedState {
         cfg,
         running: true,
@@ -1604,11 +1823,14 @@ fn main() -> ExitCode {
         tx_queue: VecDeque::new(),
         heard: Vec::new(),
         qso_log: Vec::new(),
+        worked_calls,
+        worked_grids_all,
+        worked_grids_band,
         events: VecDeque::new(),
         phase: SlotPhase::Waiting,
         phase_note: "Starting RAD950 HackRF node...".to_string(),
         peak_pct: 0.0,
-        wf_bins: [0; 24],
+        wf_hist: VecDeque::with_capacity(WF_HISTORY_MAX),
         hackrf_banner,
         slots_rx: 0,
         slots_tx: 0,
