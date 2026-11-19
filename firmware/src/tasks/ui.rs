@@ -1468,6 +1468,8 @@ fn sol950_mount_flash(store: &crate::store::Store, app: &mut App) -> ferrite_sto
             h.profile.dial_idx = cfg.dial_idx;
             h.profile.rx_corr_hz = cfg.rx_corr_hz;
             h.profile.tx_power = cfg.tx_power;
+            h.profile.coop_rx = ferrite_app::sol950::CoopRxMode::from_u8(cfg.coop_rx);
+            h.profile.coop_link = ferrite_app::sol950::CoopLink::from_u8(cfg.coop_link);
             h.sync_engine_config();
         }
     }
@@ -1537,6 +1539,8 @@ async fn sol950_step(
                 dial_idx: p.dial_idx,
                 rx_corr_hz: p.rx_corr_hz,
                 tx_power: p.tx_power,
+                coop_rx: p.coop_rx as u8,
+                coop_link: p.coop_link as u8,
             };
             let mut nor = store.sol950_nor();
             let _ = ferrite_store::sol950::save_cfg(&mut nor, &mut rec).await;
@@ -1614,6 +1618,12 @@ async fn sol950_step(
                 let slot_edge = h.utc_sec != 0 && (h.utc_sec % 10 == 0) && h.utc_ms_in_sec < 250;
                 h.wf.push(wf_col, slot_edge, false);
             }
+        }
+    }
+    if let Some(sc) = crate::chan::SOL950_SOFT.try_take() {
+        if let Some(h) = app.sol950_host_mut() {
+            let slot = if h.last_slot == u32::MAX { 0 } else { h.last_slot };
+            h.last_soft = Some((slot, sc));
         }
     }
     // Check live TX completion from the Radio task.

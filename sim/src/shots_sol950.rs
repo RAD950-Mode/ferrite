@@ -146,10 +146,15 @@ pub fn run(scale: u32) {
     press(&mut app, Key::Digit(0), &mut t);
     step(&mut app, &mut fb, &mut radio, 100, &mut t);
 
-    // 3. Setup screen (STAR)
+    // 3. Setup screen (STAR, scrolled to show Band/Dial + Coop RX + Coop link)
     press(&mut app, Key::Star, &mut t);
+    for _ in 0..8 {
+        press(&mut app, Key::Down, &mut t);
+    }
+    press(&mut app, Key::Right, &mut t); // Coop RX -> Capture
     step(&mut app, &mut fb, &mut radio, 100, &mut t);
     crate::save(&fb, "sol950-setup", scale);
+    press(&mut app, Key::Left, &mut t); // Restore Coop RX -> Off
     press(&mut app, Key::Exit, &mut t);
     step(&mut app, &mut fb, &mut radio, 100, &mut t);
 

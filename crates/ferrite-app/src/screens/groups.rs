@@ -97,7 +97,7 @@ const G3: [Entry; 7] = [
     Entry(concat!("Crossband repeater||", txtc!("Repeat one slot's band on another's."))),
     Entry(concat!("Tone search||", txtc!("Find the CTCSS or DCS in use."))),
     Entry(concat!("Satellites||", txtc!("Passes, pointing and Doppler for FM satellites."))),
-    Entry(concat!("SOL950||", txtc!("10m weak-signal digital mode."))),
+    Entry(concat!("RAD950||", txtc!("HF weak-signal digital mode."))),
 ];
 const G4: [Entry; 5] = [
     Entry(concat!("Event log||", txtc!("Every decode and alert."))),

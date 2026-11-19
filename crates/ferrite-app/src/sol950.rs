@@ -7,7 +7,7 @@ use crate::{App, Screen};
 use ferrite_core::freq::Freq10;
 use ferrite_core::msg::RadioCmd;
 use ferrite_core::sol950::usol950::frame::encode_grid4;
-use ferrite_core::sol950::usol950::{Callsign, Decoded, Frame, GRID_UNKNOWN};
+use ferrite_core::sol950::usol950::{Callsign, Decoded, Frame, SoftCandidate, GRID_UNKNOWN};
 use ferrite_core::sol950::{Config, Engine, OpMode, QsoRecord, SlotPlan};
 
 /// Nominal HF USB dial windows for SOL950 (10 m, 12 m, 15 m, and 17 m; FT8-adjacent +4 kHz windows).
@@ -151,6 +151,41 @@ pub fn tx_wf_col(subchannel_hz: u16, tone: u8) -> [u8; WF_COL_BYTES] {
         set(center - 1, 9);
     }
     col
+}
+
+/// Cooperative RX mode under RAD950 Setup (`docs/sol950-cooperative-reception.md`).
+/// Pilot exposes `Off` and `Capture`; future live cooperation will add `Lead` and `Help`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum CoopRxMode {
+    Off = 0,
+    Capture = 1,
+}
+
+impl CoopRxMode {
+    pub const fn from_u8(v: u8) -> Self {
+        match v {
+            1 => Self::Capture,
+            _ => Self::Off,
+        }
+    }
+}
+
+/// Transport link for Cooperative RX team data sharing (independent of radio role).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum CoopLink {
+    Usb = 0,
+    Bluetooth = 1,
+}
+
+impl CoopLink {
+    pub const fn from_u8(v: u8) -> Self {
+        match v {
+            1 => Self::Bluetooth,
+            _ => Self::Usb,
+        }
+    }
 }
 
 /// Effective grid source displayed in the SOL950 header and saved with contacts.
@@ -426,6 +461,10 @@ pub struct Sol950Profile {
     pub rx_corr_hz: i16,
     /// TX power level (`0` Low, `1` Mid, `2` High).
     pub tx_power: u8,
+    /// Cooperative RX mode (`Off` default; `Capture` exports RX + 92-byte soft candidates to host).
+    pub coop_rx: CoopRxMode,
+    /// Cooperative RX link transport (`Usb` or `Bluetooth`).
+    pub coop_link: CoopLink,
 }
 
 impl Default for Sol950Profile {
@@ -447,6 +486,8 @@ impl Sol950Profile {
             dial_idx: 0,
             rx_corr_hz: 0,
             tx_power: 0,
+            coop_rx: CoopRxMode::Off,
+            coop_link: CoopLink::Usb,
         }
     }
 
@@ -592,6 +633,8 @@ pub struct Sol950Host {
     tx_subch_hz: u16,
     tx_tones: [u8; ferrite_core::sol950::usol950::phy::N_SYMBOLS],
     tx_wf_tick: u32,
+    /// Most recent failed-CRC soft candidate `(slot, SoftCandidate)` for Cooperative RX host capture.
+    pub last_soft: Option<(u32, SoftCandidate)>,
 }
 
 impl Default for Sol950Host {
@@ -638,6 +681,7 @@ impl Sol950Host {
             tx_subch_hz: 1100,
             tx_tones: [0; ferrite_core::sol950::usol950::phy::N_SYMBOLS],
             tx_wf_tick: u32::MAX,
+            last_soft: None,
         }
     }
 

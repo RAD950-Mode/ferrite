@@ -87,9 +87,9 @@ impl TextFor {
             TextFor::ContactCall => "Contact callsign",
             TextFor::ContactName => "Contact name",
             TextFor::ReplyTo => "Reply to",
-            TextFor::Sol950Call => "SOL950 call",
-            TextFor::Sol950Prefix => "SOL950 prefix",
-            TextFor::Sol950Grid => "SOL950 grid",
+            TextFor::Sol950Call => "RAD950 call",
+            TextFor::Sol950Prefix => "RAD950 prefix",
+            TextFor::Sol950Grid => "RAD950 grid",
         }
     }
 
@@ -474,7 +474,7 @@ fn keep(to: TextFor, app: &mut App, store: &impl ChannelStore) {
         }
         TextFor::Sol950Call => {
             if !t.is_empty() && ferrite_core::sol950::usol950::Callsign::encode(t.as_bytes()).is_err() {
-                return app.show_toast(b"SOL950 call", b"like NQ6N or W1AW", false);
+                return app.show_toast(b"RAD950 call", b"like NQ6N or W1AW", false);
             }
             if let Some(h) = app.sol950_host_mut() {
                 h.profile.set_base_call(t.as_bytes());
@@ -494,7 +494,7 @@ fn keep(to: TextFor, app: &mut App, store: &impl ChannelStore) {
             let valid = b.len() == 4
                 && ferrite_core::sol950::usol950::frame::encode_grid4(&[b[0], b[1], b[2], b[3]]).is_some();
             if !valid {
-                return app.show_toast(b"SOL950 grid", b"4 chars like FN31", false);
+                return app.show_toast(b"RAD950 grid", b"4 chars like FN31", false);
             }
             if let Some(h) = app.sol950_host_mut() {
                 h.profile.manual_grid = [b[0], b[1], b[2], b[3]];

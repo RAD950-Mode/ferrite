@@ -787,19 +787,48 @@ fn body<S: ChannelStore>(app: &App, cx: &Cx<S>, d: &mut Desc) {
                 l.push(screens::sol950::page_id(&s).as_bytes());
                 if let Some(h) = app.sol950_host() {
                     let slot_ms = (h.utc_sec % 10) * 1000 + h.utc_ms_in_sec as u32;
+                    let coop_s = match h.profile.coop_rx {
+                        crate::sol950::CoopRxMode::Off => "off",
+                        crate::sol950::CoopRxMode::Capture => "capture",
+                    };
+                    let link_s = match h.profile.coop_link {
+                        crate::sol950::CoopLink::Usb => "usb",
+                        crate::sol950::CoopLink::Bluetooth => "bt",
+                    };
                     let _ = ufmt::uwrite!(
                         l,
-                        " utc={} slot_ms={} rx={} saved={} tx={} fin={} sym={} trk={} dec={}",
+                        " utc={} slot_ms={} rx={} saved={} tx={} coop={} link={} fin={} sym={} trk={} dec={}",
                         h.utc_ready() as u8,
                         slot_ms,
                         n,
                         h.store.count(),
                         h.tx_in_flight as u8,
+                        coop_s,
+                        link_s,
                         h.diag[0],
                         h.diag[1],
                         h.diag[2],
                         h.diag[3]
                     );
+                }
+            }
+            if let Some((soft_slot, sc)) = app.sol950_host().and_then(|h| {
+                (h.profile.coop_rx == crate::sol950::CoopRxMode::Capture).then_some(h.last_soft).flatten()
+            }) {
+                if let Some(sl) = d.ln() {
+                    let _ = ufmt::uwrite!(
+                        sl,
+                        "rad950_soft slot={} hz={} ms={} snr={} sc={} llr=",
+                        soft_slot,
+                        sc.audio_hz,
+                        sc.time_offset_ms,
+                        sc.snr_db,
+                        sc.sync_score
+                    );
+                    const HEX: &[u8; 16] = b"0123456789abcdef";
+                    for &b in &sc.llrs_4bit {
+                        sl.push(&[HEX[(b >> 4) as usize], HEX[(b & 0x0F) as usize]]);
+                    }
                 }
             }
             for r in &rows[..n.min(4)] {

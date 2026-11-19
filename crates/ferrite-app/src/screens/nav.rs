@@ -228,7 +228,7 @@ impl Dest {
             HfMode => ("HF mode", "20a", "B12"),
             ToneSearch => ("Tone search", "22", "B14"),
             Satellites => ("Satellites", "28a", "B22"),
-            Sol950 => ("SOL950", "20b", "B25"),
+            Sol950 => ("RAD950", "20b", "B25"),
             Counter => ("Frequency counter", "22", "B15"),
             Alert => ("Alert", "23", "B17"),
             Crossband => ("Crossband repeater", "19", "B18"),

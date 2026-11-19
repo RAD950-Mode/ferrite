@@ -128,17 +128,28 @@ impl Decoder {
         }
     }
 
-    /// Finish the current 10 s SOL950 UTC slot, write decoded frames to `out`, and reset for the next slot.
+    /// Finish the current 10 s SOL950 UTC slot, write decoded frames to `out`, optionally export the best
+    /// failed-CRC soft candidate for Cooperative RX, and reset for the next slot.
     #[inline(never)]
-    pub fn sol950_finish(&mut self, out: &mut [usol950::Decoded; usol950::MAX_DECODED]) -> usize {
+    pub fn sol950_finish_with_soft(
+        &mut self,
+        out: &mut [usol950::Decoded; usol950::MAX_DECODED],
+        soft: Option<&mut Option<usol950::SoftCandidate>>,
+    ) -> usize {
         if self.kind == DecoderKind::Sol950 {
             let d = unsafe { &mut *self.inner.sol950 };
-            let n = d.finish_slot(out);
+            let n = d.finish_slot_with_soft(out, soft);
             d.reset();
             n
         } else {
             0
         }
+    }
+
+    /// Finish the current 10 s SOL950 UTC slot, write decoded frames to `out`, and reset for the next slot.
+    #[inline(never)]
+    pub fn sol950_finish(&mut self, out: &mut [usol950::Decoded; usol950::MAX_DECODED]) -> usize {
+        self.sol950_finish_with_soft(out, None)
     }
 
     /// The AFSK demodulator's carrier detect: 1200-baud data heard now (APRS-56.4); false for the others.

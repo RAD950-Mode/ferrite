@@ -269,6 +269,55 @@ pub struct Decoded {
     pub snr_db: i8,
 }
 
+/// Cooperative-RX soft candidate observation (`92`-byte signed 4-bit `[-7..=+7]` LDPC codeword LLR report,
+/// `0` = no evidence, canonical LDPC bit order per `docs/sol950-cooperative-reception.md`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SoftCandidate {
+    /// Estimated lowest-tone audio frequency offset in Hz above USB dial (refined `df`).
+    pub audio_hz: u16,
+    /// Arrival offset in milliseconds relative to nominal `+400 ms` start (`[-320, +360]`).
+    pub time_offset_ms: i16,
+    /// Estimated local SNR in dB (`2,500 Hz` reference).
+    pub snr_db: i8,
+    /// `S2` tail-sync score for candidate ranking / association confidence.
+    pub sync_score: i16,
+    /// 184 signed 4-bit LLRs (`[-7..=+7]`, two's complement nibbles packed 2 per byte: low nibble = even bit,
+    /// high nibble = odd bit) in canonical LDPC codeword order.
+    pub llrs_4bit: [u8; N_BITS / 2],
+}
+
+impl SoftCandidate {
+    pub const EMPTY: Self = Self {
+        audio_hz: 0,
+        time_offset_ms: 0,
+        snr_db: -24,
+        sync_score: 0,
+        llrs_4bit: [0; N_BITS / 2],
+    };
+
+    /// Quantize canonical LDPC codeword LLRs (`[-120..=+120]`) into packed signed 4-bit `[-7..=+7]` nibbles.
+    pub fn pack_llrs(deinter: &[i8; N_BITS]) -> [u8; N_BITS / 2] {
+        let mut out = [0u8; N_BITS / 2];
+        let mut max_abs = 1i32;
+        for &v in deinter {
+            let a = (v as i32).abs();
+            if a > max_abs {
+                max_abs = a;
+            }
+        }
+        let denom = max_abs.max(24);
+        for i in 0..(N_BITS / 2) {
+            let q = |v: i8| -> u8 {
+                let num = (v as i32) * 7;
+                let rounded = if num >= 0 { (num + denom / 2) / denom } else { (num - denom / 2) / denom };
+                (rounded.clamp(-7, 7) as i8 as u8) & 0x0F
+            };
+            out[i] = q(deinter[2 * i]) | (q(deinter[2 * i + 1]) << 4);
+        }
+        out
+    }
+}
+
 impl Decoded {
     /// Placeholder slot value for initializing `[Decoded; MAX_DECODED]` output buffers.
     pub const EMPTY: Self = Self {
@@ -1025,6 +1074,20 @@ impl Receiver {
     /// Run serial normalized min-sum LDPC + CRC-14 decoding across all admitted tracks at end of slot, reusing
     /// `self.work[BP_BASE..]` for `post` (`184`) and `c2v` (`525`) scratch so `REF_BASE..S2_BASE` stays intact.
     pub fn finish_slot(&mut self, out: &mut [Decoded; MAX_DECODED]) -> usize {
+        self.finish_slot_with_soft(out, None)
+    }
+
+    /// Same as [`Self::finish_slot`], optionally exporting the highest-scoring failed-CRC candidate as a
+    /// `92`-byte 4-bit [`SoftCandidate`] for Cooperative RX capture / combining.
+    pub fn finish_slot_with_soft(
+        &mut self,
+        out: &mut [Decoded; MAX_DECODED],
+        mut soft_out: Option<&mut Option<SoftCandidate>>,
+    ) -> usize {
+        if let Some(s) = soft_out.as_deref_mut() {
+            *s = None;
+        }
+        let mut best_soft_score = i16::MIN;
         let mut raw_llr = [0i8; N_BITS];
         let mut deinter = [0i8; N_BITS];
         let mut n_out = 0usize;
@@ -1125,6 +1188,25 @@ impl Receiver {
             }
 
             let Some(frame) = decoded_frame else {
+                if let Some(slot_soft) = soft_out.as_deref_mut() {
+                    let tr = &self.tracks[tr_i];
+                    let sync_sc = tr.s2_scores[1].max(tr.s2_scores[0]).max(tr.s2_scores[2]);
+                    if sync_sc > best_soft_score {
+                        best_soft_score = sync_sc;
+                        let audio_hz = (tr.base_freq_hz() + 0.5).clamp(0.0, 6000.0) as u16;
+                        let time_offset_ms = ((tr.start_sym as i16 - NOMINAL_START_SYM as i16) * 80)
+                            + (tr.phase as i16 * 40)
+                            + ((tr.dt_q4 as i16 * 2) / 3);
+                        let snr_db = estimate_snr_2500_db(tr.on_pwr_sum, tr.off_pwr_sum);
+                        *slot_soft = Some(SoftCandidate {
+                            audio_hz,
+                            time_offset_ms,
+                            snr_db,
+                            sync_score: sync_sc,
+                            llrs_4bit: SoftCandidate::pack_llrs(&deinter),
+                        });
+                    }
+                }
                 continue;
             };
             if out[..n_out].iter().any(|d| d.frame == frame) {

@@ -453,6 +453,10 @@ pub struct Sol950CfgRecord {
     pub dial_idx: u8,
     pub rx_corr_hz: i16,
     pub tx_power: u8,
+    /// Cooperative RX mode (`0 = Off`, `1 = Capture`; reserved `2 = Lead`, `3 = Help`).
+    pub coop_rx: u8,
+    /// Cooperative RX link transport (`0 = USB`, `1 = Bluetooth`).
+    pub coop_link: u8,
 }
 
 impl Sol950CfgRecord {
@@ -460,7 +464,10 @@ impl Sol950CfgRecord {
         let mut b = [0u8; CFG_BYTES];
         b[0..2].copy_from_slice(&CFG_MAGIC);
         b[2] = CFG_VERSION;
-        b[3] = (self.use_gps_grid as u8) | ((self.tx_power.min(2)) << 1);
+        b[3] = (self.use_gps_grid as u8)
+            | ((self.tx_power.min(2)) << 1)
+            | ((self.coop_rx & 3) << 3)
+            | ((self.coop_link & 1) << 5);
         b[4..8].copy_from_slice(&self.gen.to_le_bytes());
         b[8..14].copy_from_slice(&self.base_call);
         b[14] = self.call_len;
@@ -504,6 +511,8 @@ impl Sol950CfgRecord {
             dial_idx: b[21],
             rx_corr_hz: i16::from_le_bytes([b[26], b[27]]),
             tx_power: (b[3] >> 1) & 3,
+            coop_rx: (b[3] >> 3) & 3,
+            coop_link: (b[3] >> 5) & 1,
         })
     }
 }
@@ -690,6 +699,8 @@ mod tests {
             dial_idx: 2,
             rx_corr_hz: -125,
             tx_power: 1,
+            coop_rx: 1,
+            coop_link: 1,
         };
         block(save_cfg(&mut flash, &mut cfg)).unwrap();
         assert_eq!(cfg.gen, 1);

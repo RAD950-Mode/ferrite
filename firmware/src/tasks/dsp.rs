@@ -464,11 +464,15 @@ pub async fn task() {
                     if capturing {
                         audio::capture_stop();
                     }
-                    use ferrite_core::sol950::usol950::{Decoded, MAX_DECODED};
+                    use ferrite_core::sol950::usol950::{Decoded, SoftCandidate, MAX_DECODED};
                     #[cfg(feature = "bench")]
                     let (d_syms, d_trk, _d_acq) = slot.sol950_diag();
                     let mut out = [Decoded::EMPTY; MAX_DECODED];
-                    let n = slot.sol950_finish(&mut out);
+                    let mut soft: Option<SoftCandidate> = None;
+                    let n = slot.sol950_finish_with_soft(&mut out, Some(&mut soft));
+                    if let Some(sc) = soft {
+                        crate::chan::SOL950_SOFT.signal(sc);
+                    }
                     #[cfg(feature = "bench")]
                     {
                         SOL950_DIAG[0].fetch_add(1, Relaxed);

@@ -7,7 +7,7 @@ use super::shared::*;
 use super::{Cx, Hints, View};
 use crate::chan::ChannelStore;
 use crate::keys::{KeyEvent, Press};
-use crate::sol950::{band_label, field_letters, GridSource, SavedContact, Sol950Store, SOL950_DIALS, WF_COLS, WF_ROWS};
+use crate::sol950::{band_label, field_letters, CoopLink, CoopRxMode, GridSource, SavedContact, Sol950Store, SOL950_DIALS, WF_COLS, WF_ROWS};
 use crate::{App, Screen};
 use ferrite_core::freq::Freq10;
 use ferrite_core::keys::Key;
@@ -33,7 +33,8 @@ pub const PAGE_GRIDS_FIELD: u8 = 7;
 
 const OPERATE_ROWS: usize = 4;
 const LOG_ROWS: usize = 6;
-const SETUP_ROWS: usize = 8;
+const SETUP_ROWS: usize = 10;
+const SETUP_VISIBLE: usize = 8;
 const TOP_Y: i32 = w::SBAR_H;
 
 /// SOL950 screen state (`8` bytes, fits inside `Screen` without growing it).
@@ -60,7 +61,7 @@ impl Sol950Scr {
 pub fn open(app: &mut App) -> Screen {
     if app.radio.keyed.is_some() || app.radio.mode == super::activity::Mode::Xb {
         app.show_toast(
-            b"SOL950",
+            b"RAD950",
             if app.radio.keyed.is_some() { b"not keyed" } else { b"stop repeater first" },
             false,
         );
@@ -131,23 +132,23 @@ fn plain_qso_action(mode: OpMode, owed: Option<bool>, logged: bool, tx_active: b
 impl View for Sol950Scr {
     fn name(self) -> &'static str {
         match self.page {
-            PAGE_ACTIVE => "SOL950 QSO",
-            PAGE_SETUP => "SOL950 Setup",
-            PAGE_LOG | PAGE_LOG_DETAIL => "SOL950 Log",
-            PAGE_STATS => "SOL950 Stats",
-            PAGE_GRIDS_OVERVIEW | PAGE_GRIDS_FIELD => "SOL950 Grids",
-            _ => "SOL950",
+            PAGE_ACTIVE => "RAD950 QSO",
+            PAGE_SETUP => "RAD950 Setup",
+            PAGE_LOG | PAGE_LOG_DETAIL => "RAD950 Log",
+            PAGE_STATS => "RAD950 Stats",
+            PAGE_GRIDS_OVERVIEW | PAGE_GRIDS_FIELD => "RAD950 Grids",
+            _ => "RAD950",
         }
     }
 
     fn title(self, _app: &App, b: &mut Buf<10>) {
         let t: &[u8] = match self.page {
-            PAGE_ACTIVE => b"SOL QSO",
-            PAGE_SETUP => b"SOL SET",
-            PAGE_LOG | PAGE_LOG_DETAIL => b"SOL LOG",
-            PAGE_STATS => b"SOL STAT",
-            PAGE_GRIDS_OVERVIEW | PAGE_GRIDS_FIELD => b"SOL MAP",
-            _ => b"SOL950",
+            PAGE_ACTIVE => b"RAD QSO",
+            PAGE_SETUP => b"RAD SET",
+            PAGE_LOG | PAGE_LOG_DETAIL => b"RAD LOG",
+            PAGE_STATS => b"RAD STAT",
+            PAGE_GRIDS_OVERVIEW | PAGE_GRIDS_FIELD => b"RAD MAP",
+            _ => b"RAD950",
         };
         b.set(t);
     }
@@ -243,6 +244,10 @@ impl Sol950Scr {
                 }
             }
             Key::Menu => {
+                if app.sol950_host().is_some_and(|h| h.profile.coop_rx == CoopRxMode::Capture) {
+                    app.show_toast(b"Coop Capture", b"RX only - host collects", false);
+                    return;
+                }
                 if let Some(row) = rows.get(self.sel as usize).filter(|_| (self.sel as usize) < n) {
                     let peer = row.peer;
                     if let Some(h) = app.sol950_host_mut() {
@@ -256,6 +261,10 @@ impl Sol950Scr {
                 }
             }
             Key::Digit(1) => {
+                if app.sol950_host().is_some_and(|h| h.profile.coop_rx == CoopRxMode::Capture) {
+                    app.show_toast(b"Coop Capture", b"RX only - host collects", false);
+                    return;
+                }
                 if let Some(h) = app.sol950_host_mut() {
                     // Transmit on the very next 10 s UTC slot boundary (`(last_slot + 1) & 1`).
                     let parity = if h.last_slot == u32::MAX { 0 } else { (h.last_slot.wrapping_add(1) & 1) as u8 };
@@ -327,8 +336,22 @@ impl Sol950Scr {
                 app.screen = Screen::Sol950(Sol950Scr::OPERATE);
                 return;
             }
-            Key::Up => self.sel = if self.sel == 0 { (SETUP_ROWS - 1) as u8 } else { self.sel - 1 },
-            Key::Down => self.sel = (self.sel + 1) % SETUP_ROWS as u8,
+            Key::Up => {
+                self.sel = if self.sel == 0 { (SETUP_ROWS - 1) as u8 } else { self.sel - 1 };
+                if self.sel < self.top {
+                    self.top = self.sel;
+                } else if self.sel as usize >= self.top as usize + SETUP_VISIBLE {
+                    self.top = (self.sel as usize + 1 - SETUP_VISIBLE) as u8;
+                }
+            }
+            Key::Down => {
+                self.sel = (self.sel + 1) % SETUP_ROWS as u8;
+                if self.sel < self.top {
+                    self.top = self.sel;
+                } else if self.sel as usize >= self.top as usize + SETUP_VISIBLE {
+                    self.top = (self.sel as usize + 1 - SETUP_VISIBLE) as u8;
+                }
+            }
             Key::Menu if matches!(self.sel, 0 | 1 | 4) => {
                 let target = match self.sel {
                     0 => TextFor::Sol950Call,
@@ -360,6 +383,22 @@ impl Sol950Scr {
                         7 => {
                             h.profile.tx_power = (h.profile.tx_power as i32 + dir).rem_euclid(3) as u8;
                         }
+                        8 => {
+                            h.profile.coop_rx = match h.profile.coop_rx {
+                                CoopRxMode::Off => CoopRxMode::Capture,
+                                CoopRxMode::Capture => CoopRxMode::Off,
+                            };
+                            if h.profile.coop_rx == CoopRxMode::Capture {
+                                h.engine.stop_session();
+                                h.pending_tx = None;
+                            }
+                        }
+                        9 => {
+                            h.profile.coop_link = match h.profile.coop_link {
+                                CoopLink::Usb => CoopLink::Bluetooth,
+                                CoopLink::Bluetooth => CoopLink::Usb,
+                            };
+                        }
                         _ => {}
                     }
                     h.profile_dirty = true;
@@ -386,6 +425,8 @@ impl Sol950Scr {
         let mut dial = SOL950_DIALS[0];
         let mut utc_ok = false;
         let mut mode_tag = 0u32;
+        let mut coop_rx = CoopRxMode::Off;
+        let mut coop_link = CoopLink::Usb;
         let mut rows = [empty_row(); MAX_PEERS];
         let mut n_rows = 0usize;
         if let Some(h) = app.sol950_host() {
@@ -393,6 +434,8 @@ impl Sol950Scr {
             (grid_bytes, grid_src) = h.profile.effective_grid(h.gps_grid);
             dial = h.profile.dial();
             utc_ok = h.utc_ready();
+            coop_rx = h.profile.coop_rx;
+            coop_link = h.profile.coop_link;
             mode_tag = match h.engine.mode() {
                 OpMode::Monitor => 0,
                 OpMode::AutoCq { parity } => 1 + parity as u32,
@@ -412,6 +455,8 @@ impl Sol950Scr {
             .n(rssi as u32)
             .n(loading as u32)
             .n(mode_tag)
+            .n(coop_rx as u32)
+            .n(coop_link as u32)
             .get();
         if let Some(clear) = app.dirty_shape(R_TOP, top_h, true) {
             let y0 = TOP_Y;
@@ -442,6 +487,13 @@ impl Sol950Scr {
                 let _ = uwrite!(line2, "{}{}", st, utc_s);
                 let col = if tx_active { RED } else if utc_ok && rx_ready { GREEN } else { AMBER };
                 lcd.text4(8, y0 + 35, line2.as_bytes(), &UI_12, col, BG);
+                if coop_rx == CoopRxMode::Capture {
+                    let badge: &[u8] = match coop_link {
+                        CoopLink::Usb => b"COOP USB",
+                        CoopLink::Bluetooth => b"COOP BT",
+                    };
+                    lcd.text4(W - 64, y0 + 35, badge, &UI_12, BLUE, BG);
+                }
                 lcd.fill(0, y0 + 42, W, 1, RULE);
             });
         }
@@ -627,7 +679,11 @@ impl Sol950Scr {
         let gps_grid = h.gps_grid;
         let y0 = TOP_Y + 4;
         let row_h = 24;
-        for i in 0..SETUP_ROWS {
+        for slot in 0..SETUP_VISIBLE {
+            let i = self.top as usize + slot;
+            if i >= SETUP_ROWS {
+                break;
+            }
             let selected = i == self.sel as usize;
             let mut val = Buf::<16>::new();
             let label: &[u8] = match i {
@@ -668,7 +724,7 @@ impl Sol950Scr {
                     let _ = uwrite!(val, "{}Hz", prof.rx_corr_hz);
                     b"RX offset"
                 }
-                _ => {
+                7 => {
                     let p = match prof.tx_power {
                         0 => "Low",
                         1 => "Mid",
@@ -677,10 +733,26 @@ impl Sol950Scr {
                     let _ = uwrite!(val, "{}", p);
                     b"TX power"
                 }
+                8 => {
+                    let c = match prof.coop_rx {
+                        CoopRxMode::Off => "Off",
+                        CoopRxMode::Capture => "Capture",
+                    };
+                    let _ = uwrite!(val, "{}", c);
+                    b"Coop RX"
+                }
+                _ => {
+                    let l = match prof.coop_link {
+                        CoopLink::Usb => "USB",
+                        CoopLink::Bluetooth => "Bluetooth",
+                    };
+                    let _ = uwrite!(val, "{}", l);
+                    b"Coop link"
+                }
             };
-            let rh = Mix::new().n(selected as u32).b(label).b(val.as_bytes()).get();
-            if let Some(clear) = app.dirty_shape(R_ROW + i, rh, selected) {
-                let y = y0 + i as i32 * row_h;
+            let rh = Mix::new().n(i as u32).n(selected as u32).b(label).b(val.as_bytes()).get();
+            if let Some(clear) = app.dirty_shape(R_ROW + slot, rh, selected) {
+                let y = y0 + slot as i32 * row_h;
                 let bg = if selected { BLUE } else { BG };
                 let fg = if selected { BLUE_FG } else { TEXT };
                 redraw_box!(clear || selected, lcd, (0, y, W, row_h, bg), {
@@ -695,7 +767,7 @@ impl Sol950Scr {
         let (eff_g, _) = prof.effective_grid(gps_grid);
         let ph = Mix::new().b(&id_buf[..id_len]).b(&eff_g).get();
         if let Some(clear) = app.dirty_shape(R_NOTE, ph, true) {
-            let y = y0 + SETUP_ROWS as i32 * row_h + 6;
+            let y = y0 + SETUP_VISIBLE as i32 * row_h + 6;
             redraw_box!(clear, lcd, (0, y, W, 24, BG), {
                 let mut pv = Buf::<32>::new();
                 let id_s = core::str::from_utf8(&id_buf[..id_len]).unwrap_or("?");
