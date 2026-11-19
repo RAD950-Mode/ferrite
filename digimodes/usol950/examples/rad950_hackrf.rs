@@ -261,6 +261,7 @@ fn usage() {
     eprintln!("  --amp                     Enable HackRF RF amplifier (default: off)");
     eprintln!("  --serial <HEX>            HackRF serial number suffix (if multiple connected)");
     eprintln!("  --dry-tx                  Dry TX safety mode (synthesize without keying HackRF)");
+    eprintln!("  --tx-once                 Transmit a single CQ immediately and exit (for bench/OTA tests)");
     eprintln!("  --log <PATH>              QSO log file path (default: rad950_hackrf.log)");
     eprintln!("  --loopback                Run offline TX->2.4MS/s cs8->RX DDC->Decoder self-test");
     eprintln!("  -h, --help                Show this help");
@@ -1753,6 +1754,9 @@ fn main() -> ExitCode {
     let mut tx_vga_db: u8 = 16;
     let mut amp = false;
     let mut dry_tx = false;
+    let mut tx_once = false;
+    let mut rx_once = false;
+    let mut tx_reply: Option<(String, i8, bool)> = None;
     let mut serial: Option<String> = None;
     let mut log_path = "rad950_hackrf.log".to_string();
     let mut loopback = false;
@@ -1767,6 +1771,15 @@ fn main() -> ExitCode {
             "--loopback" => loopback = true,
             "--amp" => amp = true,
             "--dry-tx" => dry_tx = true,
+            "--tx-once" => tx_once = true,
+            "--rx-once" => rx_once = true,
+            "--tx-reply" if i + 3 < args.len() => {
+                let to = args[i + 1].to_ascii_uppercase();
+                let snr = args[i + 2].parse::<i8>().unwrap_or(-10);
+                let ack = args[i + 3] == "1" || args[i + 3].eq_ignore_ascii_case("true");
+                tx_reply = Some((to, snr, ack));
+                i += 3;
+            }
             "--call" if i + 1 < args.len() => {
                 i += 1;
                 call_str = args[i].to_ascii_uppercase();
@@ -1886,7 +1899,7 @@ fn main() -> ExitCode {
     let (worked_calls, worked_grids_all, worked_grids_band) = load_existing_log(&cfg.log_path);
 
     let state = Arc::new(Mutex::new(SharedState {
-        cfg,
+        cfg: cfg.clone(),
         running: true,
         auto_cq: false,
         auto_qso: true,
@@ -1907,6 +1920,99 @@ fn main() -> ExitCode {
         slots_tx: 0,
         frames_rx: 0,
     }));
+
+    if tx_once {
+        let frame = Frame::Cq {
+            sender: cfg.call,
+            grid4: cfg.grid4,
+            tx_pwr: 10,
+            reserved: 0,
+        };
+        let job = TxJob {
+            frame,
+            subch: cfg.subch,
+            summary: format!("CQ {} {}", cfg.call_str, cfg.grid_str),
+        };
+        println!(
+            "TX-ONCE: {} on {:.3} MHz (cal {:+.1} ppm, subch {} = {} Hz, tx_gain={} dB, dry={})",
+            job.summary,
+            cfg.dial_hz as f64 / 1e6,
+            cfg.ppm,
+            cfg.subch,
+            SUBCHANNELS_HZ[cfg.subch],
+            cfg.tx_vga_db,
+            cfg.dry_tx
+        );
+        return match transmit_slot(&cfg, &job, &state) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("TX-ONCE failed: {e}");
+                ExitCode::from(1)
+            }
+        };
+    }
+
+    if let Some((to_str, snr_db, ack)) = tx_reply {
+        let rcpt = match parse_call(&to_str) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("{e}");
+                return ExitCode::from(2);
+            }
+        };
+        let frame = Frame::Rx {
+            sender: cfg.call,
+            recipient: rcpt,
+            snr_db,
+            ack,
+            reserved: false,
+        };
+        let tag = if ack { "R+RX" } else { "RX" };
+        let job = TxJob {
+            frame,
+            subch: cfg.subch,
+            summary: format!("{} de {} {tag} {:+}dB", to_str, cfg.call_str, snr_db),
+        };
+        println!(
+            "TX-REPLY: {} on {:.3} MHz (cal {:+.1} ppm, subch {} = {} Hz)",
+            job.summary,
+            cfg.dial_hz as f64 / 1e6,
+            cfg.ppm,
+            cfg.subch,
+            SUBCHANNELS_HZ[cfg.subch]
+        );
+        return match transmit_slot(&cfg, &job, &state) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("TX-REPLY failed: {e}");
+                ExitCode::from(1)
+            }
+        };
+    }
+
+    if rx_once {
+        println!(
+            "RX-ONCE: listening 9.45s on {:.3} MHz (cal {:+.1} ppm, LNA={} VGA={} amp={})",
+            cfg.dial_hz as f64 / 1e6,
+            cfg.ppm,
+            cfg.lna_db,
+            cfg.vga_db,
+            cfg.amp
+        );
+        return match receive_slot(&cfg, &state) {
+            Ok((frames, peak_pct)) => {
+                println!("RX-ONCE done: {} decode(s), peak={:.1}%", frames.len(), peak_pct);
+                for d in &frames {
+                    println!("  DECODE: {:?}  hz={}  snr={:+}dB", d.frame, d.audio_hz, d.snr_db);
+                }
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("RX-ONCE failed: {e}");
+                ExitCode::from(1)
+            }
+        };
+    }
 
     let _raw = match RawTerm::enter() {
         Ok(r) => r,
