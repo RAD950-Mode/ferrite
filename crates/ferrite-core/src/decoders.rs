@@ -3,6 +3,8 @@
 //! (uwspr), about 12.75 KB each, join when their audio path is in (milestone 6); the budget below already holds
 //! them.
 
+use crate::msg::DecoderKind;
+use core::mem::ManuallyDrop;
 use udsc::Receiver as Dsc;
 use uafsk::Demodulator as Afsk;
 use upocsag::Receiver as Pocsag;
@@ -14,17 +16,19 @@ pub const RATE_HZ: u32 = 24_000;
 /// RAM the slot may take: FT8's or WSPR's footprint.
 pub const BUDGET: usize = 13 * 1024;
 
-#[allow(clippy::large_enum_variant)] // the slot is as large as its largest decoder by design
-pub enum Decoder {
-    Off,
-    /// APRS and other 1200-baud AFSK packet (uaprs parses the frames).
-    Afsk(Afsk),
-    /// Pagers at 512, 1200 and 2400 baud.
-    Pocsag(Pocsag),
-    /// Marine DSC, channel 70.
-    Dsc(Dsc),
-    /// SOL950 10 m weak-signal 4-FSK streaming receiver (`<= 13 KB`).
-    Sol950(Sol950),
+union DecoderInner {
+    off: (),
+    afsk: ManuallyDrop<Afsk>,
+    pocsag: ManuallyDrop<Pocsag>,
+    dsc: ManuallyDrop<Dsc>,
+    sol950: ManuallyDrop<Sol950>,
+}
+
+/// Shared decoder slot: holds one active decoder at a time inside a single `<= 13 KB` union,
+/// initialized in-place by [`Decoder::switch`] so `dsp::task` never allocates a 13 KB temporary on the stack.
+pub struct Decoder {
+    kind: DecoderKind,
+    inner: DecoderInner,
 }
 
 /// What a decoder found, handed to the event bus.
@@ -40,25 +44,75 @@ pub enum Found<'a> {
 }
 
 impl Decoder {
+    pub const fn off() -> Self {
+        Self { kind: DecoderKind::Off, inner: DecoderInner { off: () } }
+    }
+
     pub fn afsk() -> Self {
-        Decoder::Afsk(Afsk::new(uafsk::fsk::Config::new(RATE_HZ)))
+        let mut d = Self::off();
+        d.switch(DecoderKind::Afsk);
+        d
     }
 
     pub fn pocsag() -> Self {
-        Decoder::Pocsag(Pocsag::new(RATE_HZ))
+        let mut d = Self::off();
+        d.switch(DecoderKind::Pocsag);
+        d
     }
 
     pub fn dsc() -> Self {
-        Decoder::Dsc(Dsc::new(uafsk::fsk::Config::new(RATE_HZ)))
+        let mut d = Self::off();
+        d.switch(DecoderKind::Dsc);
+        d
     }
 
     pub fn sol950() -> Self {
-        Decoder::Sol950(Sol950::new())
+        let mut d = Self::off();
+        d.switch(DecoderKind::Sol950);
+        d
+    }
+
+    /// Switch the active decoder in-place without constructing a `Decoder`-sized temporary on the stack.
+    #[inline(never)]
+    pub fn switch(&mut self, kind: DecoderKind) {
+        self.kind = DecoderKind::Off;
+        match kind {
+            DecoderKind::Off => {}
+            DecoderKind::Afsk => {
+                unsafe {
+                    core::ptr::addr_of_mut!(self.inner.afsk)
+                        .write(ManuallyDrop::new(Afsk::new(uafsk::fsk::Config::new(RATE_HZ))));
+                }
+                self.kind = DecoderKind::Afsk;
+            }
+            DecoderKind::Pocsag => {
+                unsafe {
+                    core::ptr::addr_of_mut!(self.inner.pocsag)
+                        .write(ManuallyDrop::new(Pocsag::new(RATE_HZ)));
+                }
+                self.kind = DecoderKind::Pocsag;
+            }
+            DecoderKind::Dsc => {
+                unsafe {
+                    core::ptr::addr_of_mut!(self.inner.dsc)
+                        .write(ManuallyDrop::new(Dsc::new(uafsk::fsk::Config::new(RATE_HZ))));
+                }
+                self.kind = DecoderKind::Dsc;
+            }
+            DecoderKind::Sol950 => {
+                unsafe {
+                    Sol950::init_in_place(core::ptr::addr_of_mut!(self.inner.sol950) as *mut Sol950);
+                }
+                self.kind = DecoderKind::Sol950;
+            }
+        }
     }
 
     /// Finish the current 10 s SOL950 UTC slot, write decoded frames to `out`, and reset for the next slot.
+    #[inline(never)]
     pub fn sol950_finish(&mut self, out: &mut [usol950::Decoded; usol950::MAX_DECODED]) -> usize {
-        if let Decoder::Sol950(d) = self {
+        if self.kind == DecoderKind::Sol950 {
+            let d = unsafe { &mut *self.inner.sol950 };
             let n = d.finish_slot(out);
             d.reset();
             n
@@ -69,14 +123,15 @@ impl Decoder {
 
     /// The AFSK demodulator's carrier detect: 1200-baud data heard now (APRS-56.4); false for the others.
     pub fn busy(&self) -> bool {
-        matches!(self, Decoder::Afsk(d) if d.busy())
+        self.kind == DecoderKind::Afsk && unsafe { (*self.inner.afsk).busy() }
     }
 
     /// One block of audio.
     pub fn push(&mut self, block: &[i16], mut found: impl FnMut(Found)) {
-        match self {
-            Decoder::Off => {}
-            Decoder::Afsk(d) => {
+        match self.kind {
+            DecoderKind::Off => {}
+            DecoderKind::Afsk => {
+                let d = unsafe { &mut *self.inner.afsk };
                 block.iter().for_each(|&x| d.push(x, |f| found(Found::Frame(f))));
                 // The demodulator's one block buffer: handed over (the DSP task copies it into APRS_RX's slot,
                 // which a plain frame's size already sets), then freed for the next tag.
@@ -88,9 +143,18 @@ impl Decoder {
                     found(Found::Miss(&m)); // a miss's window (32 bits) is longer than a block: one at most
                 }
             }
-            Decoder::Pocsag(d) => block.iter().for_each(|&x| d.push(x, |m| found(Found::Page(m)))),
-            Decoder::Dsc(d) => block.iter().for_each(|&x| d.push(x, |c| found(Found::Call(c)))),
-            Decoder::Sol950(d) => d.push_samples(block),
+            DecoderKind::Pocsag => {
+                let d = unsafe { &mut *self.inner.pocsag };
+                block.iter().for_each(|&x| d.push(x, |m| found(Found::Page(m))));
+            }
+            DecoderKind::Dsc => {
+                let d = unsafe { &mut *self.inner.dsc };
+                block.iter().for_each(|&x| d.push(x, |c| found(Found::Call(c))));
+            }
+            DecoderKind::Sol950 => {
+                let d = unsafe { &mut *self.inner.sol950 };
+                d.push_samples(block);
+            }
         }
     }
 }
@@ -198,7 +262,7 @@ mod tests {
     #[test]
     fn other_slots_on_silence() {
         let mut hits = 0;
-        for mut d in [Decoder::Off, Decoder::dsc(), Decoder::afsk()] {
+        for mut d in [Decoder::off(), Decoder::dsc(), Decoder::afsk()] {
             d.push(&[0; 2400], |_| hits += 1);
         }
         assert_eq!(hits, 0);

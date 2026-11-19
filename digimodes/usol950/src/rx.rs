@@ -206,6 +206,15 @@ impl Receiver {
         }
     }
 
+    /// Initialize a `Receiver` in-place without constructing a ~13 KB temporary on the stack.
+    ///
+    /// # Safety
+    /// `dst` must be valid for writes and properly aligned for `Self`.
+    pub unsafe fn init_in_place(dst: *mut Self) {
+        core::ptr::write_bytes(dst, 0, 1);
+        (*dst).tone_q_off = compute_tone_q_off(DEFAULT_SPACING_HZ);
+    }
+
     /// Reset state at the UTC `10.0 s` slot boundary (`t = 0.00 s`).
     pub fn reset(&mut self) {
         self.decim.reset();

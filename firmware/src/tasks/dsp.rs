@@ -366,7 +366,7 @@ pub static WORK_MAX_US: AtomicU32 = AtomicU32::new(0);
 #[embassy_executor::task]
 pub async fn task() {
     // The slot lives in this task's future, which is a static: one decoder's memory, whichever is running.
-    let mut slot = Decoder::Off;
+    let mut slot = Decoder::off();
     let mut dec = Decim::new();
     let mut capturing = false;
     // What each side asks for, and what runs (DEC-18).
@@ -431,13 +431,7 @@ pub async fn task() {
                 };
                 if kind != running {
                     running = kind;
-                    slot = match kind {
-                        DecoderKind::Off => Decoder::Off,
-                        DecoderKind::Afsk => Decoder::afsk(),
-                        DecoderKind::Pocsag => Decoder::pocsag(),
-                        DecoderKind::Dsc => Decoder::dsc(),
-                        DecoderKind::Sol950 => Decoder::sol950(),
-                    };
+                    slot.switch(kind);
                 }
                 // PWR-26.9: AFSK only while the APRS slot's squelch is open, and its tail; the pager decoder always
                 let want = kind != DecoderKind::Off && (kind != DecoderKind::Afsk || sq || tail != 0) || listen != 0 || meter_on;
