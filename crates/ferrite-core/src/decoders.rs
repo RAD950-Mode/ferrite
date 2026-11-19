@@ -6,6 +6,7 @@
 use udsc::Receiver as Dsc;
 use uafsk::Demodulator as Afsk;
 use upocsag::Receiver as Pocsag;
+use usol950::Receiver as Sol950;
 
 /// Audio rate the DSP task feeds the decoders.
 pub const RATE_HZ: u32 = 24_000;
@@ -22,6 +23,8 @@ pub enum Decoder {
     Pocsag(Pocsag),
     /// Marine DSC, channel 70.
     Dsc(Dsc),
+    /// SOL950 10 m weak-signal 4-FSK streaming receiver (`<= 13 KB`).
+    Sol950(Sol950),
 }
 
 /// What a decoder found, handed to the event bus.
@@ -49,6 +52,21 @@ impl Decoder {
         Decoder::Dsc(Dsc::new(uafsk::fsk::Config::new(RATE_HZ)))
     }
 
+    pub fn sol950() -> Self {
+        Decoder::Sol950(Sol950::new())
+    }
+
+    /// Finish the current 10 s SOL950 UTC slot, write decoded frames to `out`, and reset for the next slot.
+    pub fn sol950_finish(&mut self, out: &mut [usol950::Decoded; usol950::MAX_DECODED]) -> usize {
+        if let Decoder::Sol950(d) = self {
+            let n = d.finish_slot(out);
+            d.reset();
+            n
+        } else {
+            0
+        }
+    }
+
     /// The AFSK demodulator's carrier detect: 1200-baud data heard now (APRS-56.4); false for the others.
     pub fn busy(&self) -> bool {
         matches!(self, Decoder::Afsk(d) if d.busy())
@@ -72,6 +90,7 @@ impl Decoder {
             }
             Decoder::Pocsag(d) => block.iter().for_each(|&x| d.push(x, |m| found(Found::Page(m)))),
             Decoder::Dsc(d) => block.iter().for_each(|&x| d.push(x, |c| found(Found::Call(c)))),
+            Decoder::Sol950(d) => d.push_samples(block),
         }
     }
 }

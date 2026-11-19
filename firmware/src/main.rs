@@ -98,7 +98,7 @@ type Vector = unsafe extern "C" fn();
 static __INTERRUPTS: [Vector; 96] = {
     let mut v: [Vector; 96] = [stray; 96];
     v[hal::time_driver::IRQ as usize] = tmr3;
-    #[cfg(all(feature = "tx", feature = "bench"))]
+    #[cfg(feature = "tx")]
     {
         v[hal::edge::IRQ as usize] = tmr5;
     }
@@ -119,8 +119,8 @@ extern "C" fn stray() {
 extern "C" fn tmr3() {
     hal::time_driver::on_interrupt()
 }
-/// TERM-33 `afsk-bk`'s bit timer (decision 134); a bench build's (TERM-38).
-#[cfg(all(feature = "tx", feature = "bench"))]
+/// TMR5 bit/symbol timer (`afsk-bk` in bench builds; SOL950 PLL symbol stepping in `tx` builds).
+#[cfg(feature = "tx")]
 extern "C" fn tmr5() {
     tasks::radio::afskbk::on_interrupt()
 }

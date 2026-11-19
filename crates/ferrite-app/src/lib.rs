@@ -43,6 +43,7 @@ pub mod radio_data;
 pub mod remote;
 pub mod sample;
 pub mod sat;
+pub mod sol950;
 pub mod screens;
 pub mod slotctl;
 pub mod settings;
@@ -443,6 +444,8 @@ pub struct App {
     /// Satellite mode (chapter 28a): the platform's satellites and passes, and the App's own few bytes.
     satd: Option<&'static mut dyn ferrite_core::sat::data::SatData>,
     pub(crate) sat: sat::SatUi,
+    /// SOL950 10 m weak-signal mode: platform-owned runtime host (`Engine`, profile, UTC sync).
+    sol950d: Option<&'static mut sol950::Sol950Host>,
 }
 
 /// Screens remembered for BACK: menu, group, item and one more.
@@ -544,6 +547,7 @@ impl App {
             link_answer: None,
             satd: None,
             sat: sat::SatUi::new(),
+            sol950d: None,
         };
         app.region_steps(); // VFO-18: the region's step on 2 m and 1.25 m (saved slots bring their own)
         for s in 0..SLOTS as u8 {

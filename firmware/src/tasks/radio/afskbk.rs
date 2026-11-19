@@ -11,13 +11,19 @@ use core::sync::atomic::{AtomicU32, Ordering::Relaxed};
 use critical_section::Mutex;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex as M;
 use embassy_sync::signal::Signal;
+#[cfg(feature = "bench")]
 use ferrite_core::txtest::{bk_gain, bk_tone, Arm, BkFlags, Signal as TxSig, Sol950Bk};
 use ferrite_radio::chip::Sol950Saved;
 
 /// TMR5's priority: the time driver's (4), above every executor.
 const PRIO: u8 = 4;
+/// SOL950 substep rate: 64 substeps per 80 ms symbol = 800 Hz (1,500 TMR5 ticks at 1.2 MHz).
+const SOL950_STEP_HZ: u32 = 800;
+/// Short 5 ms lead (4 * 1.25 ms) after PA ramp before symbol 0 of a live SOL950 burst.
+const SOL950_LIVE_LEAD_STEPS: u32 = 4;
 
 enum SchedKind {
+    #[cfg(feature = "bench")]
     Afsk(BkFlags),
     Sol950 { step: u32, per_step: u32 },
 }
@@ -25,6 +31,7 @@ enum SchedKind {
 impl SchedKind {
     fn next_ticks(&mut self) -> u32 {
         match self {
+            #[cfg(feature = "bench")]
             SchedKind::Afsk(f) => f.next_change(),
             SchedKind::Sol950 { step, per_step } => {
                 *step = step.wrapping_add(1);
@@ -59,9 +66,16 @@ pub fn on_interrupt() {
 
 #[derive(Clone, Copy)]
 enum RunMode {
+    #[cfg(feature = "bench")]
     Afsk,
+    #[cfg(feature = "bench")]
     Sol950 {
         cal: bool,
+        last_step: u32,
+        saved: Sol950Saved,
+    },
+    Sol950Live {
+        tones: [u8; ferrite_core::sol950::usol950::N_SYMBOLS],
         last_step: u32,
         saved: Sol950Saved,
     },
@@ -78,7 +92,31 @@ pub(super) struct BkRun {
 }
 
 impl Radio {
+    /// Start a live 110-symbol SOL950 burst on chip `n` via direct BK4829 PLL stepping (`REG_38/39` + `REG_30`
+    /// VCO toggle), timed by TMR5 at 80 ms/symbol (`64 * 1.25 ms`).
+    pub(super) fn sol950_live_start(&mut self, n: u8, tones: [u8; ferrite_core::sol950::usol950::N_SYMBOLS]) {
+        let narrow = self.tx.narrow;
+        let saved = radio_chip::sol950_bk_prime(&mut self.chip(n), 0, 0, narrow);
+        CHANGES.store(0, Relaxed);
+        EDGE.reset();
+        let t0 = crate::hal::edge::start(PRIO);
+        let per_step = crate::hal::edge::TICK_HZ / SOL950_STEP_HZ; // exact 1,500 ticks (1.25 ms)
+        let mut sk = SchedKind::Sol950 { step: 0, per_step };
+        let first = t0.wrapping_add(sk.next_ticks() as u16);
+        critical_section::with(|cs| *SCHED.borrow_ref_mut(cs) = Some((sk, t0)));
+        crate::hal::edge::arm(first);
+        self.tx.bk = Some(BkRun {
+            chip: n,
+            sent: 0,
+            missed: 0,
+            writes: 1,
+            mode: RunMode::Sol950Live { tones, last_step: 0, saved },
+        });
+        log(b"sol950 tx start", 0);
+    }
+
     /// After the key-up's plan: start `afsk-bk`, `sol950`, or `sol950-cal` on chip `n`.
+    #[cfg(feature = "bench")]
     pub(super) fn bk_test_start(&mut self, n: u8, arm: &Arm) {
         if arm.signal.is_sol950() {
             let cal = arm.signal == TxSig::Sol950Cal;
@@ -110,6 +148,7 @@ impl Radio {
 
     /// The timer from now, the chip already sending the space tone (TERM-34's flag steps set it with the rest of
     /// the step): the first change 7 bits on.
+    #[cfg(feature = "bench")]
     pub(super) fn afsk_bk_timer(&mut self, n: u8) {
         CHANGES.store(0, Relaxed);
         EDGE.reset();
@@ -121,22 +160,26 @@ impl Radio {
         self.tx.bk = Some(BkRun { chip: n, sent: 0, missed: 0, writes: 0, mode: RunMode::Afsk });
     }
 
-    /// The Radio task woken by [`EDGE`]: update `REG_71` (`afsk-bk`) or `REG_70` (`sol950*`, only when gain changed).
-    pub(super) fn afsk_bk_edge(&mut self) {
-        let Some(mut run) = self.tx.bk else { return };
+    /// The Radio task woken by [`EDGE`]: step `REG_71` (`afsk-bk`) or `REG_38/39` (`sol950*`).
+    /// Returns `true` when a live SOL950 burst has completed all 110 symbols and is ready to unkey.
+    pub(super) fn afsk_bk_edge(&mut self) -> bool {
+        let Some(mut run) = self.tx.bk else { return false };
         let n = CHANGES.load(Relaxed);
         if n == run.sent {
-            return;
+            return false;
         }
         run.missed += n - run.sent - 1;
         run.sent = n;
         let chip = run.chip;
+        let mut finished = false;
         if self.has(chip) {
             match &mut run.mode {
+                #[cfg(feature = "bench")]
                 RunMode::Afsk => {
                     radio_chip::afsk_bk_tone(&mut self.chip(chip), bk_tone(n));
                     run.writes += 1;
                 }
+                #[cfg(feature = "bench")]
                 RunMode::Sol950 { cal, last_step, saved } => {
                     if *cal {
                         // 500 ms per step: steps 0..4 test bit-15-only VCO toggle (0x43FA->0xC3FA), 4..9 full tx_on
@@ -165,9 +208,28 @@ impl Radio {
                         }
                     }
                 }
+                RunMode::Sol950Live { tones, last_step, saved } => {
+                    if n >= SOL950_LIVE_LEAD_STEPS {
+                        let sym = ((n - SOL950_LIVE_LEAD_STEPS) / 64) as usize;
+                        if sym < tones.len() {
+                            let tone = tones[sym] as u32;
+                            let idx = tone + 1;
+                            if idx != *last_step {
+                                *last_step = idx;
+                                let hz = saved.base_hz.saturating_add(tone * 50);
+                                let narrow = saved.narrow;
+                                radio_chip::sol950_bk_freq(&mut self.chip(chip), hz, false, narrow);
+                                run.writes += 1;
+                            }
+                        } else {
+                            finished = true;
+                        }
+                    }
+                }
             }
         }
         self.tx.bk = Some(run);
+        finished
     }
 
     /// At the release (or any unkey): the timer stopped, then the tones/registers restored on the chip.
@@ -175,13 +237,17 @@ impl Radio {
         let Some((chip, mode)) = self.afsk_bk_halt_mode() else { return };
         if self.has(chip) {
             match mode {
+                #[cfg(feature = "bench")]
                 RunMode::Afsk => radio_chip::afsk_bk_end(&mut self.chip(chip)),
+                #[cfg(feature = "bench")]
                 RunMode::Sol950 { saved, .. } => radio_chip::sol950_bk_end(&mut self.chip(chip), &saved),
+                RunMode::Sol950Live { saved, .. } => radio_chip::sol950_bk_end(&mut self.chip(chip), &saved),
             }
         }
     }
 
     /// The timer stopped and the run's counts logged; the chip untouched (TERM-34's next step turns the tones off).
+    #[cfg(feature = "bench")]
     pub(super) fn afsk_bk_halt(&mut self) -> Option<u8> {
         self.afsk_bk_halt_mode().map(|(c, _)| c)
     }

@@ -87,6 +87,7 @@ pub mod save;
 pub mod samecodes;
 pub mod autoreply;
 pub mod sat;
+pub mod sol950;
 pub mod scan;
 pub mod scanlists;
 pub mod scope;
@@ -179,6 +180,8 @@ pub enum Screen {
     Dtmf(dtmf::DtmfPad),
     /// Satellite mode (chapter 28a): the pass list, pass page and pointing page.
     Sat(sat::SatScr),
+    /// SOL950 10 m weak-signal mode (MENU 0 3 7).
+    Sol950(sol950::Sol950Scr),
 }
 
 /// Runs `$e` with `$s` bound to the screen's state: the one place that lists every variant.
@@ -239,6 +242,7 @@ macro_rules! each {
             Screen::AutoReply($s) => $e,
             Screen::Dtmf($s) => $e,
             Screen::Sat($s) => $e,
+            Screen::Sol950($s) => $e,
         }
     };
 }

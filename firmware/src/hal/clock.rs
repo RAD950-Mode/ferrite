@@ -279,6 +279,6 @@ fn retime(t: Tree) {
     super::audio::retime(t);
     super::tone::retime();
     super::backlight::retime(t);
-    #[cfg(all(feature = "tx", feature = "bench"))]
+    #[cfg(feature = "tx")]
     super::edge::retime(t);
 }

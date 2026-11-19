@@ -63,11 +63,15 @@ pub struct Needs {
     pub alarm: bool,
     /// (d) The clock from GPS (0 6 6): one fix after power-on ([`GpsAuto`] drops it once taken).
     pub clock: bool,
+    /// (e) SOL950 needs GPS UTC time discipline while active.
+    pub sol950_time: bool,
+    /// (f) SOL950 needs an onboard GPS position fix while active with GPS grid enabled.
+    pub sol950_pos: bool,
 }
 
 impl Needs {
     pub fn any(&self) -> bool {
-        self.aprs || self.screen || self.alarm || self.clock
+        self.aprs || self.screen || self.alarm || self.clock || self.sol950_time || self.sol950_pos
     }
 }
 
@@ -75,11 +79,14 @@ impl Needs {
 pub fn needs(app: &crate::App, alarm: bool) -> Needs {
     let set = app.settings();
     let c = app.aprs_cfg();
+    let sol950 = app.sol950_open();
     Needs {
         aprs: app.aprs_on() && (c.mode() != 0 || c.after_voice) && !set.fixed_on,
         screen: matches!(app.screen(), crate::Screen::Gps(_)),
         alarm,
         clock: set.clock_gps,
+        sol950_time: sol950,
+        sol950_pos: sol950 && app.sol950_wants_gps_grid(),
     }
 }
 
@@ -140,7 +147,7 @@ pub fn auto_step(app: &mut crate::App, data: &dyn Data, alarm: bool, now: u32) {
 /// satellites page is open, the two that show satellites in view (from GSV and GSA).
 pub fn demand(app: &crate::App, data: &dyn Data, alarm: bool, now_ms: u32) -> GpsDemand {
     use crate::screens::gps::Page;
-    let watch = alarm || matches!(app.screen(), crate::Screen::Gps(_));
+    let watch = alarm || matches!(app.screen(), crate::Screen::Gps(_)) || app.sol950_open();
     let sky = matches!(app.screen(), crate::Screen::Gps(g) if matches!(g.page, Page::Position | Page::Satellites));
     let (mut track, mut beacon_at) = (false, None);
     if app.aprs_on() {
@@ -284,6 +291,26 @@ impl GpsData {
         }
         self.fixed.get()
     }
+
+    /// Explicit onboard GPS fix only (never returns the fixed position `0 6 9` or phone position).
+    /// Used by SOL950 for `GPS` grid source and UTC discipline.
+    pub fn onboard_fix(&self) -> Option<GpsFix> {
+        self.recent()
+    }
+}
+
+/// Convert WGS-84 latitude/longitude in `1e-7` degrees to a 4-character Maidenhead locator (`GRID4`).
+/// Wraps `+180.0°` longitude to `-180.0°` (`'A'`, `'0'`) and clamps `+90.0°` northern latitude to `'R'`, `'9'`.
+pub fn pos_to_grid4(lat_1e7: i32, lon_1e7: i32) -> [u8; 4] {
+    const SCALE: i64 = 10_000_000;
+    const LON_SPAN: i64 = 360 * SCALE;
+    let lon_u = (lon_1e7 as i64 + 180 * SCALE).rem_euclid(LON_SPAN);
+    let lat_u = (lat_1e7 as i64 + 90 * SCALE).clamp(0, 180 * SCALE - 1);
+    let lon_field = (lon_u / (20 * SCALE)) as u8;
+    let lat_field = (lat_u / (10 * SCALE)) as u8;
+    let lon_sq = ((lon_u % (20 * SCALE)) / (2 * SCALE)) as u8;
+    let lat_sq = ((lat_u % (10 * SCALE)) / SCALE) as u8;
+    [b'A' + lon_field, b'A' + lat_field, b'0' + lon_sq, b'0' + lat_sq]
 }
 
 /// Minutes since local midnight for UTC seconds `utc` in time zone `tz` (an index into [`TIME_ZONES`]), and
@@ -845,5 +872,31 @@ mod tests {
         assert!(a.armed(100));
         assert!(!a.armed(0), "the alarm off");
         assert_eq!(a.check(Pos { lat: 0, lon: 0 }, 0), None, "no radius: never fires");
+    }
+
+    #[test]
+    fn pos_to_grid4_boundaries() {
+        // W1AW / Newington CT ~ 41.7147 N, 72.7272 W -> FN31
+        assert_eq!(&pos_to_grid4(417_147_000, -727_272_000), b"FN31");
+        // Origin (0, 0) -> JJ00
+        assert_eq!(&pos_to_grid4(0, 0), b"JJ00");
+        // -90, -180 -> AA00
+        assert_eq!(&pos_to_grid4(-900_000_000, -1_800_000_000), b"AA00");
+        // +180 wraps to -180 (lon field A, square 0)
+        assert_eq!(&pos_to_grid4(0, 1_800_000_000), b"AJ00");
+        // +90 northern pole clamps to lat field R, square 9 (never overflows past 'R'/'9')
+        assert_eq!(&pos_to_grid4(900_000_000, 1_799_999_999), b"RR99");
+        assert_eq!(&pos_to_grid4(900_000_000, 1_800_000_000), b"AR09");
+    }
+
+    #[test]
+    fn onboard_fix_ignores_fixed_position() {
+        let g = GpsData::new();
+        g.set_fixed(Some(Pos { lat: 417_147_000, lon: -727_272_000 }));
+        assert!(g.position().is_some(), "general position falls back to fixed");
+        assert!(g.onboard_fix().is_none(), "onboard_fix must never return fixed position");
+        g.set_fix(GpsFix { on: true, fix: 2, used: 6, lat: 417_147_000, lon: -727_272_000, unix: 1_700_000_000, at_ms: 1000, ..GpsFix::default() });
+        g.tick(2000);
+        assert!(g.onboard_fix().is_some(), "recent onboard fix returned");
     }
 }

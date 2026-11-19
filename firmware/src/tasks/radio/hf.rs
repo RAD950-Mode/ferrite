@@ -106,7 +106,7 @@ impl Radio {
             // The patch as soon as the chip answers (AN332: right after POWER_UP), then whatever is left of the
             // crystal's 550 ms before the first tune (stock waits it out first)
             let up = now_ms();
-            self.ssb_patch(freq).await?;
+            self.ssb_patch(freq, false).await?;
             let settled = up + 550;
             if now_ms() < settled {
                 Timer::after_millis(settled - now_ms()).await;
@@ -129,8 +129,8 @@ impl Radio {
     }
 
     /// HF-3, HF-19: the stored patch (SPI, `layout::SSB_PATCH`, checked at boot) to the chip, 8 bytes a record,
-    /// read in 64-byte pieces; the progress goes to the screen as it goes ([`ModeLive::Hf`]'s `loading`).
-    async fn ssb_patch(&mut self, freq: Freq10) -> Result<(), si4732::Error> {
+    /// read in 64-byte pieces; the progress goes to the screen as it goes ([`ModeLive::Hf`] or [`ModeLive::Sol950`]).
+    pub(super) async fn ssb_patch(&mut self, freq: Freq10, sol950: bool) -> Result<(), si4732::Error> {
         use ferrite_core::{layout::SSB_PATCH, ssb};
         let mut h = [0u8; ssb::HEADER];
         part_read_wait(SSB_PATCH.start, &mut h).await?;
@@ -157,7 +157,11 @@ impl Radio {
                 if off % 256 == 0 {
                     if off % 1024 == 0 {
                         let loading = (off as u64 * 100 / p.len as u64) as u8;
-                        self.live.mode = ModeLive::Hf { freq, rssi: -127, snr: 0, si4732: true, loading };
+                        self.live.mode = if sol950 {
+                            ModeLive::Sol950 { rx_ready: false, tx_active: false, rssi: -127, loading }
+                        } else {
+                            ModeLive::Hf { freq, rssi: -127, snr: 0, si4732: true, loading }
+                        };
                         live.send(self.live);
                     }
                     Timer::after_millis(1).await;

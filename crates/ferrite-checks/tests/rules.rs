@@ -138,7 +138,7 @@ fn bench_is_a_feature() {
         assert!(core.contains(m) && before.trim_end().ends_with("#[cfg(feature = \"bench\")]"), "{m} only in a bench build");
     }
     let hal = code(&root().join("firmware/src/hal/mod.rs"));
-    assert!(hal.contains("#[cfg(all(feature = \"tx\", feature = \"bench\"))]\npub mod edge;"), "TMR5's bit clock only in a tx bench build");
+    assert!(hal.contains("#[cfg(feature = \"tx\")]\npub mod edge;"), "TMR5's symbol timer only in a tx build");
 }
 
 /// GOAL-2: the receive-only firmware builds (and the transmit one too). Slow (two firmware builds, a minute or

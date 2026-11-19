@@ -161,7 +161,8 @@ fn ram_is_small() {
     // broadcast slot took the broadcast, for the sleep timer (BCR-5, decision 352: 4 bytes), 8 with padding, to 1992;
     // the shortcut popup as last drawn on home, so home waits under it (HOME-8: 4 bytes), 8 with padding, to 2000;
     // auto reply's settings in the App's AprsCfg (APRS-57: on and delay, the pattern, the 45-character reply), 56
-    assert!(n <= 2056, "App is {n} bytes");
+    // to 2056; SOL950 host pointer (`sol950d`, 8 on PC, 4 on radio), 8 to 2064
+    assert!(n <= 2064, "App is {n} bytes");
     let s = core::mem::size_of::<crate::settings::Settings>();
     std::println!("Settings: {s} bytes");
     assert!(s <= 512, "Settings is {s} bytes");

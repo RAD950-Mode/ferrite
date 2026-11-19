@@ -123,6 +123,21 @@ pub struct Decoded {
     pub snr_db: i8,
 }
 
+impl Decoded {
+    /// Placeholder slot value for initializing `[Decoded; MAX_DECODED]` output buffers.
+    pub const EMPTY: Self = Self {
+        frame: Frame::Cq {
+            sender: crate::frame::Callsign::from_raw(0).unwrap(),
+            grid4: 0,
+            tx_pwr: 0,
+            reserved: 0,
+        },
+        audio_hz: 0,
+        time_offset_ms: 0,
+        snr_db: 0,
+    };
+}
+
 #[derive(Clone, Copy)]
 struct Track {
     active: bool,

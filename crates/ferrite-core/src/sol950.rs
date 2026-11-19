@@ -3,6 +3,7 @@
 
 use crate::decoders::BUDGET;
 use crate::freq::Freq10;
+pub use usol950;
 use usol950::{Callsign, Decoded, Frame, Receiver, GRID_UNKNOWN, SUBCHANNELS_HZ};
 
 // Compile-time check that the SOL950 streaming receiver fits inside Ferrite's shared 13 KB `Decoder` slot.
@@ -56,6 +57,18 @@ pub struct QsoRecord {
     pub sent_snr: i8,
     pub rcvd_snr: i8,
     pub completed_slot: u32,
+}
+
+/// Summary row for the Operate screen's activity list.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ActivityRow {
+    pub peer: Callsign,
+    pub grid4: u16,
+    pub snr_db: i8,
+    pub last_seen_slot: u32,
+    pub window: Freq10,
+    pub owed_reply: Option<bool>,
+    pub logged: bool,
 }
 
 /// Action planned for an upcoming 10-second UTC slot.
@@ -175,6 +188,85 @@ impl Engine {
 
     pub fn recent_logs(&self) -> &[Option<QsoRecord>; MAX_LOG_RECENT] {
         &self.logs
+    }
+
+    pub fn config(&self) -> &Config {
+        &self.cfg
+    }
+
+    pub fn mode(&self) -> OpMode {
+        self.cfg.mode
+    }
+
+    pub fn set_config(&mut self, cfg: Config) {
+        self.cfg = cfg;
+    }
+
+    /// Start an attended CQ session on the active window.
+    pub fn start_cq(&mut self, parity: u8) {
+        self.cfg.mode = OpMode::AutoCq { parity: parity & 1 };
+    }
+
+    /// Explicitly answer a heard peer from the Operate activity list.
+    pub fn answer_peer(&mut self, peer: Callsign, slot: u32) -> bool {
+        let win = self.current_window();
+        let Some(idx) = self.find_peer(peer, win) else { return false };
+        let p = &mut self.peers[idx];
+        if p.logged_at.is_some() {
+            return false;
+        }
+        self.cfg.mode = OpMode::Pounce;
+        if p.owed_reply != Some(true) {
+            p.owed_reply = Some(false);
+        }
+        self.lock_until = Some(slot + EXPIRY_SLOTS);
+        true
+    }
+
+    /// Stop any attended CQ/Answer session: returns to Monitor, cancels queued replies, preserves completed logs.
+    pub fn stop_session(&mut self) {
+        self.cfg.mode = OpMode::Monitor;
+        self.pending_tx = None;
+        self.lock_until = None;
+        self.linger_until = None;
+        for p in &mut self.peers {
+            p.owed_reply = None;
+        }
+    }
+
+    /// Record that a planned TX slot missed its deadline and was skipped, leaving any pending reply observable.
+    pub fn on_tx_missed_deadline(&mut self, slot: u32) {
+        if self.pending_tx.is_some_and(|p| p.slot == slot) {
+            self.pending_tx = None;
+        }
+    }
+
+    /// Collect heard peers on any window, sorted newest-seen first, for the Operate screen.
+    pub fn activity_rows(&self, out: &mut [ActivityRow; MAX_PEERS]) -> usize {
+        let mut n = 0usize;
+        for p in &self.peers {
+            if p.active {
+                out[n] = ActivityRow {
+                    peer: p.peer,
+                    grid4: p.grid4,
+                    snr_db: p.last_heard_snr,
+                    last_seen_slot: p.last_seen_slot,
+                    window: p.window,
+                    owed_reply: p.owed_reply,
+                    logged: p.logged_at.is_some(),
+                };
+                n += 1;
+            }
+        }
+        // Insertion sort newest-first (N <= 16)
+        for i in 1..n {
+            let mut j = i;
+            while j > 0 && out[j].last_seen_slot > out[j - 1].last_seen_slot {
+                out.swap(j, j - 1);
+                j -= 1;
+            }
+        }
+        n
     }
 
     /// Expire stale sessions and advance the 2-slot rendezvous scanner if unlocked, then return the plan for `slot`.

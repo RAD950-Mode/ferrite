@@ -173,6 +173,12 @@ impl Radio {
             RadioCmd::BcastSlot(s) => self.bcast_slot = s,
             RadioCmd::Hf { freq, mode, on } => self.hf(freq, mode, on).await,
             RadioCmd::HfSeek { up } => self.hf_seek(up),
+            RadioCmd::Sol950Rx { dial, rx_corr_hz, on } => self.sol950_rx(dial, rx_corr_hz, on).await,
+            #[cfg(feature = "tx")]
+            RadioCmd::Sol950Tx { freq, power } => self.sol950_tx(freq, power).await,
+            #[cfg(not(feature = "tx"))]
+            RadioCmd::Sol950Tx { .. } => {}
+            RadioCmd::Sol950Abort => self.sol950_abort().await,
             RadioCmd::SiOpts(o) => {
                 // BCR-32, HF-35: kept for the next power-up, and applied now if the SI4732 runs
                 if o != self.si_opts {
@@ -293,8 +299,9 @@ impl Radio {
             }
             #[cfg(feature = "tx")]
             RadioCmd::Transmit { slot, on } => {
-                // XB-14: local PTT interrupts a pass (unkeyed first) and holds the repeater until it's released.
+                // XB-14 / SOL950: local PTT interrupts an active repeater pass or SOL950 burst immediately.
                 if on {
+                    self.sol950_abort().await;
                     self.xb_hold(true).await;
                 }
                 self.transmit(slot, on, None).await;

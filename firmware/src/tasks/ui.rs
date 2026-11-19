@@ -450,6 +450,8 @@ pub async fn task() {
     lcd.0.fill(0, 0, 240, 320, BG);
     let mut app = App::new(set, store::last_alert());
     app.sat_attach(crate::sat::data(store)); // chapter 28a: the satellites (the store's, SAT-2) and their passes
+    app.sol950_attach(sol950_host()); // SOL950 10 m weak-signal mode host
+    let mut sol950_dec_on = false;
     // The slots as they were saved (frequencies, VFO settings, the channel each is on, watch, Battery Save).
     store.restore(&mut app);
     // After the self-test: setup on first boot (BOOT-12); MENU held: the settings reset (PIN-6, BOOT-14), which
@@ -964,6 +966,7 @@ pub async fn task() {
         if house {
             gps.step(&mut app, store, &mut dev); // PWR-26.15: fixes come once a second
         }
+        sol950_step(&mut app, store, &mut sol950_dec_on);
         sec!(4); // gps
         // LINK-38: a redraw for live changes alone at most every FRAME_MIN_MS. During a scan the Radio task reports
         // every step and each scan page redraw is ~14 KB (12-17 ms): back to back they left the Link task (same
@@ -1432,4 +1435,89 @@ fn linkz_bench() -> [u32; 11] {
         (v[5], v[6], v[7]) = (v[5] + n as u32, v[6] + c1.wrapping_sub(c0), v[7] + c2.wrapping_sub(c1));
     }
     v
+}
+
+/// Static storage for the SOL950 runtime host (initialized once at boot by `ui::task`).
+fn sol950_host() -> &'static mut ferrite_app::sol950::Sol950Host {
+    use core::mem::MaybeUninit;
+    use core::sync::atomic::AtomicBool;
+    static TAKEN: AtomicBool = AtomicBool::new(false);
+    static mut HOST: MaybeUninit<ferrite_app::sol950::Sol950Host> = MaybeUninit::uninit();
+    assert!(!TAKEN.swap(true, Relaxed));
+    unsafe { (*core::ptr::addr_of_mut!(HOST)).write(ferrite_app::sol950::Sol950Host::new()) }
+}
+
+/// Drive SOL950 DSP decoder switching, GPS sub-second UTC slot timing, RX frames, and TX dispatch.
+fn sol950_step(app: &mut App, store: &crate::store::Store, dec_on: &mut bool) {
+    use ferrite_core::msg::{DecoderKind, DspCmd};
+    let open = app.sol950_open();
+    if open != *dec_on {
+        let cmd = if open {
+            DspCmd::Decoder(DecoderKind::Sol950)
+        } else if app.aprs_on() {
+            DspCmd::Decoder(DecoderKind::Afsk)
+        } else {
+            DspCmd::Decoder(DecoderKind::Off)
+        };
+        if crate::chan::DSP.try_send(cmd).is_ok() {
+            *dec_on = open;
+        }
+    }
+    if !open {
+        return;
+    }
+
+    // Drain any decoded SOL950 frames from the DSP task.
+    while let Ok(d) = crate::chan::SOL950_RX.try_receive() {
+        if let Some(h) = app.sol950_host_mut() {
+            h.on_rx_frame(d);
+        }
+    }
+    // Check live TX completion from the Radio task.
+    #[cfg(feature = "tx")]
+    if let Some(ok) = crate::chan::SOL950_TX_DONE.try_take() {
+        if let Some(h) = app.sol950_host_mut() {
+            h.on_tx_done(ok);
+        }
+    }
+
+    // Update sub-second UTC & onboard GPS grid from `store.extra.gps.onboard_fix()` + NMEA `$` burst tick.
+    let g = &store.extra.gps;
+    let (utc_sec, ms_in_sec, uncert_ms, gps_grid) = if let Some(fix) = g.onboard_fix() {
+        let grid = Some(ferrite_app::gpsdata::pos_to_grid4(fix.lat, fix.lon));
+        if fix.unix != 0 {
+            let burst_tick = crate::tasks::gps::last_burst_tick();
+            let now_tick = Instant::now().as_ticks() as u32;
+            let diff = now_tick.wrapping_sub(burst_tick);
+            if burst_tick != 0 && diff < u32::MAX / 2 {
+                let elapsed_ms = diff / 2; // 2 kHz tick driver -> 0.5 ms/tick
+                let secs = elapsed_ms / 1000;
+                let ms = (elapsed_ms % 1000) as u16;
+                let unc = if secs < 5 { 50 } else { 50u16.saturating_add((secs as u16).saturating_mul(2)) };
+                (fix.unix.wrapping_add(secs), ms, unc, grid)
+            } else {
+                (fix.unix, 0, 500, grid)
+            }
+        } else {
+            (0, 0, u16::MAX, grid)
+        }
+    } else {
+        (0, 0, u16::MAX, None)
+    };
+    if let Some(h) = app.sol950_host_mut() {
+        h.update_clock(utc_sec, ms_in_sec, uncert_ms, gps_grid);
+    }
+
+    if app.sol950_take_finish() {
+        let _ = crate::chan::DSP.try_send(DspCmd::Sol950Finish);
+    }
+
+    #[cfg(feature = "tx")]
+    if let Some((rf_freq, power, frame)) = app.sol950_take_tx() {
+        let region = app.settings().region;
+        let extend = app.settings().extend_tx;
+        crate::chan::SOL950_TX.signal(frame);
+        let _ = crate::chan::RADIO.try_send(RadioCmd::TxPlan { tx: rf_freq, region, extend, confirmed: false });
+        let _ = crate::chan::RADIO.try_send(RadioCmd::Sol950Tx { freq: rf_freq, power });
+    }
 }

@@ -541,7 +541,7 @@ pub fn afsk_bk_end<B: Bus>(bk: &mut Bk4829<B>) {
 }
 
 /// Registers saved by [`sol950_bk_prime`] and restored at unkey by [`sol950_bk_end`].
-#[cfg(all(feature = "tx", feature = "bench"))]
+#[cfg(feature = "tx")]
 #[derive(Clone, Copy)]
 pub struct Sol950Saved {
     pub regs: [(u8, u16); 9],
@@ -549,9 +549,9 @@ pub struct Sol950Saved {
     pub narrow: bool,
 }
 
-/// Start SOL950 bench carrier-stepping on the keyed BK4829: saves modified registers and initial frequency
+/// Start SOL950 carrier-stepping on the keyed BK4829: saves modified registers and initial frequency
 /// `base_hz`, enters `Source::Tones` (`REG_30 = 0xC3FA`, mic off, Tone 1 off).
-#[cfg(all(feature = "tx", feature = "bench"))]
+#[cfg(feature = "tx")]
 pub fn sol950_bk_prime<B: Bus>(bk: &mut Bk4829<B>, _dev: u16, _g0: u8, narrow: bool) -> Sol950Saved {
     let regs = [0x38u8, 0x39, 0x70, 0x71, 0x47, 0x7E, 0x29, 0x2B, 0x40].map(|r| (r, bk.read(r)));
     let base_hz = bk.freq();
@@ -562,7 +562,7 @@ pub fn sol950_bk_prime<B: Bus>(bk: &mut Bk4829<B>, _dev: u16, _g0: u8, narrow: b
 
 /// Set SOL950 frequency step (`hz` absolute), latching via VCO bit-15 toggle (`bit15_only = true`:
 /// `0x43FA -> 0xC3FA`) or full `tx_on` (`0x0200 -> 50 us -> 0xC3FA`).
-#[cfg(all(feature = "tx", feature = "bench"))]
+#[cfg(feature = "tx")]
 pub fn sol950_bk_freq<B: Bus>(bk: &mut Bk4829<B>, hz: u32, bit15_only: bool, narrow: bool) {
     bk.set_freq(hz);
     if bit15_only {
@@ -574,7 +574,7 @@ pub fn sol950_bk_freq<B: Bus>(bk: &mut Bk4829<B>, hz: u32, bit15_only: bool, nar
 }
 
 /// Restore all registers saved by [`sol950_bk_prime`] before unkey completes.
-#[cfg(all(feature = "tx", feature = "bench"))]
+#[cfg(feature = "tx")]
 pub fn sol950_bk_end<B: Bus>(bk: &mut Bk4829<B>, saved: &Sol950Saved) {
     for &(r, v) in &saved.regs {
         bk.write(r, v);

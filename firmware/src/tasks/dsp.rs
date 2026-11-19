@@ -436,6 +436,7 @@ pub async fn task() {
                         DecoderKind::Afsk => Decoder::afsk(),
                         DecoderKind::Pocsag => Decoder::pocsag(),
                         DecoderKind::Dsc => Decoder::dsc(),
+                        DecoderKind::Sol950 => Decoder::sol950(),
                     };
                 }
                 // PWR-26.9: AFSK only while the APRS slot's squelch is open, and its tail; the pager decoder always
@@ -460,6 +461,29 @@ pub async fn task() {
                     audio::capture_stop();
                 }
                 capturing = want;
+            }
+            Either4::First(DspCmd::Sol950Finish) => {
+                if running == DecoderKind::Sol950 {
+                    if capturing {
+                        audio::capture_stop();
+                    }
+                    use ferrite_core::sol950::usol950::{Decoded, MAX_DECODED};
+                    let mut out = [Decoded::EMPTY; MAX_DECODED];
+                    let n = slot.sol950_finish(&mut out);
+                    for d in &out[..n] {
+                        if crate::chan::SOL950_RX.try_send(*d).is_err() {
+                            DROPPED.fetch_add(1, Relaxed);
+                        }
+                    }
+                    if n != 0 {
+                        crate::chan::TERM_WAKE.signal(());
+                    }
+                    if capturing {
+                        clock::for_audio().await;
+                        dec = decim(listen);
+                        audio::capture_start();
+                    }
+                }
             }
             Either4::First(DspCmd::Beep { .. }) => {} // beeps are the BK4829's (SND-11)
             Either4::Second(half) => {
