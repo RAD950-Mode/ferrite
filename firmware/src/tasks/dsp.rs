@@ -505,6 +505,19 @@ pub async fn task() {
                     }
                 }
             }
+            Either4::First(DspCmd::Sol950Reset) => {
+                if running == DecoderKind::Sol950 {
+                    if capturing {
+                        audio::capture_stop();
+                    }
+                    slot.sol950_reset();
+                    if capturing {
+                        clock::for_audio().await;
+                        dec = decim(listen);
+                        audio::capture_start();
+                    }
+                }
+            }
             Either4::First(DspCmd::Beep { .. }) => {} // beeps are the BK4829's (SND-11)
             Either4::Second(half) => {
                 // APRS-56.4: the half's wake and work times, bench builds only (decision 363)

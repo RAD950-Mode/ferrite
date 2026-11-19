@@ -13,9 +13,13 @@ use std::f64::consts::TAU;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write};
 use std::process::{Command, ExitCode, Stdio};
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+/// Optional slot phase offset in ms (`--slot-offset-ms`), used indoors to align with a radio lacking GPS UTC.
+static SLOT_OFFSET_MS: AtomicI64 = AtomicI64::new(0);
 
 use usol950::frame::{decode_grid4, encode_grid4};
 use usol950::{
@@ -33,8 +37,8 @@ const NCO1_PERIOD: usize = 12;
 /// Exact `+1,500 Hz` NCO frequency at 24 kHz (`1_500 / 24_000 = 1 / 16`).
 const NCO2_PERIOD: usize = 16;
 
-/// RX capture duration inside each 10.0 s UTC slot (leaves 550 ms guard for HackRF turnaround).
-const RX_SLOT_MS: u64 = 9_450;
+/// RX capture duration inside each 10.0 s UTC slot (covers +0.00s..+9.45s, capturing the full +0.40s..+9.20s burst).
+const RX_SLOT_MS: u64 = 9_050;
 /// TX lead-in silence before symbol 0 (RAD950 nominal burst start = +400 ms).
 const TX_LEAD_MS: usize = 400;
 /// TX trailing silence after last symbol.
@@ -263,6 +267,7 @@ fn usage() {
     eprintln!("  --dry-tx                  Dry TX safety mode (synthesize without keying HackRF)");
     eprintln!("  --tx-once                 Transmit a single CQ immediately and exit (for bench/OTA tests)");
     eprintln!("  --log <PATH>              QSO log file path (default: rad950_hackrf.log)");
+    eprintln!("  --slot-offset-ms <MS>     Shift 10 s slot clock by signed ms (for indoor non-GPS bench sync)");
     eprintln!("  --loopback                Run offline TX->2.4MS/s cs8->RX DDC->Decoder self-test");
     eprintln!("  -h, --help                Show this help");
 }
@@ -331,10 +336,12 @@ fn format_grid(g: u16) -> String {
 }
 
 fn utc_now_ms() -> u64 {
-    SystemTime::now()
+    let raw = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
-        .as_millis() as u64
+        .as_millis() as i128;
+    let off = SLOT_OFFSET_MS.load(Ordering::Relaxed) as i128;
+    (raw + off).max(0) as u64
 }
 
 fn format_utc_hms(utc_sec: u64) -> String {
@@ -686,7 +693,7 @@ fn receive_slot(cfg: &NodeConfig, state: &Arc<Mutex<SharedState>>) -> Result<(Ve
         "-n",
         &n_samples.to_string(),
         "-a",
-        if cfg.amp { "1" } else { "0" },
+        if cfg.amp && cfg.lna_db >= 32 { "1" } else { "0" },
         "-p",
         "0",
         "-l",
@@ -973,14 +980,23 @@ fn slot_worker(state: Arc<Mutex<SharedState>>) {
         }
 
         let now_ms = utc_now_ms();
-        let rem_ms = 10_000 - (now_ms % 10_000);
-        if (now_ms % 10_000) > 250 {
+        let in_slot = now_ms % 10_000;
+        let rem_ms = 10_000 - in_slot;
+        // Peek whether the upcoming slot will TX so we pre-trigger 350 ms early for TX synth,
+        // while RX starts right at the 0 ms slot boundary to capture the full +0.40s..+9.20s burst.
+        let next_slot = (now_ms + rem_ms + 50) / 10_000;
+        let will_tx = last_tx_slot.is_none_or(|prev| next_slot >= prev + 2) && {
+            let st = state.lock().unwrap();
+            !st.tx_queue.is_empty() || (st.auto_cq && (next_slot % 2 == st.cq_parity))
+        };
+        let lead_ms = if will_tx { 350 } else { 0 };
+        if in_slot > 250 && rem_ms > lead_ms {
             {
                 let mut st = state.lock().unwrap();
                 st.phase = SlotPhase::Waiting;
                 st.phase_note = "Syncing to next 10s UTC slot...".to_string();
             }
-            let mut left = rem_ms;
+            let mut left = rem_ms - lead_ms;
             while left > 0 {
                 if !state.lock().unwrap().running {
                     return;
@@ -991,7 +1007,8 @@ fn slot_worker(state: Arc<Mutex<SharedState>>) {
             }
         }
 
-        let slot_ms = utc_now_ms();
+        // Round to nearest 10s slot boundary.
+        let slot_ms = utc_now_ms() + 500;
         let slot = slot_ms / 10_000;
         let utc_sec = slot * 10;
 
@@ -1841,6 +1858,16 @@ fn main() -> ExitCode {
             "--log" if i + 1 < args.len() => {
                 i += 1;
                 log_path = args[i].clone();
+            }
+            "--slot-offset-ms" if i + 1 < args.len() => {
+                i += 1;
+                match args[i].parse::<i64>() {
+                    Ok(ms) => SLOT_OFFSET_MS.store(ms, Ordering::Relaxed),
+                    Err(_) => {
+                        eprintln!("invalid --slot-offset-ms '{}'", args[i]);
+                        return ExitCode::from(2);
+                    }
+                }
             }
             other => {
                 eprintln!("unknown argument: {other}");

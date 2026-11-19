@@ -1732,6 +1732,10 @@ async fn sol950_step(
         }
     }
 
+    if app.sol950_take_reset() {
+        let _ = crate::chan::DSP.try_send(DspCmd::Sol950Reset);
+    }
+
     if let Some((utc_slot, dial_hz, coop_capture)) = app.sol950_take_finish() {
         let _ = crate::chan::DSP.try_send(DspCmd::Sol950Finish { utc_slot, dial_hz, coop_capture });
     }

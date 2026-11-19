@@ -158,6 +158,13 @@ impl Decoder {
         }
     }
 
+    /// Reset the SOL950 receiver for a fresh 10 s RX slot without running `finish_slot` (used after a TX slot).
+    pub fn sol950_reset(&mut self) {
+        if self.kind == DecoderKind::Sol950 {
+            unsafe { (&mut *self.inner.sol950).reset() };
+        }
+    }
+
     /// Finish the current 10 s SOL950 UTC slot, write decoded frames to `out`, and reset for the next slot.
     #[inline(never)]
     pub fn sol950_finish(&mut self, out: &mut [usol950::Decoded; usol950::MAX_DECODED]) -> usize {

@@ -734,12 +734,16 @@ pub struct Sol950Host {
     finish_dial_hz: u32,
     finish_coop_capture: bool,
     pub finish_sent_slot: u32,
+    /// Last 10 s UTC slot that ran TX (so the following RX slot resets `usol950::Receiver` cleanly).
+    pub tx_slot: u32,
     /// A live SOL950 TX burst is currently keyed on BK4829.
     pub tx_in_flight: bool,
     /// Next frame staged by `Engine::on_slot_start` for the platform to hand to `SOL950_TX` + `RadioCmd::Sol950Tx`.
     pub pending_tx: Option<(Freq10, u8, Frame)>,
     /// True when the platform should send `DspCmd::Sol950Finish` at the end of the active RX slot.
     pub finish_due: bool,
+    /// True when the platform should send `DspCmd::Sol950Reset` to clear muted TX-slot samples before RX.
+    pub reset_due: bool,
     /// Set true only after durable storage confirms a completed contact was written.
     pub saved_ack: bool,
     /// Set true if durable flash log is full (non-overwriting).
@@ -810,9 +814,11 @@ impl Sol950Host {
             finish_dial_hz: 0,
             finish_coop_capture: false,
             finish_sent_slot: u32::MAX,
+            tx_slot: u32::MAX,
             tx_in_flight: false,
             pending_tx: None,
             finish_due: false,
+            reset_due: false,
             saved_ack: false,
             log_full: false,
             last_qso: None,
@@ -919,8 +925,11 @@ impl Sol950Host {
         // Advance the session state machine on each 10 s UTC slot boundary.
         if slot != self.last_slot {
             // Safety net: if the previous slot rolled over before `ms_in_sec >= 940` was polled, still
-            // flush the RX decoder once so no slot is ever silently dropped.
-            if self.last_slot != u32::MAX && self.finish_sent_slot != self.last_slot && !self.tx_in_flight {
+            // flush the RX decoder once so no slot is ever silently dropped. If the previous slot was a
+            // TX slot, reset the DSP receiver cleanly so muted TX-slot audio does not lock out RX acquisition.
+            if self.last_slot != u32::MAX && self.last_slot == self.tx_slot {
+                self.reset_due = true;
+            } else if self.last_slot != u32::MAX && self.finish_sent_slot != self.last_slot && !self.tx_in_flight {
                 self.finish_sent_slot = self.last_slot;
                 self.queue_finish();
             }
@@ -940,6 +949,7 @@ impl Sol950Host {
                         self.tx_tones = ferrite_core::sol950::usol950::encode_tones(frame);
                         self.pending_tx = Some((rf_freq, self.profile.tx_power, frame));
                         self.finish_sent_slot = slot; // TX slot: never fire spurious RX finish at +9.55 s
+                        self.tx_slot = slot;
                     }
                 }
                 return;
@@ -961,6 +971,7 @@ impl Sol950Host {
                     self.tx_tones = ferrite_core::sol950::usol950::encode_tones(frame);
                     self.pending_tx = Some((rf_freq, self.profile.tx_power, frame));
                     self.finish_sent_slot = slot; // TX slot: never fire spurious RX finish at +9.55 s
+                    self.tx_slot = slot;
                 } else {
                     self.engine.on_tx_missed_deadline(slot);
                     if !self.utc_ready() {
@@ -980,6 +991,7 @@ impl Sol950Host {
                         self.tx_tones = ferrite_core::sol950::usol950::encode_tones(frame);
                         self.pending_tx = Some((rf_freq, self.profile.tx_power, frame));
                         self.finish_sent_slot = slot;
+                        self.tx_slot = slot;
                     }
                 }
             }
@@ -1052,6 +1064,9 @@ impl Sol950Host {
 
     pub fn on_tx_done(&mut self, ok: bool) {
         self.tx_in_flight = false;
+        if self.last_slot != u32::MAX && self.last_slot != self.tx_slot {
+            self.reset_due = true;
+        }
         if self.chat.is_open() {
             self.chat.on_tx_done(ok);
             return;
@@ -1162,6 +1177,11 @@ impl App {
             && h.utc_ready()
             && h.profile.dial().saturating_mul(10) == h.finish_dial_hz;
         Some((h.finish_utc_slot, h.finish_dial_hz, coop_capture))
+    }
+
+    /// Take the `DspCmd::Sol950Reset` trigger after a TX slot so the DSP receiver restarts cleanly at 0.00 s.
+    pub fn sol950_take_reset(&mut self) -> bool {
+        self.sol950d.as_deref_mut().is_some_and(|h| core::mem::take(&mut h.reset_due))
     }
 
     /// Maximum sleep duration (ms) for the UI task while SOL950 is active, so `DspCmd::Sol950Finish`

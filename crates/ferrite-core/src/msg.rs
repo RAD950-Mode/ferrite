@@ -312,6 +312,9 @@ pub enum DspCmd {
     /// `dial_hz` were captured at the slot start. `coop_capture` keeps reports from slots before Capture was armed
     /// out of the browser Cooperative RX transport.
     Sol950Finish { utc_slot: u32, dial_hz: u32, coop_capture: bool },
+    /// SOL950 post-TX slot reset: stop capture, reset the `usol950::Receiver` without running LDPC decode
+    /// (discarding muted TX-slot audio), and resume capture cleanly at the next 10 s RX slot boundary.
+    Sol950Reset,
 }
 
 /// PWR-26.9: how long the AFSK capture runs on after the APRS slot's squelch closes (the frame's last flags).

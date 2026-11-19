@@ -193,4 +193,47 @@ A carrier capture proves the fixture. For the **SOL950 TX waveform** measurement
 - **RT-950 Pro (`NQ6N`) → HackRF One (`NQ6NA`) live OTA TX:**
   - Pressed `OK` (Answer) on `NQ6NA` on the RT-950 Pro (`RAD950 QSO`, `28.078 MHz`, `Low` power, `dry=0`).
   - HackRF One (`rad950_hackrf --band 10m --ppm 43.7 --lna 0 --vga 16 --rx-once`, RF amp off) decoded live over the air: `Rx { sender: NQ6N, recipient: NQ6NA, snr_db: +7, ack: false }` at `938 Hz`, `-24 dB` SNR.
+- **Uninterrupted interactive OTA QSO with matching logs at both ends (2026-11-19 22:32Z):**
+  - **Root causes fixed during interactive end-to-end testing:**
+    1. **Firmware post-TX RX reset (`DspCmd::Sol950Reset`):** Previously, `Sol950Host::update_clock()` suppressed `Sol950Finish` at `+9.55 s` during TX slots (`finish_sent_slot = slot`), leaving `usol950::Receiver` un-reset after TX while muted TX-slot audio advanced `sym` past the 18-symbol acquisition window (`acquired = true`), blinding the radio during the RX slot immediately following any TX. Added `DspCmd::Sol950Reset` (`crates/ferrite-core/src/msg.rs`, `crates/ferrite-core/src/decoders.rs`, `crates/ferrite-app/src/sol950.rs`, `firmware/src/tasks/dsp.rs`, `firmware/src/tasks/ui.rs`) so the DSP receiver resets cleanly at `0.00 s` of every RX slot following a TX slot.
+    2. **Interactive HackRF TUI slot turnaround (`digimodes/usol950/examples/rad950_hackrf.rs`):** Added `--slot-offset-ms` for indoor non-GPS slot alignment, lowered `RX_SLOT_MS` (`9_450 -> 9_050`) so the `350 ms` TX pre-trigger fires on time immediately after an RX slot, and bypassed the HackRF RX RF amp for `--lna < 32` so `--lna 8 --vga 24` decodes the nearby handheld cleanly without front-end overload (`-3 dB` SNR vs `-24 dB` at `--lna 0 --vga 16`).
+  - **Single uninterrupted interactive session (`rad950_hackrf` TUI `c` ↔ RT-950 Pro `RAD950` `OK`, `28.078 MHz` 10m, `--ppm 43.7 --lna 8 --vga 24 --tx-gain 47 --amp --slot-offset-ms -2690`):**
+    1. `22:32:00Z` — HackRF (`NQ6NA`, interactive `c`) transmitted `CQ NQ6NA FN31` (`1050 Hz`).
+    2. RT-950 Pro (`NQ6N`) decoded `NQ6NA FN31 NEW 9dB` (`dec=1`); operator pressed `OK` (Answer).
+    3. `22:32:40Z` — RT-950 Pro (`NQ6N`, Low power, `dry=0`) transmitted `RX NQ6NA de NQ6N +7dB`; HackRF decoded it live (`rx=-3dB tx=+7dB`), logged `NQ6N`, and automatically queued `R+RX -3dB` in the same session.
+    4. `22:32:50Z` — HackRF (`NQ6NA`) transmitted `NQ6N de NQ6NA R+RX -3dB` (`1050 Hz`); RT-950 Pro (`NQ6N`) decoded it live (`dec=2`, `sym=119`, `-9 dB` RX SNR, `-3 dB` reported TX SNR), updated `Operate` to `WKD*`, displayed `Saved to flash log` / `Saved - NEW GRID!`, and persisted the QSO to SPI flash.
+  - **Matching logged entries at both ends:**
+    - **HackRF (`/tmp/sol950-lab/ota_qso.log`):**
+      `22:32:40Z  28.078 MHz  NQ6N        grid=----  rx=-3dB  tx=+7dB`
+    - **RT-950 Pro (`RAD950 Log` / `Log Detail`, SPI flash):**
+      `Saved contacts: 1` · `NQ6NA FN31  -9/-3dB` · `My: NQ6N (FN31)` · `SNR RX -9 / TX -3 dB` · `Dial: 28.078 MHz` · `UTC 21:15:59 #1` (bench monotonic UTC; `TX -3 dB` matches HackRF's live `rx=-3dB` report).
 - **On-MCU stability:** Resolved stack headroom (`ui::task` `12,096 B -> 6,560 B`, `dsp::feed` `5,536 B -> <1,600 B`, `Decoder::switch` `4,800 B -> <100 B`), Low Power Mode 24 MHz DSP starvation, World Map `lcd.rows()` band clipping, and PTT exit behavior; verified 231+ consecutive live 10-second RX slots with zero crashes.
+
+## Conducted RAD950 transmitter measurements with the Siglent SSA3021X
+
+Use an ordinary RAD950 CQ so the capture includes the behavior of the operating firmware from key-up through unkey. Start on 10 m at Low power and use the same CQ payload and subchannel for repeats. The earlier 10 m HackRF capture supplies a baseline for tone spacing, symbol timing, and occupied bandwidth. This measurement pass adds calibrated burst power, a wider spur survey, and comparable traces across the rendezvous bands. [Earlier TX measurements](#measured-bench-results-nq6n-fn31-2026-11-18) · [SSA3000X user manual](https://siglentna.com/wp-content/uploads/dlm_uploads/2017/10/SSA3000X_User-Manual_UM0703X_E02B.pdf)
+
+### Connect and calibrate the sample path
+
+```text
+RT-950 Pro RF out ──► IN [directional coupler] THRU ──► rated 50 Ω dummy load
+                              FWD sample ──► fixed attenuator ──► SSA3021X RF INPUT
+```
+
+- Use 50 Ω RF components. Verify the coupler orientation, the dummy load's rating for the intended burst power and repetition rate, and the termination required at the unused coupler port.
+- Calculate the maximum at the analyzer from the highest credible radio output minus the minimum coupling loss and minimum external pad loss. With **10 W (+40 dBm)**, a nominal **20 dB coupler** and **30 dB external pad** give **−10 dBm nominal** at the analyzer. The first pad sees **+20 dBm (100 mW) nominal** in that example. Rate it with margin for the actual coupling tolerance. Recalculate for the coupler and pads on the bench.
+- Start with **preamp off**, **tracking generator off**, **20 dB manual input attenuation**, and **0 dBm reference level**. Keep the external pad in the sample line. Capture a radio-unkeyed baseline before measuring the first burst.
+- Measure or record the loss from the coupler input to the analyzer at the fundamental and the frequencies where harmonics or spurs will be measured. Use that frequency-specific loss to refer readings back to the radio jack. Where the path is uncharacterized, record the analyzer reading and mark the correction as unknown. [Coupler and load setup](#wire-the-load-and-forward-sample)
+
+### Measurement sequence
+
+| Measurement | Analyzer starting settings | What to save |
+| --- | --- | --- |
+| **Burst power and envelope** | Center on the actual RF burst, midway between the lowest and highest tones. Use zero span, **10 kHz RBW**, about **12 s** sweep time, and a video trigger if convenient. | Trace from key-up through unkey. Record flat-top power during the burst, corrected to the radio jack, in dBm and watts. Record lead-in, burst duration, any droop, and unkey behavior. Compare the symbol portion with the nominal **8.8 s** frame. Repeat at each supported power setting. |
+| **Harmonics and other spurs** | Start with a **10–200 MHz** overview in max hold across repeated identical bursts. Zoom in on the second through fifth harmonics and any other suspect peaks. Adjust RBW and sweep time to resolve the peak from the noise floor. | For each suspect emission, record RF frequency, RBW, measured input level, loss correction, and level at the radio jack. Report dBc relative to the corrected fundamental burst power, with the reference identified. Repeat with **10 dB more attenuation** and correct for the added loss. A genuine transmitter spur should stay near its prior corrected level. Use the radio-unkeyed baseline to identify signals already present. |
+| **Close-in spectrum** | Center on the actual RF burst. Start with **5 kHz span** and **10–30 Hz RBW**. Repeat the same CQ for max-hold screening. | Tone centers and spacing, spectral skirts, and excursions toward the **225 Hz** neighboring subchannels. Save span, RBW, detector, and sweep time with each trace. For quantitative adjacent-subchannel power, **99% occupied bandwidth**, or sub-millisecond PLL relock, analyze complete HackRF IQ bursts. The swept max-hold trace serves as a peak survey. |
+| **Frequency offset and warm-up drift** | Use a steady test tone at a known commanded RF frequency. Compare a cold measurement with one after several minutes of typical operation. Use a known **10 MHz reference** at the analyzer if available. | Commanded and measured RF in Hz, offset, elapsed time, band, and reference used. Treat an internal-reference reading as relative to the analyzer. At **28 MHz**, a 1 ppm reference error corresponds to **28 Hz**. |
+
+Once 10 m produces a repeatable baseline, repeat the envelope, harmonic survey, and close-in capture on **12 m, 15 m, and 17 m** wherever the firmware has a supported, calibrated TX path. Start at Low power on each band. Record a refusal or unavailable calibration directly in the test log. The current live 12 m result establishes handheld RX, while the conducted measurements will establish handheld TX behavior there. [Live OTA results](#live-over-the-air-two-way-verification-nq6n-rt-950-pro--nq6na-hackrf-one-2026-11-19)
+
+For each run, log **firmware revision, UTC, band, USB dial, subchannel, power setting, battery or supply voltage, coupler and pad IDs, loss calibration, analyzer settings, and trace filenames**. Save a CSV trace where available and a screenshot of the instrument settings. Use the same signal and settings when comparing firmware, bands, or power levels.
