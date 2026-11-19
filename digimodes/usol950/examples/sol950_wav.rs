@@ -988,6 +988,12 @@ fn print_decoded(burst_start_ms: i64, d: &Decoded) {
                 d.audio_hz, d.snr_db, snr_db
             );
         }
+        Frame::ExtFrag { kind, idx, tag, .. } => {
+            println!(
+                "t={burst_start_ms:6} ms | {:4} Hz | {:+3} dB | EXT kind={kind} idx={idx} tag=0x{tag:02x}",
+                d.audio_hz, d.snr_db
+            );
+        }
     }
 }
 

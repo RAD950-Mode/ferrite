@@ -11,11 +11,13 @@
 #![no_std]
 #![allow(clippy::needless_range_loop)]
 
+pub mod ext;
 pub mod frame;
 pub mod ldpc;
 pub mod phy;
 pub mod rx;
 
+pub use ext::{encode_ext_cq, encode_ext_rx, ExtMsg, ExtReassembler, StationId};
 pub use frame::{CallError, Callsign, Frame, GRID_MAX, GRID_UNKNOWN};
 pub use phy::{encode_tones, Modulator, DEFAULT_SPACING_HZ, N_SYMBOLS, SUBCHANNELS_HZ};
 pub use rx::{Decoded, Receiver, MAX_DECODED};

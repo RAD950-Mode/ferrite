@@ -253,6 +253,14 @@ pub enum Frame {
         ack: bool,
         reserved: bool,
     },
+    /// Extension fragment (`bit 63 = 1 | bits 62..57 = 0b111111 | 2b kind | 2b idx | 8b tag | 45b payload`).
+    /// Strictly rejected by legacy decoders because `s_raw >= 0x0FC0_0000 > Callsign::MAX_RAW`.
+    ExtFrag {
+        kind: u8,
+        idx: u8,
+        tag: u8,
+        payload: u64,
+    },
 }
 
 impl Frame {
@@ -274,12 +282,27 @@ impl Frame {
                     | ((ack as u64) << 1)
                     | (reserved as u64)
             }
+            Frame::ExtFrag { kind, idx, tag, payload } => {
+                (1u64 << 63)
+                    | (crate::ext::EXT_MARKER_BITS << 57)
+                    | ((kind as u64 & 0x03) << 55)
+                    | ((idx as u64 & 0x03) << 53)
+                    | ((tag as u64 & 0xFF) << 45)
+                    | (payload & crate::ext::FRAG_MASK)
+            }
         }
     }
 
     /// Unpack a 64-bit payload (`None` if either 28-bit callsign value exceeds [`Callsign::MAX_RAW`]).
     pub const fn unpack_u64(w: u64) -> Option<Self> {
         let typ = (w >> 63) & 1;
+        if typ == 1 && ((w >> 57) & 0x3F) == crate::ext::EXT_MARKER_BITS {
+            let kind = ((w >> 55) & 0x03) as u8;
+            let idx = ((w >> 53) & 0x03) as u8;
+            let tag = ((w >> 45) & 0xFF) as u8;
+            let payload = w & crate::ext::FRAG_MASK;
+            return Some(Frame::ExtFrag { kind, idx, tag, payload });
+        }
         let s_raw = ((w >> 35) & 0x0FFF_FFFF) as u32;
         let Some(sender) = Callsign::from_raw(s_raw) else {
             return None;

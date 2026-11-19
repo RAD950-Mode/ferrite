@@ -451,6 +451,7 @@ impl Engine {
                         }
                     }
                 }
+                Frame::ExtFrag { .. } => {}
             }
         }
         n_logged
