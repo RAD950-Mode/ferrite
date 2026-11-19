@@ -799,6 +799,7 @@ impl Sol950Host {
                         self.tx_subch_hz = subchannel_hz;
                         self.tx_tones = ferrite_core::sol950::usol950::encode_tones(frame);
                         self.pending_tx = Some((rf_freq, self.profile.tx_power, frame));
+                        self.finish_sent_slot = slot; // TX slot: never fire spurious RX finish at +9.55 s
                     }
                 }
                 return;
@@ -810,6 +811,7 @@ impl Sol950Host {
                     self.tx_subch_hz = subchannel_hz;
                     self.tx_tones = ferrite_core::sol950::usol950::encode_tones(frame);
                     self.pending_tx = Some((rf_freq, self.profile.tx_power, frame));
+                    self.finish_sent_slot = slot; // TX slot: never fire spurious RX finish at +9.55 s
                 } else {
                     self.engine.on_tx_missed_deadline(slot);
                     if !self.utc_ready() {

@@ -1631,4 +1631,113 @@ mod tests {
             assert!(zone_freqs.contains(f), "{f} is not one of the zone's channels {zone_freqs:?}");
         }
     }
+
+    #[test]
+    fn rad950_qso_to_chat_workflow_works_in_sim() {
+        use ferrite_app::rad950_chat::{ChatDelivery, ChatPhase};
+        use ferrite_core::keys::Key;
+
+        let mut s = SimCore::new(1, false);
+        run(&mut s, 0, 2500);
+        let mut t = 2520u32;
+        let tap = |s: &mut SimCore, k: Key, t: &mut u32| {
+            s.key(k, true);
+            s.step(*t);
+            *t += 60;
+            s.key(k, false);
+            s.step(*t);
+            *t += 80;
+        };
+
+        // 1. Open RAD950 via MENU 0 3 7
+        for k in [Key::Menu, Key::Digit(0), Key::Digit(3), Key::Digit(7)] {
+            tap(&mut s, k, &mut t);
+        }
+        assert!(s.app.sol950_open(), "RAD950 should be open: {}", s.screen_name());
+
+        // 2. Step until a simulated CQ caller appears (up to 15 s)
+        let mut saw_peer = false;
+        for _ in 0..750 {
+            t += 20;
+            s.step(t);
+            if s.app.sol950_host().is_some_and(|h| {
+                let mut rows = [ferrite_core::sol950::ActivityRow {
+                    peer: ferrite_core::sol950::usol950::Callsign::from_raw(0).unwrap(),
+                    grid4: 0,
+                    snr_db: 0,
+                    last_seen_slot: 0,
+                    window: 0,
+                    owed_reply: None,
+                    logged: false,
+                }; ferrite_core::sol950::MAX_PEERS];
+                h.engine.activity_rows(&mut rows) > 0
+            }) {
+                saw_peer = true;
+                break;
+            }
+        }
+        assert!(saw_peer, "should hear a simulated CQ caller on Operate");
+
+        // 3. Press OK to answer the caller, then step until QSO completes & saves (up to 35 s)
+        tap(&mut s, Key::Menu, &mut t);
+        let mut saved = false;
+        for _ in 0..1750 {
+            t += 20;
+            s.step(t);
+            if s.app.sol950_host().is_some_and(|h| h.saved_ack && h.last_qso.is_some()) {
+                saved = true;
+                break;
+            }
+        }
+        if !saved {
+            let h = s.app.sol950_host().unwrap();
+            panic!(
+                "QSO did not save: call={:?} utc_ready={} state={:?} saved_ack={} last_qso={:?} screen={}",
+                h.profile.callsign(),
+                h.utc_ready(),
+                h.engine.mode(),
+                h.saved_ack,
+                h.last_qso,
+                s.screen_name()
+            );
+        }
+
+        // 4. Press 2 (Chat) to invite the completed QSO peer, then step until peer accepts + asks antenna question
+        tap(&mut s, Key::Digit(2), &mut t);
+        assert_eq!(s.screen_name(), "RAD950 Chat");
+        let mut active_with_q = false;
+        for _ in 0..1500 {
+            t += 20;
+            s.step(t);
+            if s.app.sol950_host().is_some_and(|h| h.chat.phase == ChatPhase::Active && h.chat.entry_count >= 1) {
+                active_with_q = true;
+                break;
+            }
+        }
+        assert!(active_with_q, "peer should accept invite and ask antenna question");
+
+        // 5. Press OK (Reply -> My station auto-highlighted) -> OK (Preview) -> OK (Send)
+        tap(&mut s, Key::Menu, &mut t);
+        assert_eq!(s.screen_name(), "RAD950 Reply");
+        tap(&mut s, Key::Menu, &mut t);
+        assert_eq!(s.screen_name(), "RAD950 Send");
+        tap(&mut s, Key::Menu, &mut t);
+        assert_eq!(s.screen_name(), "RAD950 Chat");
+
+        // 6. Step until our StationCard is Delivered (1st TX turn sends ACK for peer's question, 2nd sends StationCard)
+        let mut delivered = false;
+        for _ in 0..2500 {
+            t += 20;
+            s.step(t);
+            if s.app.sol950_host().is_some_and(|h| {
+                h.chat.entries[..h.chat.entry_count as usize]
+                    .iter()
+                    .any(|e| e.from_me && e.status == ChatDelivery::Delivered)
+            }) {
+                delivered = true;
+                break;
+            }
+        }
+        assert!(delivered, "StationCard should transmit and become Delivered in simulator");
+    }
 }
