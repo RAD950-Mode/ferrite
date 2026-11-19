@@ -637,9 +637,9 @@ impl Sol950Scr {
             .n(coop_link as u32)
             .n(rx_distress.map_or(0, |d| d.alert.sender.raw() ^ ((d.status as u32) << 28)))
             .get();
-        if let Some(clear) = app.dirty_shape(R_TOP, top_h, false) {
+        if app.dirty(R_TOP, top_h) {
             let y0 = TOP_Y;
-            redraw_box!(clear, lcd, (0, y0, W, 44, BG), {
+            redraw_box!(true, lcd, (0, y0, W, 44, BG), {
                 if let Some(inc) = rx_distress {
                     use crate::rad950_chat::DistressRxStatus;
                     lcd.fill(0, y0, W, 43, RED);
@@ -726,12 +726,12 @@ impl Sol950Scr {
                     .n(r.snr_db as u32)
                     .n(r.logged as u32);
             }
-            if let Some(clear) = app.dirty_shape(R_ROW + i, rh.get(), selected) {
+            if app.dirty(R_ROW + i, rh.get()) {
                 let y = list_y + i as i32 * row_h;
                 let bg = if selected { BLUE } else { BG };
                 let fg = if selected { BLUE_FG } else { TEXT };
                 let dim = if selected { BLUE_FG } else { DIM };
-                redraw_box!(clear || selected, lcd, (0, y, W, row_h, bg), {
+                redraw_box!(true, lcd, (0, y, W, row_h, bg), {
                     if let Some(r) = row {
                         let mut cb = [0u8; 6];
                         let cn = r.peer.decode(&mut cb);
@@ -772,13 +772,13 @@ impl Sol950Scr {
         let tx_now = h.tx_in_flight;
         let slot_sec = if h.utc_sec == 0 { 0 } else { (h.utc_sec % 10) as u8 };
         let wf_h = Mix::new().n(seq).n(slot_sec as u32).n(tx_now as u32).get();
-        if let Some(clear) = app.dirty_shape(R_NOTE, wf_h, true) {
+        if app.dirty(R_NOTE, wf_h) {
             let y0 = 210i32;
             let wf_x = 12i32;
             let wf_y = y0 + 18; // 228..276 (48 px tall)
             let wf_w = (WF_COLS * 2) as i32; // 224 px (x = 12..236)
             let wf_ht = (WF_ROWS * 2) as i32; // 48 px
-            redraw_box!(clear, lcd, (0, y0, W, 70, BG), {
+            redraw_box!(false, lcd, (0, y0, W, 70, BG), {
                 lcd.fill(0, y0, W, 1, RULE);
                 lcd.fill(0, y0 + 1, W, 17, BG);
                 lcd.text4(6, y0 + 14, b"586-2344 Hz  225Hz", &UI_12, DIM, BG);
@@ -854,9 +854,9 @@ impl Sol950Scr {
             .n(saved_ack as u32)
             .n(notice_len as u32)
             .get();
-        if let Some(clear) = app.dirty_shape(R_TOP, h, false) {
+        if app.dirty(R_TOP, h) {
             let y0 = TOP_Y;
-            redraw_box!(clear, lcd, (0, y0, W, 180, BG), {
+            redraw_box!(true, lcd, (0, y0, W, 180, BG), {
                 let mut peer_line = Buf::<28>::new();
                 if let Some(r) = active_row {
                     let mut cb = [0u8; 6];
@@ -1000,11 +1000,11 @@ impl Sol950Scr {
                 }
             };
             let rh = Mix::new().n(i as u32).n(selected as u32).b(label).b(val.as_bytes()).get();
-            if let Some(clear) = app.dirty_shape(R_ROW + slot, rh, selected) {
+            if app.dirty(R_ROW + slot, rh) {
                 let y = y0 + slot as i32 * row_h;
                 let bg = if selected { BLUE } else { BG };
                 let fg = if selected { BLUE_FG } else { TEXT };
-                redraw_box!(clear || selected, lcd, (0, y, W, row_h, bg), {
+                redraw_box!(true, lcd, (0, y, W, row_h, bg), {
                     lcd.text4(8, y + 16, label, &UI_12, fg, bg);
                     lcd.text4(W - 96, y + 16, val.as_bytes(), &UI_12, fg, bg);
                 });
@@ -1015,9 +1015,9 @@ impl Sol950Scr {
         let id_len = prof.format_identity(&mut id_buf);
         let (eff_g, _) = prof.effective_grid(gps_grid);
         let ph = Mix::new().b(&id_buf[..id_len]).b(&eff_g).get();
-        if let Some(clear) = app.dirty_shape(R_NOTE, ph, false) {
+        if app.dirty(R_NOTE, ph) {
             let y = y0 + SETUP_VISIBLE as i32 * row_h + 6;
-            redraw_box!(clear, lcd, (0, y, W, 24, BG), {
+            redraw_box!(true, lcd, (0, y, W, 24, BG), {
                 let mut pv = Buf::<32>::new();
                 let id_s = core::str::from_utf8(&id_buf[..id_len]).unwrap_or("?");
                 let g_s = core::str::from_utf8(&eff_g).unwrap_or("----");
@@ -1149,9 +1149,9 @@ impl Sol950Scr {
             .n(full as u32)
             .b(&filter.unwrap_or(*b"----"))
             .get();
-        if let Some(clear) = app.dirty_shape(R_TOP, th, false) {
+        if app.dirty(R_TOP, th) {
             let y0 = TOP_Y;
-            redraw_box!(clear, lcd, (0, y0, W, 24, BG), {
+            redraw_box!(true, lcd, (0, y0, W, 24, BG), {
                 let mut head = Buf::<32>::new();
                 if let Some(gf) = filter {
                     let gs = core::str::from_utf8(&gf).unwrap_or("----");
@@ -1175,12 +1175,12 @@ impl Sol950Scr {
             if let Some(c) = row {
                 rh = rh.n(c.seq).b(&c.peer_id).b(&c.peer_grid);
             }
-            if let Some(clear) = app.dirty_shape(R_ROW + i, rh.get(), selected) {
+            if app.dirty(R_ROW + i, rh.get()) {
                 let y = list_y + i as i32 * row_h;
                 let bg = if selected { BLUE } else { BG };
                 let fg = if selected { BLUE_FG } else { TEXT };
                 let dim = if selected { BLUE_FG } else { DIM };
-                redraw_box!(clear || selected, lcd, (0, y, W, row_h, bg), {
+                redraw_box!(true, lcd, (0, y, W, row_h, bg), {
                     if let Some(c) = row {
                         let ps = core::str::from_utf8(c.peer_bytes()).unwrap_or("?");
                         let gs = core::str::from_utf8(&c.peer_grid).unwrap_or("----");
@@ -1206,9 +1206,9 @@ impl Sol950Scr {
             one[0]
         });
         let h = Mix::new().n(self.sel as u32).n(rec.map_or(0, |r| r.seq)).get();
-        if let Some(clear) = app.dirty_shape(R_TOP, h, false) {
+        if app.dirty(R_TOP, h) {
             let y0 = TOP_Y + 6;
-            redraw_box!(clear, lcd, (0, y0, W, 200, BG), {
+            redraw_box!(true, lcd, (0, y0, W, 200, BG), {
                 if let Some(c) = rec {
                     let ps = core::str::from_utf8(c.peer_bytes()).unwrap_or("?");
                     let ms = core::str::from_utf8(c.my_bytes()).unwrap_or("?");
@@ -1271,9 +1271,9 @@ impl Sol950Scr {
             .n(st.best_rx_snr as u32)
             .n(st.best_tx_snr as u32)
             .get();
-        if let Some(clear) = app.dirty_shape(R_TOP, h, false) {
+        if app.dirty(R_TOP, h) {
             let y0 = TOP_Y + 6;
-            redraw_box!(clear, lcd, (0, y0, W, 200, BG), {
+            redraw_box!(true, lcd, (0, y0, W, 200, BG), {
                 let title: &[u8] = if today_mode { b"Today (UTC)" } else { b"All saved" };
                 lcd.text4(10, y0 + 18, title, &UI_15B, BLUE, BG);
                 if today_mode && !utc_known {
@@ -1315,9 +1315,9 @@ impl Sol950Scr {
         for w_word in mask {
             h = h.n(w_word);
         }
-        if let Some(clear) = app.dirty_shape(R_TOP, h.get(), true) {
+        if app.dirty(R_TOP, h.get()) {
             let y0 = TOP_Y;
-            redraw_box!(clear, lcd, (0, y0, W, 240, BG), {
+            redraw_box!(true, lcd, (0, y0, W, 240, BG), {
                 let mut hdr = Buf::<32>::new();
                 let fs = core::str::from_utf8(&fl).unwrap_or("??");
                 let st = if sel_worked { "worked" } else { "empty" };
@@ -1372,9 +1372,9 @@ impl Sol950Scr {
                 h = h.n(c as u32);
             }
         }
-        if let Some(clear) = app.dirty_shape(R_TOP, h.get(), true) {
+        if app.dirty(R_TOP, h.get()) {
             let y0 = TOP_Y;
-            redraw_box!(clear, lcd, (0, y0, W, 240, BG), {
+            redraw_box!(true, lcd, (0, y0, W, 240, BG), {
                 let mut hdr = Buf::<32>::new();
                 let gs = core::str::from_utf8(&g4).unwrap_or("----");
                 let _ = uwrite!(hdr, "Grid {}: {} QSO", gs, sel_cnt);
@@ -1756,9 +1756,9 @@ impl Sol950Scr {
             };
             th = th.n(e.from_me as u32).n(st_key).b(e.bytes());
         }
-        if let Some(clear) = app.dirty_shape(R_TOP, th.get(), false) {
+        if app.dirty(R_TOP, th.get()) {
             let y0 = TOP_Y;
-            redraw_box!(clear, lcd, (0, y0, W, 184, BG), {
+            redraw_box!(true, lcd, (0, y0, W, 184, BG), {
                 let mut cb = [0u8; 6];
                 let cn = peer.decode(&mut cb);
                 let ps = core::str::from_utf8(&cb[..cn]).unwrap_or("?");
@@ -1914,11 +1914,11 @@ impl Sol950Scr {
         for (i, &label) in labels.iter().enumerate().take(n_items) {
             let selected = i == self.sel as usize;
             let rh = Mix::new().n(selected as u32).b(label).get();
-            if let Some(clear) = app.dirty_shape(R_ROW + i, rh, selected) {
+            if app.dirty(R_ROW + i, rh) {
                 let y = y0 + i as i32 * row_h;
                 let bg = if selected { BLUE } else { BG };
                 let fg = if selected { BLUE_FG } else { TEXT };
-                redraw_box!(clear || selected, lcd, (0, y, W, row_h, bg), {
+                redraw_box!(true, lcd, (0, y, W, row_h, bg), {
                     lcd.text4(10, y + 19, label, &UI_14, fg, bg);
                 });
             }
@@ -1966,12 +1966,12 @@ impl Sol950Scr {
                 }
             };
             let rh = Mix::new().n(selected as u32).b(label).b(val.as_bytes()).get();
-            if let Some(clear) = app.dirty_shape(R_ROW + i, rh, selected) {
+            if app.dirty(R_ROW + i, rh) {
                 let y = y0 + i as i32 * row_h;
                 let bg = if selected { BLUE } else { BG };
                 let fg = if selected { BLUE_FG } else { TEXT };
                 let dim = if selected { BLUE_FG } else { DIM };
-                redraw_box!(clear || selected, lcd, (0, y, W, row_h, bg), {
+                redraw_box!(true, lcd, (0, y, W, row_h, bg), {
                     lcd.text4(8, y + 22, label, &UI_14, fg, bg);
                     lcd.text4(W - 96, y + 22, val.as_bytes(), &UI_12, dim, bg);
                 });
@@ -1987,11 +1987,11 @@ impl Sol950Scr {
         for (i, item) in items.iter().enumerate() {
             let selected = i == self.sel as usize;
             let rh = Mix::new().n(selected as u32).b(item.as_bytes()).get();
-            if let Some(clear) = app.dirty_shape(R_ROW + i, rh, selected) {
+            if app.dirty(R_ROW + i, rh) {
                 let y = y0 + i as i32 * row_h;
                 let bg = if selected { BLUE } else { BG };
                 let fg = if selected { BLUE_FG } else { TEXT };
-                redraw_box!(clear || selected, lcd, (0, y, W, row_h, bg), {
+                redraw_box!(true, lcd, (0, y, W, row_h, bg), {
                     let s = item.as_bytes();
                     lcd.text4(8, y + 20, &s[..s.len().min(29)], &UI_12, fg, bg);
                 });
@@ -2004,9 +2004,9 @@ impl Sol950Scr {
         let mut buf = [0u8; 64];
         let (len, bursts, airtime_s) = h.chat.preview_draft(&mut buf);
         let ph = Mix::new().b(&buf[..len]).n(bursts as u32).n(airtime_s as u32).get();
-        if let Some(clear) = app.dirty_shape(R_TOP, ph, false) {
+        if app.dirty(R_TOP, ph) {
             let y0 = TOP_Y + 8;
-            redraw_box!(clear, lcd, (0, y0, W, 220, BG), {
+            redraw_box!(true, lcd, (0, y0, W, 220, BG), {
                 lcd.text4(8, y0 + 16, b"Preview before sending:", &UI_12, DIM, BG);
                 let txt = &buf[..len];
                 // Word-wrap across 2 lines of up to 24 chars each.
@@ -2097,9 +2097,9 @@ impl Sol950Scr {
             .b(&id_buf[..id_len])
             .b(&eff_g)
             .get();
-        if let Some(clear) = app.dirty_shape(R_TOP, dh, false) {
+        if app.dirty(R_TOP, dh) {
             let y0 = TOP_Y + 4;
-            redraw_box!(clear, lcd, (0, y0, W, 232, BG), {
+            redraw_box!(true, lcd, (0, y0, W, 232, BG), {
                 lcd.fill(0, y0, W, 24, RED);
                 lcd.text4(8, y0 + 17, b"SEND DISTRESS ALERT", &UI_14, WHITE, RED);
 
