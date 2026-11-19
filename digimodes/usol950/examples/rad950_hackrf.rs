@@ -1,17 +1,17 @@
-//! Interactive CLI for operating a HackRF One directly as a live RAD950 node.
+//! Interactive TUI for operating a HackRF One directly as a live RAD950 node.
 //!
 //! Uses `usol950` for exact LDPC/sync/frame encoding and decoding, and streams
 //! `2.4 MS/s` signed 8-bit I/Q directly to/from `hackrf_transfer` (`-r -` / `-t -`).
 //!
 //! Quick start:
-//!   cargo run -p usol950 --example rad950_hackrf -- --call NQ6N --grid FN31 --band 10m
-//!   cargo run -p usol950 --example rad950_hackrf -- --loopback
+//!   cargo run --release -p usol950 --example rad950_hackrf -- --call NQ6N --grid FN31 --band 10m --dry-tx
+//!   cargo run --release -p usol950 --example rad950_hackrf -- --loopback
 
 use std::collections::VecDeque;
 use std::env;
 use std::f64::consts::TAU;
 use std::fs::OpenOptions;
-use std::io::{self, BufRead, Read, Write};
+use std::io::{self, Read, Write};
 use std::process::{Command, ExitCode, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -51,6 +51,21 @@ const BANDS: &[(&str, u64)] = &[
     ("17m", 18_104_000),
 ];
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum View {
+    Operate,
+    Settings,
+    Log,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SlotPhase {
+    Waiting,
+    Rx,
+    Tx,
+    DryTx,
+}
+
 #[derive(Clone)]
 struct NodeConfig {
     call: Callsign,
@@ -77,6 +92,7 @@ struct HeardEntry {
     tone_hz: u16,
     last_slot: u64,
     kind: &'static str,
+    worked: bool,
 }
 
 #[derive(Clone)]
@@ -105,33 +121,47 @@ struct SharedState {
     tx_queue: VecDeque<TxJob>,
     heard: Vec<HeardEntry>,
     qso_log: Vec<QsoLogEntry>,
-    active_peer: Option<(Callsign, String, String, i8)>, // (call, str, grid, their_snr_at_us)
+    events: VecDeque<String>,
+    phase: SlotPhase,
+    phase_note: String,
+    peak_pct: f32,
+    wf_bins: [u8; 24],
+    hackrf_banner: String,
     slots_rx: u64,
     slots_tx: u64,
     frames_rx: u64,
 }
 
+impl SharedState {
+    fn push_event(&mut self, msg: String) {
+        self.events.push_back(msg);
+        while self.events.len() > 200 {
+            self.events.pop_front();
+        }
+    }
+}
+
 fn usage() {
-    eprintln!("RAD950 HackRF Direct Node CLI");
+    eprintln!("RAD950 HackRF Direct Node TUI");
     eprintln!();
     eprintln!("Usage:");
     eprintln!("  rad950_hackrf [OPTIONS]");
     eprintln!();
     eprintln!("Options:");
-    eprintln!("  --call <CALL>        Station callsign (default: NQ6N)");
-    eprintln!("  --grid <GRID4|NONE>  4-char Maidenhead grid (default: FN31)");
+    eprintln!("  --call <CALL>             Station callsign (default: NQ6N)");
+    eprintln!("  --grid <GRID4|NONE>       4-char Maidenhead grid (default: FN31)");
     eprintln!("  --band <10m|12m|15m|17m>  RAD950 calling band (default: 10m = 28.078 MHz)");
-    eprintln!("  --freq <HZ>          Custom USB dial frequency in Hz (e.g. 28185000)");
-    eprintln!("  --subch <0..7>       TX audio subchannel index (default: 0 = 600 Hz)");
-    eprintln!("  --lna <0..40>        HackRF RX LNA gain in dB, 8 dB steps (default: 16)");
-    eprintln!("  --vga <0..62>        HackRF RX VGA gain in dB, 2 dB steps (default: 20)");
-    eprintln!("  --tx-gain <0..47>    HackRF TX VGA gain in dB (default: 16)");
-    eprintln!("  --amp                Enable HackRF RF amplifier (default: off)");
-    eprintln!("  --serial <HEX>       HackRF serial number suffix (if multiple connected)");
-    eprintln!("  --dry-tx             Dry TX safety mode (synthesize without keying HackRF)");
-    eprintln!("  --log <PATH>         QSO log file path (default: rad950_hackrf.log)");
-    eprintln!("  --loopback           Run offline TX->2.4MS/s cs8->RX DDC->Decoder self-test");
-    eprintln!("  -h, --help           Show this help");
+    eprintln!("  --freq <HZ>               Custom USB dial frequency in Hz (e.g. 28185000)");
+    eprintln!("  --subch <0..7>            TX audio subchannel index (default: 0 = 600 Hz)");
+    eprintln!("  --lna <0..40>             HackRF RX LNA gain in dB, 8 dB steps (default: 16)");
+    eprintln!("  --vga <0..62>             HackRF RX VGA gain in dB, 2 dB steps (default: 20)");
+    eprintln!("  --tx-gain <0..47>         HackRF TX VGA gain in dB (default: 16)");
+    eprintln!("  --amp                     Enable HackRF RF amplifier (default: off)");
+    eprintln!("  --serial <HEX>            HackRF serial number suffix (if multiple connected)");
+    eprintln!("  --dry-tx                  Dry TX safety mode (synthesize without keying HackRF)");
+    eprintln!("  --log <PATH>              QSO log file path (default: rad950_hackrf.log)");
+    eprintln!("  --loopback                Run offline TX->2.4MS/s cs8->RX DDC->Decoder self-test");
+    eprintln!("  -h, --help                Show this help");
 }
 
 fn band_freq(name: &str) -> Option<u64> {
@@ -139,6 +169,10 @@ fn band_freq(name: &str) -> Option<u64> {
         .iter()
         .find(|(b, _)| b.eq_ignore_ascii_case(name))
         .map(|(_, f)| *f)
+}
+
+fn band_index(dial_hz: u64) -> Option<usize> {
+    BANDS.iter().position(|(_, f)| *f == dial_hz)
 }
 
 fn band_name(dial_hz: u64) -> &'static str {
@@ -221,7 +255,7 @@ fn synthesize_tx_cs8(frame: Frame, subch: usize) -> Vec<u8> {
 
     let mut out = vec![0u8; total_samples * 2];
     let mut phase = 0.0f64;
-    let amp_peak = 104.0f64; // comfortable headroom inside [-127, 127]
+    let amp_peak = 104.0f64;
 
     for (sym_idx, &tone_u8) in tones.iter().enumerate() {
         let tone = tone_u8 as f64;
@@ -257,34 +291,25 @@ fn synthesize_tx_cs8(frame: Frame, subch: usize) -> Vec<u8> {
 
 /// Streaming single-sideband USB digital downconverter:
 /// `2.4 MS/s` `cs8` I/Q (centered at `dial - 198.5 kHz`) -> `24 kHz` real USB `i16` audio `[0..3 kHz]`.
-///
-/// Stage 1: Exact 12-sample `-200 kHz` complex NCO -> USB `[0..3 kHz]` lands at `[-1.5..+1.5 kHz]`.
-/// Stage 2: 10:1 CIC/boxcar decimation (`2.4 MS/s -> 240 kHz`).
-/// Stage 3: 31-tap Hann-windowed sinc LPF (`f_c = 1.65 kHz` at `240 kHz`, rejecting LSB) + 10:1 decimation (`-> 24 kHz`).
-/// Stage 4: Exact 16-sample `+1.5 kHz` complex NCO at `24 kHz` + `Re(z)` -> pure USB `[0..3 kHz]`.
 struct UsbDdc {
     nco1_re: [f32; NCO1_PERIOD],
     nco1_im: [f32; NCO1_PERIOD],
     nco1_idx: usize,
 
-    // Stage 2: 10:1 accumulator
     acc_re: f32,
     acc_im: f32,
     acc_n: usize,
 
-    // Stage 3: 31-tap FIR at 240 kHz, decimate by 10 -> 24 kHz
     fir_taps: [f32; 31],
     ring_re: [f32; 31],
     ring_im: [f32; 31],
     ring_pos: usize,
     dec2_n: usize,
 
-    // Stage 4: +1.5 kHz NCO at 24 kHz
     nco2_re: [f32; NCO2_PERIOD],
     nco2_im: [f32; NCO2_PERIOD],
     nco2_idx: usize,
 
-    // Simple AGC / peak tracker for healthy 16-bit scaling
     dc_est: f32,
     gain: f32,
 }
@@ -307,7 +332,6 @@ impl UsbDdc {
             nco2_im[k] = a.sin() as f32;
         }
 
-        // 31-tap Hann-windowed sinc LPF at 240 kHz, cutoff = 1.65 kHz (passes +-1.5 kHz USB cleanly).
         let mut fir_taps = [0.0f32; 31];
         let fc = 1_650.0 / 240_000.0;
         let mid = 15.0f64;
@@ -344,18 +368,16 @@ impl UsbDdc {
             nco2_im,
             nco2_idx: 0,
             dc_est: 0.0,
-            gain: 220.0, // maps full-scale cs8 (~104) to ~22,880 i16
+            gain: 220.0,
         }
     }
 
-    /// Process a chunk of interleaved signed 8-bit I/Q bytes and append `24 kHz` `i16` audio to `out`.
     fn process_cs8(&mut self, bytes: &[u8], out: &mut Vec<i16>) {
         let pairs = bytes.len() / 2;
         for p in 0..pairs {
             let i = (bytes[p * 2] as i8) as f32;
             let q = (bytes[p * 2 + 1] as i8) as f32;
 
-            // Mix down by -200 kHz
             let cr = self.nco1_re[self.nco1_idx];
             let ci = self.nco1_im[self.nco1_idx];
             self.nco1_idx += 1;
@@ -375,7 +397,6 @@ impl UsbDdc {
                 self.acc_im = 0.0;
                 self.acc_n = 0;
 
-                // Push into 240 kHz FIR ring
                 self.ring_re[self.ring_pos] = s_re;
                 self.ring_im[self.ring_pos] = s_im;
                 self.ring_pos += 1;
@@ -386,7 +407,6 @@ impl UsbDdc {
                 self.dec2_n += 1;
                 if self.dec2_n == 10 {
                     self.dec2_n = 0;
-                    // Compute 31-tap FIR
                     let mut fr = 0.0f32;
                     let mut fi = 0.0f32;
                     let mut idx = self.ring_pos;
@@ -399,7 +419,6 @@ impl UsbDdc {
                         }
                     }
 
-                    // Mix up by +1,500 Hz at 24 kHz and take real part -> USB [0..3 kHz]
                     let u_re = self.nco2_re[self.nco2_idx];
                     let u_im = self.nco2_im[self.nco2_idx];
                     self.nco2_idx += 1;
@@ -430,20 +449,26 @@ fn check_hackrf_installed(serial: Option<&str>) -> Result<String, String> {
             return Err(format!("HackRF serial '{s}' not found in hackrf_info:\n{stdout}"));
         }
     }
-    Ok(stdout)
+    let ser = stdout
+        .lines()
+        .find(|l| l.contains("Serial number"))
+        .map(|l| l.trim().to_string())
+        .unwrap_or_else(|| "HackRF One".to_string());
+    Ok(ser)
 }
 
-fn transmit_slot(cfg: &NodeConfig, job: &TxJob) -> Result<(), String> {
+fn transmit_slot(cfg: &NodeConfig, job: &TxJob, state: &Arc<Mutex<SharedState>>) -> Result<(), String> {
     let cs8 = synthesize_tx_cs8(job.frame, job.subch);
     if cfg.dry_tx {
-        println!(
-            "  [DRY-TX] {} (subch {} = {} Hz, {} bytes @ 2.4 MS/s — RF suppressed)",
-            job.summary,
-            job.subch,
-            SUBCHANNELS_HZ[job.subch],
-            cs8.len()
-        );
-        thread::sleep(Duration::from_millis(9_200));
+        let mut left = 9_200u64;
+        while left > 0 {
+            if !state.lock().unwrap().running {
+                return Ok(());
+            }
+            let d = left.min(100);
+            thread::sleep(Duration::from_millis(d));
+            left -= d;
+        }
         return Ok(());
     }
 
@@ -487,7 +512,7 @@ fn transmit_slot(cfg: &NodeConfig, job: &TxJob) -> Result<(), String> {
     Ok(())
 }
 
-fn receive_slot(cfg: &NodeConfig) -> Result<(Vec<Decoded>, f32), String> {
+fn receive_slot(cfg: &NodeConfig, state: &Arc<Mutex<SharedState>>) -> Result<(Vec<Decoded>, f32), String> {
     let center_hz = (cfg.dial_hz as i64 - RF_OFFSET_HZ).max(1_000_000) as u64;
     let n_samples: u64 = (HACKRF_FS as u64 * RX_SLOT_MS) / 1000;
 
@@ -524,12 +549,18 @@ fn receive_slot(cfg: &NodeConfig) -> Result<(Vec<Decoded>, f32), String> {
     let mut stdout = child.stdout.take().ok_or("no stdout from hackrf_transfer")?;
     let mut ddc = UsbDdc::new();
     let mut rx = Receiver::new();
-    let mut iq_buf = vec![0u8; 48_000]; // 24,000 complex samples = 10 ms at 2.4 MS/s
+    let mut iq_buf = vec![0u8; 48_000];
     let mut pcm_buf = Vec::with_capacity(512);
     let mut leftover: Option<u8> = None;
     let mut peak_abs: i16 = 0;
+    let mut chunk_peak: i16 = 0;
+    let mut chunks = 0u32;
 
     loop {
+        if !state.lock().unwrap().running {
+            let _ = child.kill();
+            break;
+        }
         let mut start = 0usize;
         if let Some(b) = leftover.take() {
             iq_buf[0] = b;
@@ -553,8 +584,25 @@ fn receive_slot(cfg: &NodeConfig) -> Result<(Vec<Decoded>, f32), String> {
             if a > peak_abs {
                 peak_abs = a;
             }
+            if a > chunk_peak {
+                chunk_peak = a;
+            }
         }
         rx.push_samples(&pcm_buf);
+        chunks += 1;
+        if chunks.is_multiple_of(8) {
+            let wf_opt = rx.take_wf_col();
+            let pct = (chunk_peak as f32 / 32767.0) * 100.0;
+            chunk_peak = 0;
+            let mut st = state.lock().unwrap();
+            st.peak_pct = pct;
+            if let Some(packed) = wf_opt {
+                for b in 0..12 {
+                    st.wf_bins[b * 2] = packed[b] & 0x0F;
+                    st.wf_bins[b * 2 + 1] = (packed[b] >> 4) & 0x0F;
+                }
+            }
+        }
     }
 
     let out = child
@@ -562,7 +610,7 @@ fn receive_slot(cfg: &NodeConfig) -> Result<(Vec<Decoded>, f32), String> {
         .map_err(|e| format!("hackrf_transfer RX wait failed: {e}"))?;
     if !out.status.success() {
         let err = String::from_utf8_lossy(&out.stderr);
-        if !err.contains("User cancel") && !err.contains("exiting") {
+        if !err.contains("User cancel") && !err.contains("exiting") && state.lock().unwrap().running {
             return Err(format!("hackrf_transfer RX exited {}: {}", out.status, err.trim()));
         }
     }
@@ -627,25 +675,26 @@ fn handle_decoded(state: &Arc<Mutex<SharedState>>, slot: u64, frames: &[Decoded]
             } => (
                 "EXT",
                 "----".to_string(),
-                format!("EXT kind={kind} idx={idx} tag=0x{tag:02X} payload=0x{payload:012X}"),
+                format!("EXT k={kind} i={idx} t=0x{tag:02X} p=0x{payload:012X}"),
             ),
         };
 
-        println!(
-            "  [RX {}] {:+3} dB  {:4} Hz  {}",
+        st.push_event(format!(
+            "[{}] RX {:+3}dB {:4}Hz  {}",
             format_utc_hms(utc_sec),
             d.snr_db,
             d.audio_hz,
             detail
-        );
+        ));
 
-        // Update heard table
         if let Some(sc) = sender_call {
+            let already_worked = st.qso_log.iter().any(|q| q.peer == sender_str);
             if let Some(existing) = st.heard.iter_mut().find(|h| h.call == sc) {
                 existing.snr_db = d.snr_db;
                 existing.tone_hz = d.audio_hz;
                 existing.last_slot = slot;
                 existing.kind = kind;
+                existing.worked = already_worked;
                 if grid_str != "----" {
                     existing.grid_str = grid_str.clone();
                 }
@@ -660,6 +709,7 @@ fn handle_decoded(state: &Arc<Mutex<SharedState>>, slot: u64, frames: &[Decoded]
                         tone_hz: d.audio_hz,
                         last_slot: slot,
                         kind,
+                        worked: already_worked,
                     },
                 );
                 if st.heard.len() > 32 {
@@ -668,7 +718,6 @@ fn handle_decoded(state: &Arc<Mutex<SharedState>>, slot: u64, frames: &[Decoded]
             }
         }
 
-        // Auto-QSO state machine for frames addressed to us
         if let Frame::Rx {
             sender,
             recipient,
@@ -686,7 +735,6 @@ fn handle_decoded(state: &Arc<Mutex<SharedState>>, slot: u64, frames: &[Decoded]
                     .unwrap_or_else(|| "----".to_string());
 
                 if !ack {
-                    // Station answered our CQ -> send R+RX (ack=true) and log QSO!
                     let reply = Frame::Rx {
                         sender: my_call,
                         recipient: sender,
@@ -708,15 +756,19 @@ fn handle_decoded(state: &Arc<Mutex<SharedState>>, slot: u64, frames: &[Decoded]
                         rx_snr: d.snr_db,
                         tx_snr: their_rpt_for_us,
                     };
-                    println!(
-                        "  [QSO] Logged {} (rx={:+}dB, tx={:+}dB) — queued R+RX ACK",
-                        qso.peer, qso.rx_snr, qso.tx_snr
-                    );
+                    st.push_event(format!(
+                        "[{}] QSO logged {} (rx={:+}dB tx={:+}dB) -> R+RX queued",
+                        format_utc_hms(utc_sec),
+                        qso.peer,
+                        qso.rx_snr,
+                        qso.tx_snr
+                    ));
                     append_qso_log(&log_path, &qso);
                     st.qso_log.push(qso);
-                    st.active_peer = None;
+                    if let Some(h) = st.heard.iter_mut().find(|h| h.call == sender) {
+                        h.worked = true;
+                    }
                 } else {
-                    // Received R+RX ACK -> QSO complete!
                     let qso = QsoLogEntry {
                         utc_sec,
                         dial_hz,
@@ -725,13 +777,18 @@ fn handle_decoded(state: &Arc<Mutex<SharedState>>, slot: u64, frames: &[Decoded]
                         rx_snr: d.snr_db,
                         tx_snr: their_rpt_for_us,
                     };
-                    println!(
-                        "  [QSO] Complete & logged {} (rx={:+}dB, tx={:+}dB)",
-                        qso.peer, qso.rx_snr, qso.tx_snr
-                    );
+                    st.push_event(format!(
+                        "[{}] QSO complete & logged {} (rx={:+}dB tx={:+}dB)",
+                        format_utc_hms(utc_sec),
+                        qso.peer,
+                        qso.rx_snr,
+                        qso.tx_snr
+                    ));
                     append_qso_log(&log_path, &qso);
                     st.qso_log.push(qso);
-                    st.active_peer = None;
+                    if let Some(h) = st.heard.iter_mut().find(|h| h.call == sender) {
+                        h.worked = true;
+                    }
                 }
             }
         }
@@ -744,18 +801,20 @@ fn slot_worker(state: Arc<Mutex<SharedState>>) {
             break;
         }
 
-        // Wait until the exact start of the next 10-second UTC slot
         let now_ms = utc_now_ms();
         let rem_ms = 10_000 - (now_ms % 10_000);
-        // If we are within the first 250 ms of a slot, start immediately; else wait for next boundary.
         if (now_ms % 10_000) > 250 {
-            let wake_step = 200u64;
+            {
+                let mut st = state.lock().unwrap();
+                st.phase = SlotPhase::Waiting;
+                st.phase_note = "Syncing to next 10s UTC slot...".to_string();
+            }
             let mut left = rem_ms;
             while left > 0 {
                 if !state.lock().unwrap().running {
                     return;
                 }
-                let d = left.min(wake_step);
+                let d = left.min(100);
                 thread::sleep(Duration::from_millis(d));
                 left -= d;
             }
@@ -765,7 +824,6 @@ fn slot_worker(state: Arc<Mutex<SharedState>>) {
         let slot = slot_ms / 10_000;
         let utc_sec = slot * 10;
 
-        // Decide TX vs RX for this slot
         let (cfg, tx_job) = {
             let mut st = state.lock().unwrap();
             if !st.running {
@@ -792,69 +850,551 @@ fn slot_worker(state: Arc<Mutex<SharedState>>) {
         };
 
         if let Some(job) = tx_job {
-            println!(
-                "\n[{} slot {}] TX  {:.3} MHz  subch {} ({} Hz)  {}",
-                format_utc_hms(utc_sec),
-                slot % 1000,
-                cfg.dial_hz as f64 / 1_000_000.0,
-                job.subch,
-                SUBCHANNELS_HZ[job.subch],
-                job.summary
-            );
-            match transmit_slot(&cfg, &job) {
+            {
+                let mut st = state.lock().unwrap();
+                st.phase = if cfg.dry_tx { SlotPhase::DryTx } else { SlotPhase::Tx };
+                st.phase_note = format!(
+                    "{} (subch {} = {} Hz)",
+                    job.summary, job.subch, SUBCHANNELS_HZ[job.subch]
+                );
+                st.push_event(format!(
+                    "[{}] {} {:.3}MHz {}Hz  {}",
+                    format_utc_hms(utc_sec),
+                    if cfg.dry_tx { "DRY-TX" } else { "TX    " },
+                    cfg.dial_hz as f64 / 1_000_000.0,
+                    SUBCHANNELS_HZ[job.subch],
+                    job.summary
+                ));
+            }
+            match transmit_slot(&cfg, &job, &state) {
                 Ok(()) => {
                     state.lock().unwrap().slots_tx += 1;
                 }
                 Err(e) => {
-                    eprintln!("  [TX ERROR] {e}");
+                    state
+                        .lock()
+                        .unwrap()
+                        .push_event(format!("[{}] TX ERROR: {e}", format_utc_hms(utc_sec)));
                 }
             }
         } else {
-            println!(
-                "\n[{} slot {}] RX  {:.3} MHz ({})  listening 9.45s...",
-                format_utc_hms(utc_sec),
-                slot % 1000,
-                cfg.dial_hz as f64 / 1_000_000.0,
-                band_name(cfg.dial_hz)
-            );
-            match receive_slot(&cfg) {
+            {
+                let mut st = state.lock().unwrap();
+                st.phase = SlotPhase::Rx;
+                st.phase_note = format!(
+                    "Listening {:.3} MHz ({}) LNA={} VGA={}",
+                    cfg.dial_hz as f64 / 1_000_000.0,
+                    band_name(cfg.dial_hz),
+                    cfg.lna_db,
+                    cfg.vga_db
+                );
+            }
+            match receive_slot(&cfg, &state) {
                 Ok((frames, peak_pct)) => {
-                    state.lock().unwrap().slots_rx += 1;
+                    let mut st = state.lock().unwrap();
+                    st.slots_rx += 1;
+                    st.peak_pct = peak_pct;
                     if frames.is_empty() {
-                        println!("  [RX] 0 decodes (audio peak {peak_pct:.1}%)");
+                        st.push_event(format!(
+                            "[{}] RX {:.3}MHz  0 decodes (peak {:.0}%)",
+                            format_utc_hms(utc_sec),
+                            cfg.dial_hz as f64 / 1_000_000.0,
+                            peak_pct
+                        ));
+                        drop(st);
                     } else {
+                        drop(st);
                         handle_decoded(&state, slot, &frames);
                     }
                 }
                 Err(e) => {
-                    eprintln!("  [RX ERROR] {e}");
-                    thread::sleep(Duration::from_millis(1000));
+                    state
+                        .lock()
+                        .unwrap()
+                        .push_event(format!("[{}] RX ERROR: {e}", format_utc_hms(utc_sec)));
+                    thread::sleep(Duration::from_millis(800));
                 }
             }
         }
-
-        print!("rad950> ");
-        let _ = io::stdout().flush();
     }
 }
 
-fn print_repl_help() {
-    println!("Commands:");
-    println!("  cq                       Queue one CQ in the next 10 s UTC slot");
-    println!("  cq auto [even|odd]       Toggle continuous alternating-slot CQ");
-    println!("  cq stop                  Stop auto-CQ and clear TX queue");
-    println!("  ans <N>                  Answer heard station #N (sends RX)");
-    println!("  reply <CALL> [SNR] [ack] Send RX (or R+RX with 'ack') to <CALL>");
-    println!("  autoqso <on|off>         Auto-complete & log QSOs when answered (default: on)");
-    println!("  band <10m|12m|15m|17m>   Switch to RAD950 calling dial");
-    println!("  freq <HZ>                Set custom USB dial frequency in Hz");
-    println!("  subch <0..7>             Set TX audio subchannel (600..2175 Hz)");
-    println!("  gain lna <dB> | vga <dB> | tx <dB> | amp <on|off>");
-    println!("  dry <on|off>             Toggle Dry TX safety mode");
-    println!("  heard                    Show recently heard stations");
-    println!("  log                      Show logged QSOs");
-    println!("  status                   Show current node configuration & stats");
-    println!("  help | quit");
+/// RAII terminal raw-mode + alternate-screen guard using POSIX `stty` (works on macOS & Linux offline).
+struct RawTerm {
+    saved: String,
+}
+
+impl RawTerm {
+    fn enter() -> io::Result<Self> {
+        let saved = Command::new("stty")
+            .arg("-g")
+            .stdin(Stdio::inherit())
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .unwrap_or_default();
+        let _ = Command::new("stty")
+            .args(["raw", "-echo", "min", "0", "time", "1"])
+            .stdin(Stdio::inherit())
+            .status();
+        let mut out = io::stdout();
+        let _ = write!(out, "\x1b[?1049h\x1b[?25l\x1b[2J");
+        let _ = out.flush();
+        Ok(Self { saved })
+    }
+}
+
+impl Drop for RawTerm {
+    fn drop(&mut self) {
+        let mut out = io::stdout();
+        let _ = write!(out, "\x1b[0m\x1b[?25h\x1b[?1049l");
+        let _ = out.flush();
+        if !self.saved.is_empty() {
+            let _ = Command::new("stty")
+                .arg(&self.saved)
+                .stdin(Stdio::inherit())
+                .status();
+        } else {
+            let _ = Command::new("stty")
+                .arg("sane")
+                .stdin(Stdio::inherit())
+                .status();
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Key {
+    Char(char),
+    Enter,
+    Esc,
+    Backspace,
+    Up,
+    Down,
+    Left,
+    Right,
+    Tab,
+    CtrlC,
+}
+
+fn read_key() -> Option<Key> {
+    let mut b = [0u8; 1];
+    let n = io::stdin().read(&mut b).ok()?;
+    if n == 0 {
+        return None;
+    }
+    match b[0] {
+        3 => Some(Key::CtrlC),
+        9 => Some(Key::Tab),
+        10 | 13 => Some(Key::Enter),
+        127 | 8 => Some(Key::Backspace),
+        27 => {
+            let mut seq = [0u8; 2];
+            if io::stdin().read(&mut seq[0..1]).unwrap_or(0) == 1
+                && seq[0] == b'['
+                && io::stdin().read(&mut seq[1..2]).unwrap_or(0) == 1
+            {
+                return match seq[1] {
+                    b'A' => Some(Key::Up),
+                    b'B' => Some(Key::Down),
+                    b'C' => Some(Key::Right),
+                    b'D' => Some(Key::Left),
+                    _ => Some(Key::Esc),
+                };
+            }
+            Some(Key::Esc)
+        }
+        c if (32..=126).contains(&c) => Some(Key::Char(c as char)),
+        _ => None,
+    }
+}
+
+fn term_size() -> (usize, usize) {
+    if let Ok(out) = Command::new("stty")
+        .arg("size")
+        .stdin(Stdio::inherit())
+        .output()
+    {
+        let s = String::from_utf8_lossy(&out.stdout);
+        let mut it = s.split_whitespace();
+        if let (Some(r), Some(c)) = (it.next(), it.next()) {
+            if let (Ok(rows), Ok(cols)) = (r.parse::<usize>(), c.parse::<usize>()) {
+                return (cols.max(72), rows.max(20));
+            }
+        }
+    }
+    (96, 28)
+}
+
+fn trunc(s: &str, max_w: usize) -> String {
+    if s.chars().count() <= max_w {
+        s.to_string()
+    } else if max_w > 1 {
+        let mut out: String = s.chars().take(max_w - 1).collect();
+        out.push('…');
+        out
+    } else {
+        String::new()
+    }
+}
+
+struct TuiState {
+    view: View,
+    heard_sel: usize,
+    set_sel: usize,
+    editing: Option<String>,
+    toast: Option<(String, u64)>,
+}
+
+impl TuiState {
+    fn set_toast(&mut self, msg: impl Into<String>) {
+        self.toast = Some((msg.into(), utc_now_ms() + 3_000));
+    }
+}
+
+const SETTINGS_COUNT: usize = 12;
+
+fn render_tui(state: &Arc<Mutex<SharedState>>, tui: &TuiState) {
+    let (cols, rows) = term_size();
+    let st = state.lock().unwrap();
+    let now_ms = utc_now_ms();
+    let slot_elapsed_ms = now_ms % 10_000;
+    let cur_slot = now_ms / 10_000;
+
+    let mut buf = String::with_capacity(8192);
+    buf.push_str("\x1b[H");
+
+    // 1. Top title bar
+    let tx_badge = if st.cfg.dry_tx {
+        "\x1b[1;30;43m DRY-TX \x1b[0;1;37;44m"
+    } else {
+        "\x1b[1;37;41m LIVE-TX \x1b[0;1;37;44m"
+    };
+    let cq_badge = if st.auto_cq {
+        "\x1b[1;30;42m AUTO-CQ \x1b[0;1;37;44m"
+    } else {
+        ""
+    };
+    let header = format!(
+        " RAD950 HackRF  |  {} [{}]  |  {:.3} MHz ({})  |  Subch {} ({} Hz)  |  {} ",
+        st.cfg.call_str,
+        st.cfg.grid_str,
+        st.cfg.dial_hz as f64 / 1_000_000.0,
+        band_name(st.cfg.dial_hz),
+        st.cfg.subch,
+        SUBCHANNELS_HZ[st.cfg.subch],
+        format_utc_hms(now_ms / 1000)
+    );
+    buf.push_str(&format!("\x1b[1;37;44m{header}{tx_badge}{cq_badge}\x1b[K\x1b[0m\r\n"));
+
+    // 2. Slot progress bar + Audio Peak + Spectrum
+    let (phase_col, phase_lbl) = match st.phase {
+        SlotPhase::Waiting => ("\x1b[33m", "WAIT  "),
+        SlotPhase::Rx => ("\x1b[32m", "RX    "),
+        SlotPhase::Tx => ("\x1b[1;31m", "TX    "),
+        SlotPhase::DryTx => ("\x1b[1;33m", "DRY-TX"),
+    };
+    let bar_w = 24usize;
+    let filled = ((slot_elapsed_ms as usize * bar_w) / 10_000).min(bar_w);
+    let bar: String = "█".repeat(filled) + &"░".repeat(bar_w - filled);
+    let blocks = [' ', '▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+    let mut spec = String::with_capacity(24 * 3);
+    for &v in &st.wf_bins {
+        let idx = ((v as usize) * (blocks.len() - 1) / 15).min(blocks.len() - 1);
+        spec.push(blocks[idx]);
+    }
+    let line2 = format!(
+        " {phase_col}{phase_lbl}\x1b[0m [{phase_col}{bar}\x1b[0m] {:4.1}s/10s  Peak:{:3.0}%  Spec:\x1b[36m[{spec}]\x1b[0m  Q:{}",
+        slot_elapsed_ms as f64 / 1000.0,
+        st.peak_pct,
+        st.tx_queue.len()
+    );
+    buf.push_str(&format!("{line2}\x1b[K\r\n"));
+
+    // 3. View tabs + HackRF info
+    let tab = |v: View, name: &str| {
+        if tui.view == v {
+            format!("\x1b[1;30;46m {name} \x1b[0m")
+        } else {
+            format!("\x1b[2m {name} \x1b[0m")
+        }
+    };
+    buf.push_str(&format!(
+        " {} {} {}   \x1b[2m{} | RX:{} TX:{} Dec:{} QSO:{}\x1b[0m\x1b[K\r\n",
+        tab(View::Operate, "1:Operate"),
+        tab(View::Settings, "2:Settings"),
+        tab(View::Log, "3:QSO Log"),
+        trunc(&st.hackrf_banner, cols.saturating_sub(58)),
+        st.slots_rx,
+        st.slots_tx,
+        st.frames_rx,
+        st.qso_log.len()
+    ));
+    buf.push_str(&format!("\x1b[2m{}\x1b[0m\r\n", "─".repeat(cols)));
+
+    let body_rows = rows.saturating_sub(7);
+
+    match tui.view {
+        View::Operate => {
+            let heard_rows = (body_rows / 2).max(5);
+            let event_rows = body_rows.saturating_sub(heard_rows + 2);
+
+            buf.push_str(&format!(
+                "\x1b[1;36m HEARD STATIONS ({}) — ↑/↓ select, Enter=Answer\x1b[0m\x1b[K\r\n",
+                st.heard.len()
+            ));
+            if st.heard.is_empty() {
+                buf.push_str("   \x1b[2m(no stations decoded yet — listening on 10 s UTC slots)\x1b[0m\x1b[K\r\n");
+                for _ in 1..heard_rows.saturating_sub(1) {
+                    buf.push_str("\x1b[K\r\n");
+                }
+            } else {
+                let max_show = heard_rows.saturating_sub(1);
+                for i in 0..max_show {
+                    if let Some(h) = st.heard.get(i) {
+                        let age_s = cur_slot.saturating_sub(h.last_slot) * 10;
+                        let sel = i == tui.heard_sel;
+                        let wkd = if h.worked { "✓WKD" } else { " NEW" };
+                        let row = format!(
+                            " {:>2}. {:<8} {:<4}  {:+3} dB  {:4} Hz  {:<4}  {}  {:>4}s",
+                            i + 1,
+                            h.call_str,
+                            h.grid_str,
+                            h.snr_db,
+                            h.tone_hz,
+                            h.kind,
+                            wkd,
+                            age_s
+                        );
+                        if sel {
+                            buf.push_str(&format!("\x1b[1;30;47m{}\x1b[K\x1b[0m\r\n", trunc(&row, cols)));
+                        } else {
+                            let col = if h.worked { "\x1b[32m" } else { "\x1b[0m" };
+                            buf.push_str(&format!("{col}{}\x1b[0m\x1b[K\r\n", trunc(&row, cols)));
+                        }
+                    } else {
+                        buf.push_str("\x1b[K\r\n");
+                    }
+                }
+            }
+
+            buf.push_str(&format!(
+                "\x1b[1;36m ACTIVITY FEED\x1b[0m  \x1b[2m{}\x1b[0m\x1b[K\r\n",
+                trunc(&st.phase_note, cols.saturating_sub(18))
+            ));
+            let ev_len = st.events.len();
+            let start = ev_len.saturating_sub(event_rows);
+            for i in 0..event_rows {
+                if let Some(ev) = st.events.get(start + i) {
+                    buf.push_str(&format!(" {}\x1b[K\r\n", trunc(ev, cols.saturating_sub(2))));
+                } else {
+                    buf.push_str("\x1b[K\r\n");
+                }
+            }
+        }
+        View::Settings => {
+            buf.push_str("\x1b[1;36m SETTINGS — ↑/↓ move, ←/→ adjust, Enter edit/toggle, Esc back\x1b[0m\x1b[K\r\n");
+            let items: [(&str, String, &str); SETTINGS_COUNT] = [
+                ("Callsign", st.cfg.call_str.clone(), "Enter to edit"),
+                ("Grid Square", st.cfg.grid_str.clone(), "Enter to edit (4-char or NONE)"),
+                (
+                    "Band Preset",
+                    match band_index(st.cfg.dial_hz) {
+                        Some(bi) => format!("{} ({:.3} MHz)", BANDS[bi].0, BANDS[bi].1 as f64 / 1e6),
+                        None => format!("Custom ({:.3} MHz)", st.cfg.dial_hz as f64 / 1e6),
+                    },
+                    "←/→ cycle 10m/12m/15m/17m",
+                ),
+                (
+                    "Dial Freq (Hz)",
+                    format!("{} ({:.3} MHz)", st.cfg.dial_hz, st.cfg.dial_hz as f64 / 1e6),
+                    "Enter to type exact Hz, ←/→ ±1 kHz",
+                ),
+                (
+                    "TX Subchannel",
+                    format!("{} ({} Hz)", st.cfg.subch, SUBCHANNELS_HZ[st.cfg.subch]),
+                    "←/→ cycle 0..7",
+                ),
+                ("RX LNA Gain", format!("{} dB", st.cfg.lna_db), "←/→ step 8 dB (0..40)"),
+                ("RX VGA Gain", format!("{} dB", st.cfg.vga_db), "←/→ step 2 dB (0..62)"),
+                ("TX VGA Gain", format!("{} dB", st.cfg.tx_vga_db), "←/→ step 1 dB (0..47)"),
+                (
+                    "RF Amplifier",
+                    if st.cfg.amp { "ON (+14 dB)".into() } else { "OFF".into() },
+                    "←/→ or Enter to toggle",
+                ),
+                (
+                    "Dry TX Safety",
+                    if st.cfg.dry_tx {
+                        "ON (RF suppressed)".into()
+                    } else {
+                        "OFF (LIVE RF TX!)".into()
+                    },
+                    "←/→ or Enter to toggle",
+                ),
+                (
+                    "Auto-QSO Reply",
+                    if st.auto_qso { "ON".into() } else { "OFF".into() },
+                    "Auto-send R+RX & log when answered",
+                ),
+                (
+                    "Auto-CQ Parity",
+                    if st.cq_parity == 0 { "Even slots".into() } else { "Odd slots".into() },
+                    "←/→ toggle even/odd 10s slot",
+                ),
+            ];
+
+            for i in 0..body_rows.saturating_sub(1) {
+                if let Some((name, val, hint)) = items.get(i) {
+                    let sel = i == tui.set_sel;
+                    let shown_val = if sel {
+                        if let Some(ref ed) = tui.editing {
+                            format!("[{ed}_]")
+                        } else {
+                            val.clone()
+                        }
+                    } else {
+                        val.clone()
+                    };
+                    let row = format!("  {:<16}  {:<24}  {}", name, shown_val, hint);
+                    if sel {
+                        buf.push_str(&format!("\x1b[1;30;47m{}\x1b[K\x1b[0m\r\n", trunc(&row, cols)));
+                    } else {
+                        buf.push_str(&format!("{}\x1b[K\r\n", trunc(&row, cols)));
+                    }
+                } else {
+                    buf.push_str("\x1b[K\r\n");
+                }
+            }
+        }
+        View::Log => {
+            buf.push_str(&format!(
+                "\x1b[1;36m QSO LOG ({}) — file: {}\x1b[0m\x1b[K\r\n",
+                st.qso_log.len(),
+                st.cfg.log_path
+            ));
+            let max_show = body_rows.saturating_sub(1);
+            if st.qso_log.is_empty() {
+                buf.push_str("   \x1b[2m(no completed QSOs yet this session)\x1b[0m\x1b[K\r\n");
+                for _ in 1..max_show {
+                    buf.push_str("\x1b[K\r\n");
+                }
+            } else {
+                let start = st.qso_log.len().saturating_sub(max_show);
+                for i in 0..max_show {
+                    if let Some(q) = st.qso_log.get(start + i) {
+                        let row = format!(
+                            " {:>3}. {}  {:.3} MHz  {:<8}  {:<4}  rx={:+3}dB  tx={:+3}dB",
+                            start + i + 1,
+                            format_utc_hms(q.utc_sec),
+                            q.dial_hz as f64 / 1_000_000.0,
+                            q.peer,
+                            q.grid,
+                            q.rx_snr,
+                            q.tx_snr
+                        );
+                        buf.push_str(&format!("{}\x1b[K\r\n", trunc(&row, cols)));
+                    } else {
+                        buf.push_str("\x1b[K\r\n");
+                    }
+                }
+            }
+        }
+    }
+
+    // Footer status/toast + key hints
+    buf.push_str(&format!("\x1b[2m{}\x1b[0m\r\n", "─".repeat(cols)));
+    if let Some((ref msg, exp)) = tui.toast {
+        if now_ms < exp {
+            buf.push_str(&format!("\x1b[1;33m {msg}\x1b[0m\x1b[K\r\n"));
+        } else {
+            buf.push_str("\x1b[K\r\n");
+        }
+    } else {
+        buf.push_str("\x1b[K\r\n");
+    }
+    let hints = match tui.view {
+        View::Operate => " [c] CQ  [a] Auto-CQ  [Enter] Answer  [b] Band  [d] Dry-TX  [s] Settings  [l] Log  [q] Quit",
+        View::Settings => " [↑/↓] Select  [←/→] Change  [Enter] Edit/Toggle  [Esc/1] Operate  [q] Quit",
+        View::Log => " [1/Esc] Operate  [2/s] Settings  [q] Quit",
+    };
+    buf.push_str(&format!("\x1b[7m{}\x1b[K\x1b[0m", trunc(hints, cols)));
+
+    let mut out = io::stdout();
+    let _ = out.write_all(buf.as_bytes());
+    let _ = out.flush();
+}
+
+fn adjust_setting(state: &Arc<Mutex<SharedState>>, tui: &mut TuiState, delta: i32) {
+    let mut st = state.lock().unwrap();
+    match tui.set_sel {
+        2 => {
+            let cur = band_index(st.cfg.dial_hz).unwrap_or(0) as i32;
+            let next = (cur + delta).rem_euclid(BANDS.len() as i32) as usize;
+            st.cfg.dial_hz = BANDS[next].1;
+            tui.set_toast(format!("Band -> {} ({:.3} MHz)", BANDS[next].0, BANDS[next].1 as f64 / 1e6));
+        }
+        3 => {
+            let f = (st.cfg.dial_hz as i64 + delta as i64 * 1_000).clamp(1_000_000, 6_000_000_000) as u64;
+            st.cfg.dial_hz = f;
+        }
+        4 => {
+            let next = (st.cfg.subch as i32 + delta).rem_euclid(SUBCHANNELS_HZ.len() as i32) as usize;
+            st.cfg.subch = next;
+        }
+        5 => {
+            let next = (st.cfg.lna_db as i32 + delta * 8).clamp(0, 40) as u8;
+            st.cfg.lna_db = (next / 8) * 8;
+        }
+        6 => {
+            let next = (st.cfg.vga_db as i32 + delta * 2).clamp(0, 62) as u8;
+            st.cfg.vga_db = (next / 2) * 2;
+        }
+        7 => {
+            st.cfg.tx_vga_db = (st.cfg.tx_vga_db as i32 + delta).clamp(0, 47) as u8;
+        }
+        8 => st.cfg.amp = !st.cfg.amp,
+        9 => {
+            st.cfg.dry_tx = !st.cfg.dry_tx;
+            tui.set_toast(if st.cfg.dry_tx {
+                "Dry TX ON (RF suppressed)"
+            } else {
+                "Dry TX OFF — LIVE RF TRANSMIT ENABLED"
+            });
+        }
+        10 => st.auto_qso = !st.auto_qso,
+        11 => st.cq_parity = 1 - st.cq_parity,
+        _ => {}
+    }
+}
+
+fn commit_edit(state: &Arc<Mutex<SharedState>>, tui: &mut TuiState, text: String) {
+    let mut st = state.lock().unwrap();
+    match tui.set_sel {
+        0 => match parse_call(&text) {
+            Ok(c) => {
+                st.cfg.call = c;
+                st.cfg.call_str = format_call(c);
+                tui.set_toast(format!("Callsign set to {}", st.cfg.call_str));
+            }
+            Err(e) => tui.set_toast(e),
+        },
+        1 => match parse_grid(&text) {
+            Ok((g, s)) => {
+                st.cfg.grid4 = g;
+                st.cfg.grid_str = s.clone();
+                tui.set_toast(format!("Grid set to {s}"));
+            }
+            Err(e) => tui.set_toast(e),
+        },
+        3 => match text.trim().parse::<u64>() {
+            Ok(f) if (1_000_000..=6_000_000_000).contains(&f) => {
+                st.cfg.dial_hz = f;
+                tui.set_toast(format!("Dial set to {:.3} MHz", f as f64 / 1e6));
+            }
+            _ => tui.set_toast("Invalid frequency (enter Hz, e.g. 28078000)"),
+        },
+        _ => {}
+    }
 }
 
 fn run_loopback_selftest() -> ExitCode {
@@ -1030,20 +1570,14 @@ fn main() -> ExitCode {
         }
     };
 
-    match check_hackrf_installed(serial.as_deref()) {
-        Ok(info) => {
-            let line = info
-                .lines()
-                .find(|l| l.contains("Serial number") || l.contains("Board ID"))
-                .unwrap_or("HackRF ready");
-            println!("Connected: {}", line.trim());
-        }
+    let hackrf_banner = match check_hackrf_installed(serial.as_deref()) {
+        Ok(info) => info,
         Err(e) => {
             eprintln!("{e}");
             eprintln!("Tip: run with --loopback to test the TX/RX DSP chain without hardware.");
             return ExitCode::from(1);
         }
-    }
+    };
 
     let cfg = NodeConfig {
         call,
@@ -1061,22 +1595,6 @@ fn main() -> ExitCode {
         log_path,
     };
 
-    println!(
-        "RAD950 HackRF Node: {} [{}]  dial={:.3} MHz ({})  subch={} ({} Hz)  LNA={}dB VGA={}dB TX={}dB amp={} dry={}",
-        cfg.call_str,
-        cfg.grid_str,
-        cfg.dial_hz as f64 / 1_000_000.0,
-        band_name(cfg.dial_hz),
-        cfg.subch,
-        SUBCHANNELS_HZ[cfg.subch],
-        cfg.lna_db,
-        cfg.vga_db,
-        cfg.tx_vga_db,
-        if cfg.amp { "on" } else { "off" },
-        if cfg.dry_tx { "ON" } else { "off" }
-    );
-    println!("Type 'help' for commands, 'cq' to call CQ, 'quit' to exit.");
-
     let state = Arc::new(Mutex::new(SharedState {
         cfg,
         running: true,
@@ -1086,267 +1604,194 @@ fn main() -> ExitCode {
         tx_queue: VecDeque::new(),
         heard: Vec::new(),
         qso_log: Vec::new(),
-        active_peer: None,
+        events: VecDeque::new(),
+        phase: SlotPhase::Waiting,
+        phase_note: "Starting RAD950 HackRF node...".to_string(),
+        peak_pct: 0.0,
+        wf_bins: [0; 24],
+        hackrf_banner,
         slots_rx: 0,
         slots_tx: 0,
         frames_rx: 0,
     }));
 
+    let _raw = match RawTerm::enter() {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("failed to enter raw terminal mode: {e}");
+            return ExitCode::from(1);
+        }
+    };
+
     let worker_state = Arc::clone(&state);
     let worker = thread::spawn(move || slot_worker(worker_state));
 
-    let stdin = io::stdin();
-    print!("rad950> ");
-    let _ = io::stdout().flush();
+    let mut tui = TuiState {
+        view: View::Operate,
+        heard_sel: 0,
+        set_sel: 0,
+        editing: None,
+        toast: Some(("Connected to HackRF One — press 's' for Settings, 'c' for CQ".into(), utc_now_ms() + 4_000)),
+    };
 
-    for line in stdin.lock().lines() {
-        let Ok(line) = line else { break };
-        let parts: Vec<&str> = line.split_whitespace().collect();
-        if parts.is_empty() {
-            print!("rad950> ");
-            let _ = io::stdout().flush();
-            continue;
+    loop {
+        render_tui(&state, &tui);
+
+        if let Some(key) = read_key() {
+            // Inline text editing inside Settings
+            if let Some(mut ed) = tui.editing.take() {
+                match key {
+                    Key::Enter => commit_edit(&state, &mut tui, ed),
+                    Key::Esc => tui.set_toast("Edit cancelled"),
+                    Key::Backspace => {
+                        ed.pop();
+                        tui.editing = Some(ed);
+                    }
+                    Key::Char(c) if ed.len() < 12 => {
+                        ed.push(c.to_ascii_uppercase());
+                        tui.editing = Some(ed);
+                    }
+                    Key::CtrlC => {
+                        state.lock().unwrap().running = false;
+                        break;
+                    }
+                    _ => tui.editing = Some(ed),
+                }
+                continue;
+            }
+
+            match key {
+                Key::CtrlC | Key::Char('q') => {
+                    state.lock().unwrap().running = false;
+                    break;
+                }
+                Key::Tab => {
+                    tui.view = match tui.view {
+                        View::Operate => View::Settings,
+                        View::Settings => View::Log,
+                        View::Log => View::Operate,
+                    };
+                }
+                Key::Char('1') => tui.view = View::Operate,
+                Key::Char('2') | Key::Char('s') => tui.view = View::Settings,
+                Key::Char('3') | Key::Char('l') => tui.view = View::Log,
+                Key::Esc => tui.view = View::Operate,
+                _ => match tui.view {
+                    View::Operate => match key {
+                        Key::Up => tui.heard_sel = tui.heard_sel.saturating_sub(1),
+                        Key::Down => {
+                            let len = state.lock().unwrap().heard.len();
+                            if len > 0 && tui.heard_sel + 1 < len {
+                                tui.heard_sel += 1;
+                            }
+                        }
+                        Key::Enter => {
+                            let mut st = state.lock().unwrap();
+                            if let Some(h) = st.heard.get(tui.heard_sel).cloned() {
+                                let frame = Frame::Rx {
+                                    sender: st.cfg.call,
+                                    recipient: h.call,
+                                    snr_db: h.snr_db,
+                                    ack: false,
+                                    reserved: false,
+                                };
+                                let subch = st.cfg.subch;
+                                let summary = format!(
+                                    "{} de {} RX {:+}dB",
+                                    h.call_str, st.cfg.call_str, h.snr_db
+                                );
+                                st.tx_queue.push_front(TxJob {
+                                    frame,
+                                    subch,
+                                    summary: summary.clone(),
+                                });
+                                tui.set_toast(format!("Queued answer: {summary}"));
+                            } else {
+                                tui.set_toast("No heard station selected");
+                            }
+                        }
+                        Key::Char('c') => {
+                            let mut st = state.lock().unwrap();
+                            let frame = Frame::Cq {
+                                sender: st.cfg.call,
+                                grid4: st.cfg.grid4,
+                                tx_pwr: 10,
+                                reserved: 0,
+                            };
+                            let subch = st.cfg.subch;
+                            let summary = format!("CQ {} {}", st.cfg.call_str, st.cfg.grid_str);
+                            st.tx_queue.push_back(TxJob {
+                                frame,
+                                subch,
+                                summary: summary.clone(),
+                            });
+                            tui.set_toast(format!("Queued CQ for next slot: {summary}"));
+                        }
+                        Key::Char('a') => {
+                            let mut st = state.lock().unwrap();
+                            st.auto_cq = !st.auto_cq;
+                            if st.auto_cq {
+                                st.cq_parity = (utc_now_ms() / 10_000 + 1) % 2;
+                                tui.set_toast(format!(
+                                    "Auto-CQ ON ({} slots)",
+                                    if st.cq_parity == 0 { "even" } else { "odd" }
+                                ));
+                            } else {
+                                st.tx_queue.clear();
+                                tui.set_toast("Auto-CQ OFF");
+                            }
+                        }
+                        Key::Char('b') => {
+                            let mut st = state.lock().unwrap();
+                            let next = (band_index(st.cfg.dial_hz).map_or(0, |i| i + 1)) % BANDS.len();
+                            st.cfg.dial_hz = BANDS[next].1;
+                            tui.set_toast(format!(
+                                "Band -> {} ({:.3} MHz)",
+                                BANDS[next].0,
+                                BANDS[next].1 as f64 / 1e6
+                            ));
+                        }
+                        Key::Char('d') => {
+                            let mut st = state.lock().unwrap();
+                            st.cfg.dry_tx = !st.cfg.dry_tx;
+                            tui.set_toast(if st.cfg.dry_tx {
+                                "Dry TX ON (RF suppressed)"
+                            } else {
+                                "Dry TX OFF — LIVE RF ENABLED"
+                            });
+                        }
+                        _ => {}
+                    },
+                    View::Settings => match key {
+                        Key::Up => tui.set_sel = tui.set_sel.saturating_sub(1),
+                        Key::Down => {
+                            if tui.set_sel + 1 < SETTINGS_COUNT {
+                                tui.set_sel += 1;
+                            }
+                        }
+                        Key::Left => adjust_setting(&state, &mut tui, -1),
+                        Key::Right => adjust_setting(&state, &mut tui, 1),
+                        Key::Enter => {
+                            let st = state.lock().unwrap();
+                            match tui.set_sel {
+                                0 => tui.editing = Some(st.cfg.call_str.clone()),
+                                1 => tui.editing = Some(st.cfg.grid_str.clone()),
+                                3 => tui.editing = Some(st.cfg.dial_hz.to_string()),
+                                _ => {
+                                    drop(st);
+                                    adjust_setting(&state, &mut tui, 1);
+                                }
+                            }
+                        }
+                        _ => {}
+                    },
+                    View::Log => {}
+                },
+            }
         }
-
-        match parts[0].to_ascii_lowercase().as_str() {
-            "help" | "?" => print_repl_help(),
-            "quit" | "exit" | "q" => {
-                state.lock().unwrap().running = false;
-                println!("Stopping after current slot...");
-                break;
-            }
-            "cq" => {
-                let mut st = state.lock().unwrap();
-                if parts.get(1).is_some_and(|s| s.eq_ignore_ascii_case("auto")) {
-                    st.auto_cq = true;
-                    if let Some(p) = parts.get(2) {
-                        st.cq_parity = if p.eq_ignore_ascii_case("odd") { 1 } else { 0 };
-                    } else {
-                        st.cq_parity = (utc_now_ms() / 10_000 + 1) % 2;
-                    }
-                    println!(
-                        "Auto-CQ ON (transmitting on {} UTC slots)",
-                        if st.cq_parity == 0 { "even" } else { "odd" }
-                    );
-                } else if parts.get(1).is_some_and(|s| s.eq_ignore_ascii_case("stop")) {
-                    st.auto_cq = false;
-                    st.tx_queue.clear();
-                    println!("Auto-CQ stopped and TX queue cleared.");
-                } else {
-                    let frame = Frame::Cq {
-                        sender: st.cfg.call,
-                        grid4: st.cfg.grid4,
-                        tx_pwr: 10,
-                        reserved: 0,
-                    };
-                    let subch = st.cfg.subch;
-                    let summary = format!("CQ {} {}", st.cfg.call_str, st.cfg.grid_str);
-                    st.tx_queue.push_back(TxJob {
-                        frame,
-                        subch,
-                        summary: summary.clone(),
-                    });
-                    println!("Queued for next UTC slot: {summary}");
-                }
-            }
-            "ans" | "answer" => {
-                let idx = parts
-                    .get(1)
-                    .and_then(|s| s.parse::<usize>().ok())
-                    .unwrap_or(1);
-                let mut st = state.lock().unwrap();
-                if idx == 0 || idx > st.heard.len() {
-                    println!("No heard station #{idx}. Run 'heard' first.");
-                } else {
-                    let h = st.heard[idx - 1].clone();
-                    let frame = Frame::Rx {
-                        sender: st.cfg.call,
-                        recipient: h.call,
-                        snr_db: h.snr_db,
-                        ack: false,
-                        reserved: false,
-                    };
-                    let subch = st.cfg.subch;
-                    let summary = format!("{} de {} RX {:+}dB", h.call_str, st.cfg.call_str, h.snr_db);
-                    st.tx_queue.push_front(TxJob {
-                        frame,
-                        subch,
-                        summary: summary.clone(),
-                    });
-                    st.active_peer = Some((h.call, h.call_str, h.grid_str, h.snr_db));
-                    println!("Queued answer: {summary}");
-                }
-            }
-            "reply" => {
-                if parts.len() < 2 {
-                    println!("Usage: reply <CALL> [SNR_DB] [ack]");
-                } else if let Ok(rcpt) = parse_call(parts[1]) {
-                    let snr: i8 = parts.get(2).and_then(|s| s.parse().ok()).unwrap_or(-10);
-                    let ack = parts.iter().any(|p| p.eq_ignore_ascii_case("ack"));
-                    let mut st = state.lock().unwrap();
-                    let frame = Frame::Rx {
-                        sender: st.cfg.call,
-                        recipient: rcpt,
-                        snr_db: snr,
-                        ack,
-                        reserved: false,
-                    };
-                    let subch = st.cfg.subch;
-                    let tag = if ack { "R+RX" } else { "RX" };
-                    let summary = format!("{} de {} {tag} {:+}dB", format_call(rcpt), st.cfg.call_str, snr);
-                    st.tx_queue.push_front(TxJob {
-                        frame,
-                        subch,
-                        summary: summary.clone(),
-                    });
-                    println!("Queued: {summary}");
-                } else {
-                    println!("Invalid callsign '{}'", parts[1]);
-                }
-            }
-            "autoqso" => {
-                let mut st = state.lock().unwrap();
-                if let Some(v) = parts.get(1) {
-                    st.auto_qso = matches!(v.to_ascii_lowercase().as_str(), "on" | "1" | "true");
-                }
-                println!("Auto-QSO: {}", if st.auto_qso { "ON" } else { "off" });
-            }
-            "band" => {
-                if let Some(b) = parts.get(1).and_then(|s| band_freq(s)) {
-                    let mut st = state.lock().unwrap();
-                    st.cfg.dial_hz = b;
-                    println!("Dial set to {:.3} MHz ({})", b as f64 / 1_000_000.0, band_name(b));
-                } else {
-                    println!("Usage: band <10m|12m|15m|17m>");
-                }
-            }
-            "freq" => {
-                if let Some(Ok(f)) = parts.get(1).map(|s| s.parse::<u64>()) {
-                    let mut st = state.lock().unwrap();
-                    st.cfg.dial_hz = f;
-                    println!("Dial set to {:.3} MHz", f as f64 / 1_000_000.0);
-                } else {
-                    println!("Usage: freq <HZ> (e.g. freq 28078000)");
-                }
-            }
-            "subch" => {
-                if let Some(Ok(sc)) = parts.get(1).map(|s| s.parse::<usize>()) {
-                    if sc < SUBCHANNELS_HZ.len() {
-                        let mut st = state.lock().unwrap();
-                        st.cfg.subch = sc;
-                        println!("TX subchannel set to {sc} ({} Hz)", SUBCHANNELS_HZ[sc]);
-                    } else {
-                        println!("subch must be 0..{}", SUBCHANNELS_HZ.len() - 1);
-                    }
-                } else {
-                    println!("Usage: subch <0..7>");
-                }
-            }
-            "gain" => {
-                let mut st = state.lock().unwrap();
-                match (parts.get(1).copied(), parts.get(2).copied()) {
-                    (Some("lna"), Some(v)) => {
-                        st.cfg.lna_db = (v.parse::<u8>().unwrap_or(st.cfg.lna_db).min(40) / 8) * 8;
-                    }
-                    (Some("vga"), Some(v)) => {
-                        st.cfg.vga_db = (v.parse::<u8>().unwrap_or(st.cfg.vga_db).min(62) / 2) * 2;
-                    }
-                    (Some("tx"), Some(v)) => {
-                        st.cfg.tx_vga_db = v.parse::<u8>().unwrap_or(st.cfg.tx_vga_db).min(47);
-                    }
-                    (Some("amp"), Some(v)) => {
-                        st.cfg.amp = matches!(v.to_ascii_lowercase().as_str(), "on" | "1" | "true");
-                    }
-                    _ => {}
-                }
-                println!(
-                    "Gains: LNA={}dB VGA={}dB TX={}dB amp={}",
-                    st.cfg.lna_db,
-                    st.cfg.vga_db,
-                    st.cfg.tx_vga_db,
-                    if st.cfg.amp { "on" } else { "off" }
-                );
-            }
-            "dry" => {
-                let mut st = state.lock().unwrap();
-                if let Some(v) = parts.get(1) {
-                    st.cfg.dry_tx = matches!(v.to_ascii_lowercase().as_str(), "on" | "1" | "true");
-                }
-                println!("Dry TX: {}", if st.cfg.dry_tx { "ON" } else { "off" });
-            }
-            "heard" => {
-                let st = state.lock().unwrap();
-                if st.heard.is_empty() {
-                    println!("No stations heard yet.");
-                } else {
-                    let cur_slot = utc_now_ms() / 10_000;
-                    for (i, h) in st.heard.iter().enumerate() {
-                        let age_s = cur_slot.saturating_sub(h.last_slot) * 10;
-                        println!(
-                            "  {:2}) {:<10} {:<4}  {:+3} dB  {:4} Hz  {:<4}  ({}s ago)",
-                            i + 1,
-                            h.call_str,
-                            h.grid_str,
-                            h.snr_db,
-                            h.tone_hz,
-                            h.kind,
-                            age_s
-                        );
-                    }
-                }
-            }
-            "log" => {
-                let st = state.lock().unwrap();
-                if st.qso_log.is_empty() {
-                    println!("No QSOs logged this session (file: {}).", st.cfg.log_path);
-                } else {
-                    for (i, q) in st.qso_log.iter().enumerate() {
-                        println!(
-                            "  {:2}) {}  {:.3} MHz  {:<10} {}  rx={:+}dB tx={:+}dB",
-                            i + 1,
-                            format_utc_hms(q.utc_sec),
-                            q.dial_hz as f64 / 1_000_000.0,
-                            q.peer,
-                            q.grid,
-                            q.rx_snr,
-                            q.tx_snr
-                        );
-                    }
-                }
-            }
-            "status" => {
-                let st = state.lock().unwrap();
-                let now_ms = utc_now_ms();
-                println!(
-                    "Node: {} [{}]  dial={:.3} MHz ({})  subch={} ({} Hz)  UTC={} (next slot in {:.1}s)",
-                    st.cfg.call_str,
-                    st.cfg.grid_str,
-                    st.cfg.dial_hz as f64 / 1_000_000.0,
-                    band_name(st.cfg.dial_hz),
-                    st.cfg.subch,
-                    SUBCHANNELS_HZ[st.cfg.subch],
-                    format_utc_hms(now_ms / 1000),
-                    (10_000 - (now_ms % 10_000)) as f64 / 1000.0
-                );
-                println!(
-                    "Mode: auto_cq={} auto_qso={} dry_tx={}  queued_tx={}  rx_slots={} tx_slots={} decodes={} qsos={}",
-                    st.auto_cq,
-                    st.auto_qso,
-                    st.cfg.dry_tx,
-                    st.tx_queue.len(),
-                    st.slots_rx,
-                    st.slots_tx,
-                    st.frames_rx,
-                    st.qso_log.len()
-                );
-            }
-            other => println!("Unknown command '{other}'. Type 'help'."),
-        }
-
-        print!("rad950> ");
-        let _ = io::stdout().flush();
     }
 
+    drop(_raw);
     let _ = worker.join();
     ExitCode::SUCCESS
 }
