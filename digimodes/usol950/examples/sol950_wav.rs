@@ -19,6 +19,7 @@ fn usage() {
     eprintln!("  sol950_wav rx <SENDER> <RECIPIENT> <SNR_DB> <ACK:0|1> <AUDIO_HZ> <OUT.wav>");
     eprintln!("  sol950_wav decode <IN.wav>        (scans both slot-aligned and unaligned bench captures)");
     eprintln!("  sol950_wav tone <IN.wav>          (measures peak carrier Hz and SNR_2500 for BFO/path check)");
+    eprintln!("  sol950_wav sweep <WEAK.wav|synth> <cq|rx> [ADJ.wav|synth:+225 ADJ_DB [TRIALS]]");
 }
 
 fn main() -> ExitCode {
@@ -60,6 +61,7 @@ fn main() -> ExitCode {
         }
         "decode" if args.len() == 3 => decode_wav(&args[2]),
         "tone" if args.len() == 3 => measure_tone(&args[2]),
+        "sweep" if matches!(args.len(), 4 | 6 | 7) => run_sweep(&args[2..]),
         _ => {
             usage();
             ExitCode::from(2)
@@ -280,6 +282,159 @@ fn measure_tone(path: &str) -> ExitCode {
     println!("tone_found  = {}", if tone_present { "YES" } else { "NO (noise floor only)" });
     println!("peak_hz     = {peak_hz:.2} Hz");
     println!("snr_2500_db = {snr_2500_db:+.1} dB  (averaged over {blocks} s, input {rate} Hz)");
+    ExitCode::SUCCESS
+}
+
+struct SweepRng(u64);
+impl SweepRng {
+    fn next_u32(&mut self) -> u32 {
+        let mut x = self.0;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        self.0 = x;
+        (x >> 16) as u32
+    }
+    fn gauss(&mut self, sigma: f64) -> f64 {
+        let mut s = 0.0;
+        for _ in 0..12 {
+            s += (self.next_u32() as f64) / (u32::MAX as f64 + 1.0);
+        }
+        (s - 6.0) * sigma
+    }
+}
+
+fn load_norm_burst(spec: &str) -> Option<Vec<i16>> {
+    if spec == "synth" {
+        return None;
+    }
+    let data = fs::read(spec).unwrap_or_else(|e| panic!("read {spec}: {e}"));
+    let (rate, samples) = read_wav_mono16(&data).unwrap_or_else(|| panic!("{spec}: expected 24 kHz mono PCM"));
+    assert_eq!(rate, RATE_24K, "{spec}: expected 24000 Hz, got {rate}");
+    Some(samples)
+}
+
+/// Reproducible host AWGN & adjacent-caller replay sweep (`P_n(2500) = sigma^2 * 2500/12000`, `sigma = 1200`,
+/// WAV burst inputs normalized to active signal RMS = 10,000, deterministic seed `0x2000_0000_0000_0001 + i*997`).
+/// Weak and adjacent callers always use distinct payloads (`CQ NQ6N FN31` vs `RX K1ABC -> NQ6N`) and only
+/// recovery of the weak frame is scored.
+fn run_sweep(args: &[String]) -> ExitCode {
+    let weak_wav = load_norm_burst(&args[0]);
+    let nq6n = Callsign::encode(b"NQ6N").unwrap();
+    let k1abc = Callsign::encode(b"K1ABC").unwrap();
+    let fn31 = encode_grid4(b"FN31").unwrap();
+    let cq_frame = Frame::Cq { sender: nq6n, grid4: fn31, tx_pwr: 10, reserved: 0 };
+    let rx_frame = Frame::Rx { sender: k1abc, recipient: nq6n, snr_db: -15, ack: false, reserved: false };
+    let (weak_frame, adj_frame) = if args[1].eq_ignore_ascii_case("cq") {
+        (cq_frame, rx_frame)
+    } else if args[1].eq_ignore_ascii_case("rx") {
+        (rx_frame, cq_frame)
+    } else {
+        usage();
+        return ExitCode::from(2);
+    };
+
+    let (adj_wav, adj_synth_hz, adj_db, trials) = if args.len() >= 4 {
+        let (aw, shz) = if let Some(rest) = args[2].strip_prefix("synth:") {
+            let off: i32 = rest.parse().unwrap_or(225);
+            (None, Some((1037i32 + off) as u32))
+        } else {
+            (load_norm_burst(&args[2]), None)
+        };
+        let adb: f64 = args[3].parse().unwrap_or(15.0);
+        let tr: usize = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(100);
+        (aw, shz, adb, tr)
+    } else {
+        (None, None, 0.0, 100)
+    };
+
+    let snrs = [-12.0f64, -13.0, -14.0, -15.0, -16.0, -17.0, -18.0];
+    let dummy = cq_frame;
+    let weak_tones = encode_tones(weak_frame);
+    let adj_tones = encode_tones(adj_frame);
+    const FS: usize = RATE_24K as usize;
+    let sigma = 1_200.0f64;
+    let p_n_2500 = sigma * sigma * (2500.0 / 12000.0);
+    let seed_base = 0x2000_0000_0000_0001u64;
+
+    println!("sol950_wav sweep: trials={trials}, norm_rms=10000, sigma_24k={sigma:.0}, seed_base=0x{seed_base:016x}, weak={:?}", weak_frame);
+    let mut rates = Vec::with_capacity(snrs.len());
+    for (si, &snr_db) in snrs.iter().enumerate() {
+        let p_weak = p_n_2500 * 10f64.powf(snr_db / 10.0);
+        let weak_rms = p_weak.sqrt();
+        let weak_amp = (2.0 * p_weak).sqrt() as i16;
+        let adj_rms = weak_rms * 10f64.powf(adj_db / 20.0);
+        let adj_amp = (2.0f64.sqrt() * adj_rms) as i16;
+        let mut rng = SweepRng(seed_base + (si as u64) * 997);
+        let mut rx = Receiver::new();
+        let mut ok = 0usize;
+
+        for t in 0..trials {
+            let mut slot = vec![0.0f64; FS * 10];
+            for s in &mut slot {
+                *s = rng.gauss(sigma);
+            }
+            let dt_w_ms = -160i32 + ((t as i32 * 53) % 401);
+            if let Some(wb) = weak_wav.as_deref() {
+                let start = ((200 + dt_w_ms) as usize * FS) / 1000;
+                let sc = weak_rms / 10_000.0;
+                for (k, &v) in wb.iter().enumerate() {
+                    if start + k < slot.len() {
+                        slot[start + k] += (v as f64) * sc;
+                    }
+                }
+            } else {
+                let start = ((400 + dt_w_ms) as usize * FS) / 1000;
+                let mut m = Modulator::new(weak_tones, RATE_24K, 1037, DEFAULT_SPACING_HZ, weak_amp);
+                let mut i = start;
+                while let Some(v) = m.next_sample() {
+                    if i < slot.len() {
+                        slot[i] += v as f64;
+                    }
+                    i += 1;
+                }
+            }
+
+            let dt_a_ms = -160i32 + (((t as i32 * 97) + 211) % 401);
+            if let Some(ab) = adj_wav.as_deref() {
+                let start = ((200 + dt_a_ms) as usize * FS) / 1000;
+                let sc = adj_rms / 10_000.0;
+                for (k, &v) in ab.iter().enumerate() {
+                    if start + k < slot.len() {
+                        slot[start + k] += (v as f64) * sc;
+                    }
+                }
+            } else if let Some(ahz) = adj_synth_hz {
+                let start = ((400 + dt_a_ms) as usize * FS) / 1000;
+                let mut m = Modulator::new(adj_tones, RATE_24K, ahz, DEFAULT_SPACING_HZ, adj_amp);
+                let mut i = start;
+                while let Some(v) = m.next_sample() {
+                    if i < slot.len() {
+                        slot[i] += v as f64;
+                    }
+                    i += 1;
+                }
+            }
+
+            let pcm: Vec<i16> = slot.into_iter().map(|v| v.round().clamp(-32767.0, 32767.0) as i16).collect();
+            rx.reset();
+            for blk in pcm.chunks(192) {
+                rx.push_samples(blk);
+            }
+            let mut out = [Decoded { frame: dummy, audio_hz: 0, time_offset_ms: 0, snr_db: 0 }; MAX_DECODED];
+            let n = rx.finish_slot(&mut out);
+            if out[..n].iter().any(|d| d.frame == weak_frame) {
+                ok += 1;
+            }
+        }
+        let frac = ok as f64 / trials as f64;
+        rates.push((snr_db, frac));
+        println!("  SNR={snr_db:+5.1} dB : {ok:3}/{trials} ({:5.1}%)", 100.0 * frac);
+    }
+    if let Some(w) = rates.windows(2).find(|w| w[0].1 >= 0.5 && w[1].1 <= 0.5 && (w[0].1 - w[1].1).abs() > 1e-9) {
+        let snr50 = w[0].0 + (0.5 - w[0].1) / (w[1].1 - w[0].1) * (w[1].0 - w[0].0);
+        println!("  interp_50pct = {snr50:+.2} dB");
+    }
     ExitCode::SUCCESS
 }
 
