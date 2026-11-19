@@ -407,6 +407,43 @@ impl MemSol950Store {
         };
         PeerCallStatus { worked, award }
     }
+
+    /// Worked Maidenhead field bitmask (`324` bits) filtered by `band_m` (`None` = all bands, `Some(10|12|15|17)`).
+    pub fn field_mask_for_band(&self, band_m: Option<u8>) -> [u32; 11] {
+        let Some(bm) = band_m else {
+            return self.field_mask;
+        };
+        let mut mask = [0u32; 11];
+        for c in self.rows.iter().take(self.len as usize) {
+            if dial_band_m(c.dial_hz10) == bm {
+                if let Some((fi, _)) = grid4_to_field_square(&c.peer_grid) {
+                    let i = fi as usize;
+                    if i < 324 {
+                        mask[i / 32] |= 1u32 << (i % 32);
+                    }
+                }
+            }
+        }
+        mask
+    }
+
+    /// Per-square worked counts (`0..100`) inside `field_idx`, filtered by `band_m` (`None` = all bands).
+    pub fn field_squares_for_band(&self, field_idx: u16, band_m: Option<u8>) -> [u16; 100] {
+        let mut out = [0u16; 100];
+        for c in self.rows.iter().take(self.len as usize) {
+            if let Some(bm) = band_m {
+                if dial_band_m(c.dial_hz10) != bm {
+                    continue;
+                }
+            }
+            if let Some((fi, si)) = grid4_to_field_square(&c.peer_grid) {
+                if fi == field_idx && (si as usize) < 100 {
+                    out[si as usize] = out[si as usize].saturating_add(1);
+                }
+            }
+        }
+        out
+    }
 }
 
 impl Sol950Store for MemSol950Store {

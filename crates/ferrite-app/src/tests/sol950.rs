@@ -55,12 +55,17 @@ fn sol950_screens_log_stats_and_worked_grids() {
     t.render(&mut fb);
     t.tap(Key::Exit);
 
-    // Press 4 -> Worked Grids (18x18 overview -> zoom into 10x10 FN -> open filtered Log)
+    // Press 4 -> Worked Grids (1x World -> 3x Region -> 10x Field -> Band filter -> Filtered Log)
     t.tap(Key::Digit(4));
-    assert!(matches!(t.app.screen(), Screen::Sol950(s) if s.page == PAGE_GRIDS_OVERVIEW));
+    assert!(matches!(t.app.screen(), Screen::Sol950(s) if s.page == PAGE_GRIDS_OVERVIEW && s.top == 0));
+    t.render(&mut fb);
+    t.tap(Key::Menu);
+    assert!(matches!(t.app.screen(), Screen::Sol950(s) if s.page == PAGE_GRIDS_OVERVIEW && s.top == 1));
     t.render(&mut fb);
     t.tap(Key::Menu);
     assert!(matches!(t.app.screen(), Screen::Sol950(s) if s.page == PAGE_GRIDS_FIELD));
+    t.tap(Key::Star); // Band filter -> 10m
+    assert!(matches!(t.app.screen(), Screen::Sol950(s) if s.page == PAGE_GRIDS_FIELD && s.sel == 1));
     t.render(&mut fb);
     t.tap(Key::Menu);
     assert!(matches!(t.app.screen(), Screen::Sol950(s) if s.page == PAGE_LOG));

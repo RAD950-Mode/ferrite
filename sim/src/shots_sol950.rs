@@ -182,15 +182,23 @@ pub fn run(scale: u32) {
     press(&mut app, Key::Exit, &mut t);
     step(&mut app, &mut fb, &mut radio, 100, &mut t);
 
-    // 7. Worked Grids 18x18 overview (Digit 4, cursor on FN)
+    // 7. Worked Grids 1x World Map (Digit 4, cursor on FN, All bands)
     press(&mut app, Key::Digit(4), &mut t);
     step(&mut app, &mut fb, &mut radio, 100, &mut t);
     crate::save(&fb, "sol950-grids", scale);
 
-    // 8. Worked Grids 10x10 FN field drill-down (OK)
+    // 7b. Worked Grids 3x Region Map (OK -> 3x zoom centered on FN, showing worked 4-char squares over North America!)
     press(&mut app, Key::Menu, &mut t);
     step(&mut app, &mut fb, &mut radio, 100, &mut t);
+    crate::save(&fb, "sol950-grids-region", scale);
+
+    // 8. Worked Grids 10x FN field drill-down (OK -> 10x zoom over coastline, toggle * to 10m band!)
+    press(&mut app, Key::Menu, &mut t);
+    press(&mut app, Key::Star, &mut t); // Band filter -> 10m (amber)
+    step(&mut app, &mut fb, &mut radio, 100, &mut t);
     crate::save(&fb, "sol950-grids-field", scale);
+    // Exit back to Operate (10x -> 3x -> 1x -> Operate)
+    press(&mut app, Key::Exit, &mut t);
 
     // 9. Chat conversation flow via real keypad navigation:
     //    Operate -> OK (answer K1ABC) -> TX report -> peer R+RX saves QSO -> 2 (Chat) -> peer Accept + Question

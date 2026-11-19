@@ -46,6 +46,7 @@ pub mod sat;
 pub mod rad950_chat;
 pub mod rad950_rdv;
 pub mod sol950;
+pub mod world_map;
 pub mod screens;
 pub mod slotctl;
 pub mod settings;
