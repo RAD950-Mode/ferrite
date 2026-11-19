@@ -81,10 +81,156 @@ fn unpack_dibit_i4(packed: u8) -> (i8, i8) {
     (q0, q1)
 }
 
-/// Packed `i16` length holding `RING_SYMS * 2 * N_BINS = 9,600` bytes during capture, and reused at `finish_slot`
-/// for `post: [i16; 184]` + `c2v: [i8; 525]` LDPC belief-propagation scratch (`447` `i16` words < `4,800`).
+/// Packed `i16` length holding `RING_SYMS * 2 * N_BINS = 9,600` bytes during capture, and reused after
+/// `ACQUIRE_AT_SYM` (`sym == 32`) for:
+/// - `0..840` (`HIST_LEN`): `140 ms` circular `6,000 Hz` PCM ring for rectangular `dt`-aligned Goertzel demodulation.
+/// - `840..3400` (`8 tracks x 80 streaming data symbols x 4 tones`): quantized `log2_q8` rectangular tone energies.
+/// - `3400..3464` (`8 tracks x 8 i16`): `S2` rectangular `on_sum`/`off_sum` (`f32` bit-packed into `i16` pairs).
+/// - `3528..4237`: `post: [i16; 184]` + `c2v: [i16; 525]` LDPC belief-propagation scratch in `finish_slot()`.
 const WORK_BYTES: usize = RING_SYMS * 2 * N_BINS; // 9,600
 const WORK_I16: usize = WORK_BYTES / 2; // 4,800
+const HIST_LEN: usize = 840; // 140 ms @ 6,000 Hz (covers +-20 ms timing shift around 80 ms symbol)
+const REF_START_DATA: usize = 12; // data[12..92] = 80 streaming symbols
+const REF_DATA_SYMS: usize = N_DATA_SYMS - REF_START_DATA; // 80
+const REF_STRIDE: usize = REF_DATA_SYMS * 4; // 320 i16 per track
+const REF_BASE: usize = HIST_LEN; // 840..3400 (2,560 i16)
+const S2_BASE: usize = REF_BASE + MAX_TRACKS * REF_STRIDE; // 3400..3432 (32 i16 = 8 * 2 f32)
+const BP_BASE: usize = 3528; // 3528..4237 (709 i16 < 4800)
+
+/// Fast `no_std` IEEE-754 single-precision square root (accurate to `< 1e-6`).
+#[inline]
+fn sqrt_f32(x: f32) -> f32 {
+    if x <= 0.0 {
+        return 0.0;
+    }
+    let mut y = f32::from_bits((x.to_bits() >> 1) + 0x1fc0_0000);
+    y = 0.5 * (y + x / y);
+    y = 0.5 * (y + x / y);
+    0.5 * (y + x / y)
+}
+
+/// Fast `no_std` `2^x` for `x in [-60, 60]` (accurate to `< 2e-4`).
+#[inline]
+fn exp2_f32(x: f32) -> f32 {
+    let xc = x.clamp(-60.0, 60.0);
+    let n = if xc >= 0.0 { xc as i32 } else { (xc as i32) - 1 };
+    let f = xc - n as f32;
+    let p = 1.0 + f * (core::f32::consts::LN_2 + f * (0.240_226_5 + f * (0.055_504_1 + f * 0.011_122_2)));
+    let scale = f32::from_bits(((n + 127) as u32) << 23);
+    p * scale
+}
+
+/// Fast `no_std` natural logarithm `ln(x)` for `x > 0` (accurate to `< 1e-5`).
+#[inline]
+fn ln_f32(x: f32) -> f32 {
+    if x <= 0.0 {
+        return -80.0;
+    }
+    let bits = x.to_bits();
+    let e = ((bits >> 23) & 0xFF) as i32 - 127;
+    let m = f32::from_bits((bits & 0x007F_FFFF) | 0x3F80_0000);
+    let u = (m - 1.0) / (m + 1.0);
+    let u2 = u * u;
+    let ln_m = 2.0 * u * (1.0 + u2 * (0.333_333_34 + u2 * (0.2 + u2 * 0.142_857_15)));
+    (e as f32) * core::f32::consts::LN_2 + ln_m
+}
+
+/// `ln(I_0(x))` for `x >= 0` (Abramowitz & Stegun 9.8.1 / 9.8.2), exact to `< 1e-5`.
+#[inline(never)]
+fn ln_bessel_i0_f32(x: f32) -> f32 {
+    if x <= 0.0 {
+        return 0.0;
+    }
+    if x < 3.75 {
+        let t = (x / 3.75) * (x / 3.75);
+        let i0 = 1.0
+            + t * (3.515_622_9
+                + t * (3.089_942_4
+                    + t * (1.206_749_2 + t * (0.265_973_2 + t * (0.036_076_8 + t * 0.004_581_3)))));
+        ln_f32(i0)
+    } else {
+        let t = 3.75 / x;
+        let p = 0.398_942_3
+            + t * (0.013_285_92
+                + t * (0.002_253_19
+                    + t * (-0.001_575_65
+                        + t * (0.009_162_81
+                            + t * (-0.020_577_06
+                                + t * (0.026_355_37 + t * (-0.016_476_33 + t * 0.003_923_77)))))));
+        x + ln_f32((p / sqrt_f32(x)).max(1e-30))
+    }
+}
+
+#[inline(never)]
+fn log_sum_exp_f32(a: f32, b: f32) -> f32 {
+    let m = if a > b { a } else { b };
+    let d = if a > b { a - b } else { b - a };
+    if d > 12.0 {
+        m
+    } else {
+        m + ln_f32(1.0 + exp2_f32(-d * core::f32::consts::LOG2_E))
+    }
+}
+
+/// Pure-`f32` `cos(w)` for `w in [0, pi]` (zero `f64` soft-float code on Cortex-M4F, accurate to `< 2e-6`).
+#[inline(never)]
+fn cos_f32(w: f32) -> f32 {
+    let (x, sign) = if w > core::f32::consts::FRAC_PI_2 {
+        (core::f32::consts::PI - w, -1.0f32)
+    } else {
+        (w, 1.0f32)
+    };
+    let x2 = x * x;
+    sign * (1.0 + x2 * (-0.5 + x2 * (0.041_666_668 + x2 * (-0.001_388_889 + x2 * 2.480_158_8e-5))))
+}
+
+/// Rectangular 480-sample (`80 ms`) Goertzel tone energy over circular `hist` (`HIST_LEN = 840`).
+#[inline(never)]
+fn goertzel_energy(hist: &[i16], start_idx: usize, freq_hz: f32) -> f32 {
+    let w = core::f32::consts::TAU * freq_hz / (PROC_RATE_HZ as f32);
+    let c2 = 2.0 * cos_f32(w);
+    let mut s1 = 0.0f32;
+    let mut s2 = 0.0f32;
+    let mut idx = start_idx;
+    for _ in 0..SYM_SAMPLES {
+        let s0 = hist[idx] as f32 + c2 * s1 - s2;
+        s2 = s1;
+        s1 = s0;
+        idx += 1;
+        if idx == HIST_LEN {
+            idx = 0;
+        }
+    }
+    let e = s1 * s1 + s2 * s2 - c2 * s1 * s2;
+    if e > 1.0 { e } else { 1.0 }
+}
+
+/// Pack positive `f32` energy into `u16` Q8 `log2(energy)` (`0.0117 dB` resolution over `0..768 dB`).
+#[inline]
+fn pack_energy_q8(e: f32) -> u16 {
+    let bits = e.max(1.0).to_bits();
+    let exp = (((bits >> 23) & 0xFF) as i32 - 127).max(0) as u32;
+    let m = f32::from_bits((bits & 0x007F_FFFF) | 0x3F80_0000);
+    // `log2(m)` for `m in [1, 2)` via linear+quadratic fit: accurate to `< 0.002` octaves (`0.006 dB`).
+    let f = m - 1.0;
+    let frac = f * (core::f32::consts::LOG2_E - f * (0.491_15 - f * 0.048_45));
+    let q8 = (exp << 8) + (frac * 256.0 + 0.5) as u32;
+    q8.min(u16::MAX as u32) as u16
+}
+
+#[inline]
+fn write_f32_work(work: &mut [i16], idx: usize, v: f32) {
+    let b = v.to_bits();
+    work[idx] = (b & 0xFFFF) as i16;
+    work[idx + 1] = ((b >> 16) & 0xFFFF) as i16;
+}
+
+#[inline]
+fn read_f32_work(work: &[i16], idx: usize) -> f32 {
+    let lo = work[idx] as u16 as u32;
+    let hi = work[idx + 1] as u16 as u32;
+    f32::from_bits(lo | (hi << 16))
+}
 
 static DECIM_TAPS: [i16; 31] = lowpass::<31>(2500.0 / 24000.0);
 static HANN_480: [i16; SYM_SAMPLES] = hann_table();
@@ -143,7 +289,13 @@ struct Track {
     active: bool,
     start_sym: u8,
     phase: u8,
+    /// Fine timing offset in units of 4 decimated samples (`0.667 ms`, range `[-30..+30]` = `+-20 ms`).
+    dt_q4: i8,
     q0: u16, // half-bin index relative to FIRST_BIN
+    /// Fine frequency offset relative to `q0` in units of `0.25 Hz` (range `[-24..+24]` = `+-6.0 Hz`).
+    df_q2: i8,
+    /// First data symbol index (`>= REF_START_DATA`) covered by streaming rectangular Goertzel in `work`.
+    ref_first_d: u8,
     /// Sum of linear power on the 18 active sync tones (`S0 + S1 + S2`, evaluated along winning drift).
     on_pwr_sum: u64,
     /// Sum of linear power across the `18 * 3 = 54` inactive sync tones (`3 x` noise per bin).
@@ -164,7 +316,10 @@ impl Track {
             active: false,
             start_sym: 0,
             phase: 0,
+            dt_q4: 0,
             q0: 0,
+            df_q2: 0,
+            ref_first_d: N_DATA_SYMS as u8,
             on_pwr_sum: 0,
             off_pwr_sum: 0,
             s2_scores: [0; 3],
@@ -172,6 +327,12 @@ impl Track {
             llr_neg_tail: [0; TAIL_DATA_SYMS],
             llr_pos_tail: [0; TAIL_DATA_SYMS],
         }
+    }
+
+    #[inline]
+    fn base_freq_hz(&self) -> f32 {
+        let q0_hz = (2 * FIRST_BIN as u32 + self.q0 as u32) as f32 * (PROC_RATE_HZ as f32 / (2.0 * FFT_N as f32));
+        q0_hz + (self.df_q2 as f32) * 0.25
     }
 }
 
@@ -227,14 +388,28 @@ impl Receiver {
     }
 
     /// Diagnostic hook: bypass blind `S0 + S1` acquisition and pin track 0 to the nearest `(start_sym, phase, q0)`
-    /// for a known burst start time (`start_ms` from slot edge) and base tone (`audio_hz`). Call right after `reset()`.
+    /// with sub-grid `(dt_q4, df_q2)` for a known burst start time (`start_ms`) and base tone (`audio_hz`).
     pub fn set_oracle_track(&mut self, start_ms: u32, audio_hz: u32) {
         let h = ((start_ms + 20) / 40) as usize;
         let start_sym = (h / 2) as u8;
         let phase = (h % 2) as u8;
+        let dt_ms = start_ms as i32 - (h as i32 * 40);
+        let dt_q4 = ((dt_ms * 6) / 4).clamp(-30, 30) as i8; // 6 samples/ms / 4
         let half_bin = ((audio_hz as u64 * (FFT_N as u64 * 2) + (PROC_RATE_HZ as u64 / 2)) / PROC_RATE_HZ as u64) as usize;
         let q0 = half_bin.saturating_sub(2 * FIRST_BIN).min((N_BINS - 2) * 2) as u16;
-        self.tracks[0] = Track { active: true, start_sym, phase, q0, ..Track::empty() };
+        let q0_hz = (2 * FIRST_BIN as u32 + q0 as u32) as f32 * (PROC_RATE_HZ as f32 / (2.0 * FFT_N as f32));
+        let df_q2 = ((audio_hz as f32 - q0_hz) * 4.0).clamp(-24.0, 24.0) as i8;
+        self.tracks[0] = Track {
+            active: true,
+            start_sym,
+            phase,
+            dt_q4,
+            q0,
+            df_q2,
+            ref_first_d: REF_START_DATA as u8,
+            ..Track::empty()
+        };
+        self.work.fill(0);
         self.acquired = true;
     }
 
@@ -269,6 +444,9 @@ impl Receiver {
             if let Some(y) = self.decim.push(x, &DECIM_TAPS, DECIM_FACTOR) {
                 self.pcm_ring[self.pcm_pos] = y;
                 self.pcm_pos = if self.pcm_pos + 1 == SYM_SAMPLES { 0 } else { self.pcm_pos + 1 };
+                if self.acquired {
+                    self.work[(self.decim_count as usize) % HIST_LEN] = y;
+                }
                 self.decim_count += 1;
 
                 if self.decim_count >= SYM_SAMPLES as u32
@@ -331,6 +509,67 @@ impl Receiver {
             let rel = sym - start;
             if rel < N_SYMBOLS {
                 self.feed_track_symbol(tr_i, rel, &cur_bins);
+            }
+        }
+
+        // Streaming rectangular Goertzel demodulation on the 140 ms circular PCM ring (`work[0..HIST_LEN]`).
+        // Evaluated 1 half-symbol (+40 ms = 240 samples) after each track's nominal symbol end so any
+        // `dt_samp in [-120..+120]` (`+-20 ms`) window lies completely inside `work[0..HIST_LEN]`.
+        let h_cur = sym * 2 + phase;
+        if h_cur > 0 && self.decim_count as usize >= HIST_LEN {
+            let h_prev = h_cur - 1;
+            let df_tone = if self.tone_q_off[3] == 26 {
+                DEFAULT_SPACING_HZ as f32
+            } else {
+                (self.tone_q_off[3] as f32) * (PROC_RATE_HZ as f32 / (6.0 * FFT_N as f32))
+            };
+            for tr_i in 0..MAX_TRACKS {
+                if !self.tracks[tr_i].active {
+                    continue;
+                }
+                let h_start = self.tracks[tr_i].start_sym as usize * 2 + self.tracks[tr_i].phase as usize;
+                if h_prev < h_start || ((h_prev - h_start) & 1) != 0 {
+                    continue;
+                }
+                let rel = (h_prev - h_start) >> 1;
+                if rel >= N_SYMBOLS {
+                    continue;
+                }
+                let is_s2 = rel >= 104;
+                let d_opt = if !is_s2 && rel >= 24 { Some(12 + (rel - 24)) } else { None };
+                if !is_s2 && d_opt.is_none_or(|d| d >= N_DATA_SYMS) {
+                    continue;
+                }
+                let dt_samp = self.tracks[tr_i].dt_q4 as i32 * 4;
+                let win_start = (self.decim_count as i32 - 720 + dt_samp) as usize % HIST_LEN;
+                let f0 = self.tracks[tr_i].base_freq_hz();
+                let mut e = [0.0f32; 4];
+                for (t, slot) in e.iter_mut().enumerate() {
+                    *slot = goertzel_energy(&self.work[..HIST_LEN], win_start, f0 + t as f32 * df_tone);
+                }
+                if is_s2 {
+                    let w = S2[rel - 104] as usize;
+                    let base = S2_BASE + tr_i * 4;
+                    let mut on = read_f32_work(&self.work, base);
+                    let mut off = read_f32_work(&self.work, base + 2);
+                    for (t, &et) in e.iter().enumerate() {
+                        if t == w {
+                            on += et;
+                        } else {
+                            off += et;
+                        }
+                    }
+                    write_f32_work(&mut self.work, base, on);
+                    write_f32_work(&mut self.work, base + 2, off);
+                } else if let Some(d) = d_opt {
+                    let base = REF_BASE + tr_i * REF_STRIDE + (d - REF_START_DATA) * 4;
+                    for (t, &et) in e.iter().enumerate() {
+                        self.work[base + t] = pack_energy_q8(et) as i16;
+                    }
+                    if (d as u8) < self.tracks[tr_i].ref_first_d {
+                        self.tracks[tr_i].ref_first_d = d as u8;
+                    }
+                }
             }
         }
     }
@@ -499,6 +738,59 @@ impl Receiver {
             };
             let s_usize = start_sym as usize;
             let ph_usize = phase as usize;
+            // Refine sub-bin frequency (`df_q2`) and sub-half-symbol timing (`dt_q4`) via 3-point
+            // parabolic interpolation on `S0 + S1` log-power in `work` before `work` is reused.
+            let sync_log_sum = |s_a: usize, ph_a: usize, q_a: u16| -> f32 {
+                let mut acc = 0i32;
+                for (k, &w) in S0.iter().enumerate() {
+                    let b = self.read_ring_bins((s_a + k) % RING_SYMS, ph_a);
+                    acc += Self::sample_tone(&b, q_a, &self.tone_q_off, w as usize);
+                }
+                for (k, &w) in S1.iter().enumerate() {
+                    let b = self.read_ring_bins((s_a + 18 + k) % RING_SYMS, ph_a);
+                    acc += Self::sample_tone(&b, q_a, &self.tone_q_off, w as usize);
+                }
+                acc as f32
+            };
+            let q_u16 = q0 as u16;
+            let df_q2 = if q_u16 >= 2 && (q_u16 as usize + 2) < n_q {
+                let ym = sync_log_sum(s_usize, ph_usize, q_u16 - 2);
+                let y0 = sync_log_sum(s_usize, ph_usize, q_u16);
+                let yp = sync_log_sum(s_usize, ph_usize, q_u16 + 2);
+                let denom = ym - 2.0 * y0 + yp;
+                if denom < -1e-3 {
+                    let delta_bins = (0.5 * (ym - yp) / denom).clamp(-0.5, 0.5);
+                    let df_hz = delta_bins * (PROC_RATE_HZ as f32 / FFT_N as f32);
+                    let q2 = (df_hz * 4.0) + if df_hz >= 0.0 { 0.5 } else { -0.5 };
+                    (q2 as i32).clamp(-24, 24) as i8
+                } else {
+                    0
+                }
+            } else {
+                0
+            };
+            let h_start = s_usize * 2 + ph_usize;
+            let dt_q4 = if (2..MAX_START_SYM * 2 + 1).contains(&h_start) {
+                let hm = h_start - 1;
+                let hp = h_start + 1;
+                let tm = sync_log_sum(hm >> 1, hm & 1, q_u16);
+                let t0 = sync_log_sum(s_usize, ph_usize, q_u16);
+                let tp = sync_log_sum(hp >> 1, hp & 1, q_u16);
+                let denom = tm - 2.0 * t0 + tp;
+                if denom < -1e-3 {
+                    let delta_half = (0.5 * (tm - tp) / denom).clamp(-0.5, 0.5);
+                    let dt_samp = delta_half * (HALF_SAMPLES as f32);
+                    let q4 = (dt_samp * 0.25) + if dt_samp >= 0.0 { 0.5 } else { -0.5 };
+                    (q4 as i32).clamp(-30, 30) as i8
+                } else {
+                    0
+                }
+            } else {
+                0
+            };
+            self.tracks[chosen_n].df_q2 = df_q2;
+            self.tracks[chosen_n].dt_q4 = dt_q4;
+
             for sym in s_usize..=ACQUIRE_AT_SYM {
                 let rel = sym - s_usize;
                 if rel < N_SYMBOLS {
@@ -506,7 +798,53 @@ impl Receiver {
                     self.feed_track_symbol(chosen_n, rel, &bins);
                 }
             }
+            // Upgrade early backfilled data symbols (`rel <= ACQUIRE_AT_SYM - start_sym`) to `ln I_0`
+            // linear-power LLRs scaled to match the streaming rectangular Goertzel LLRs (`* 12.0`).
+            let off_sum = self.tracks[chosen_n].off_pwr_sum as f32;
+            let on_sum = self.tracks[chosen_n].on_pwr_sum as f32;
+            if off_sum > 0.0 {
+                let n0 = (off_sum / 36.0).max(1.0);
+                let e_on = on_sum / 12.0;
+                let gamma = ((e_on / n0) - 1.0).clamp(0.3, 20.0);
+                for sym in s_usize..=ACQUIRE_AT_SYM {
+                    let rel = sym - s_usize;
+                    if rel < 6 || (18..24).contains(&rel) || rel >= 104 {
+                        continue;
+                    }
+                    let d = if rel < 18 { rel - 6 } else { 12 + (rel - 24) };
+                    if d >= N_DATA_SYMS {
+                        continue;
+                    }
+                    let bins = self.read_ring_bins(sym % RING_SYMS, ph_usize);
+                    let mut lp = [0.0f32; 4];
+                    for (t, slot) in lp.iter_mut().enumerate() {
+                        let b = Self::sample_tone(&bins, q_u16, &self.tone_q_off, t).clamp(0, 255) as u8;
+                        let ratio = lin_power(b) as f32 / n0;
+                        *slot = ln_bessel_i0_f32(2.0 * sqrt_f32(gamma * ratio));
+                    }
+                    let llr0 = (log_sum_exp_f32(lp[0], lp[1]) - log_sum_exp_f32(lp[2], lp[3])) * 12.0;
+                    let llr1 = (log_sum_exp_f32(lp[0], lp[3]) - log_sum_exp_f32(lp[1], lp[2])) * 12.0;
+                    let r0 = llr0 + if llr0 >= 0.0 { 0.5 } else { -0.5 };
+                    let r1 = llr1 + if llr1 >= 0.0 { 0.5 } else { -0.5 };
+                    self.tracks[chosen_n].llr_zero[2 * d] = (r0 as i32).clamp(-120, 120) as i8;
+                    self.tracks[chosen_n].llr_zero[2 * d + 1] = (r1 as i32).clamp(-120, 120) as i8;
+                }
+            }
             chosen_n += 1;
+        }
+
+        // Transition `self.work` from the acquisition spectrogram to the streaming PCM ring + Goertzel store.
+        self.work.fill(0);
+        if self.decim_count as usize >= SYM_SAMPLES {
+            let start_cnt = self.decim_count as usize - SYM_SAMPLES;
+            let mut r_idx = self.pcm_pos;
+            for i in 0..SYM_SAMPLES {
+                self.work[(start_cnt + i) % HIST_LEN] = self.pcm_ring[r_idx];
+                r_idx += 1;
+                if r_idx == SYM_SAMPLES {
+                    r_idx = 0;
+                }
+            }
         }
     }
 
@@ -620,12 +958,8 @@ impl Receiver {
     }
 
     /// Run serial normalized min-sum LDPC + CRC-14 decoding across all admitted tracks at end of slot, reusing
-    /// `self.work` (`[i16; 4800]`) for `post` (`184`) and `c2v` (`525`) scratch and ranking drift branches by `S2`.
+    /// `self.work[BP_BASE..]` for `post` (`184`) and `c2v` (`525`) scratch so `REF_BASE..S2_BASE` stays intact.
     pub fn finish_slot(&mut self, out: &mut [Decoded; MAX_DECODED]) -> usize {
-        let (post_slice, rest) = self.work.split_at_mut(N_BITS);
-        let post: &mut [i16; N_BITS] = post_slice.try_into().unwrap();
-        let c2v: &mut [i16; N_EDGES] = (&mut rest[..N_EDGES]).try_into().unwrap();
-
         let mut raw_llr = [0i8; N_BITS];
         let mut deinter = [0i8; N_BITS];
         let mut n_out = 0usize;
@@ -634,49 +968,93 @@ impl Receiver {
             if !self.tracks[tr_i].active || n_out >= MAX_DECODED {
                 continue;
             }
-            // Rank the 3 drift branches `0 = neg (-2), 1 = zero (0), 2 = pos (+2)` by measured `S2` tail-sync score
-            // (with small +6 tie-break bias toward zero drift when stationary).
-            let sc = [
-                self.tracks[tr_i].s2_scores[0],
-                self.tracks[tr_i].s2_scores[1].saturating_add(16),
-                self.tracks[tr_i].s2_scores[2],
-            ];
-            let mut order = [1usize, 0, 2];
-            if sc[order[1]] > sc[order[0]] {
-                order.swap(0, 1);
-            }
-            if sc[order[2]] > sc[order[1]] {
-                order.swap(1, 2);
-                if sc[order[1]] > sc[order[0]] {
-                    order.swap(0, 1);
-                }
-            }
-
             let mut decoded_frame = None;
-            for &branch in &order {
+
+            // Priority 1: refined rectangular-windowed Goertzel `ln I_0` LLRs (using `S2` local noise `N0` & `gamma`).
+            let s2_base = S2_BASE + tr_i * 4;
+            let s2_on = read_f32_work(&self.work, s2_base);
+            let s2_off = read_f32_work(&self.work, s2_base + 2);
+            let ref_first = self.tracks[tr_i].ref_first_d as usize;
+            if s2_off > 0.0 && ref_first < N_DATA_SYMS {
+                let n0 = (s2_off / 18.0).max(1.0);
+                let e_on = s2_on / 6.0;
+                let gamma = ((e_on / n0) - 1.0).clamp(0.3, 20.0);
+                let n0_q8 = pack_energy_q8(n0) as f32;
                 raw_llr.copy_from_slice(&self.tracks[tr_i].llr_zero);
-                if branch == 0 {
-                    for (ti, &pk) in self.tracks[tr_i].llr_neg_tail.iter().enumerate() {
-                        let (b0, b1) = unpack_dibit_i4(pk);
-                        let bit_i = (DRIFT_START_DATA + ti) * 2;
-                        raw_llr[bit_i] = b0;
-                        raw_llr[bit_i + 1] = b1;
+                for d in ref_first..N_DATA_SYMS {
+                    let base = REF_BASE + tr_i * REF_STRIDE + (d - REF_START_DATA) * 4;
+                    let mut lp = [0.0f32; 4];
+                    for (t, slot) in lp.iter_mut().enumerate() {
+                        let e_q8 = self.work[base + t] as u16 as f32;
+                        let ratio = exp2_f32((e_q8 - n0_q8) * (1.0 / 256.0));
+                        *slot = ln_bessel_i0_f32(2.0 * sqrt_f32(gamma * ratio));
                     }
-                } else if branch == 2 {
-                    for (ti, &pk) in self.tracks[tr_i].llr_pos_tail.iter().enumerate() {
-                        let (b0, b1) = unpack_dibit_i4(pk);
-                        let bit_i = (DRIFT_START_DATA + ti) * 2;
-                        raw_llr[bit_i] = b0;
-                        raw_llr[bit_i + 1] = b1;
-                    }
+                    let llr0 = (log_sum_exp_f32(lp[0], lp[1]) - log_sum_exp_f32(lp[2], lp[3])) * 12.0;
+                    let llr1 = (log_sum_exp_f32(lp[0], lp[3]) - log_sum_exp_f32(lp[1], lp[2])) * 12.0;
+                    let r0 = llr0 + if llr0 >= 0.0 { 0.5 } else { -0.5 };
+                    let r1 = llr1 + if llr1 >= 0.0 { 0.5 } else { -0.5 };
+                    raw_llr[2 * d] = (r0 as i32).clamp(-120, 120) as i8;
+                    raw_llr[2 * d + 1] = (r1 as i32).clamp(-120, 120) as i8;
                 }
                 for code_i in 0..N_BITS {
                     deinter[code_i] = raw_llr[interleave_idx(code_i)];
                 }
+                let (post_slice, rest) = self.work[BP_BASE..].split_at_mut(N_BITS);
+                let post: &mut [i16; N_BITS] = post_slice.try_into().unwrap();
+                let c2v: &mut [i16; N_EDGES] = (&mut rest[..N_EDGES]).try_into().unwrap();
                 if let Some(bits78) = ldpc::decode_bp_with_slices(&deinter, post, c2v, LDPC_MAX_ITER) {
                     if let Some(f) = Frame::from_bits78(&bits78) {
                         decoded_frame = Some(f);
-                        break;
+                    }
+                }
+            }
+
+            // Priority 2: fallback to 3-branch linear drift decoder (`-11.7, 0, +11.7 Hz`) ranked by `S2`.
+            if decoded_frame.is_none() {
+                let sc = [
+                    self.tracks[tr_i].s2_scores[0],
+                    self.tracks[tr_i].s2_scores[1].saturating_add(16),
+                    self.tracks[tr_i].s2_scores[2],
+                ];
+                let mut order = [1usize, 0, 2];
+                if sc[order[1]] > sc[order[0]] {
+                    order.swap(0, 1);
+                }
+                if sc[order[2]] > sc[order[1]] {
+                    order.swap(1, 2);
+                    if sc[order[1]] > sc[order[0]] {
+                        order.swap(0, 1);
+                    }
+                }
+
+                let (post_slice, rest) = self.work[BP_BASE..].split_at_mut(N_BITS);
+                let post: &mut [i16; N_BITS] = post_slice.try_into().unwrap();
+                let c2v: &mut [i16; N_EDGES] = (&mut rest[..N_EDGES]).try_into().unwrap();
+                for &branch in &order {
+                    raw_llr.copy_from_slice(&self.tracks[tr_i].llr_zero);
+                    if branch == 0 {
+                        for (ti, &pk) in self.tracks[tr_i].llr_neg_tail.iter().enumerate() {
+                            let (b0, b1) = unpack_dibit_i4(pk);
+                            let bit_i = (DRIFT_START_DATA + ti) * 2;
+                            raw_llr[bit_i] = b0;
+                            raw_llr[bit_i + 1] = b1;
+                        }
+                    } else if branch == 2 {
+                        for (ti, &pk) in self.tracks[tr_i].llr_pos_tail.iter().enumerate() {
+                            let (b0, b1) = unpack_dibit_i4(pk);
+                            let bit_i = (DRIFT_START_DATA + ti) * 2;
+                            raw_llr[bit_i] = b0;
+                            raw_llr[bit_i + 1] = b1;
+                        }
+                    }
+                    for code_i in 0..N_BITS {
+                        deinter[code_i] = raw_llr[interleave_idx(code_i)];
+                    }
+                    if let Some(bits78) = ldpc::decode_bp_with_slices(&deinter, post, c2v, LDPC_MAX_ITER) {
+                        if let Some(f) = Frame::from_bits78(&bits78) {
+                            decoded_frame = Some(f);
+                            break;
+                        }
                     }
                 }
             }
