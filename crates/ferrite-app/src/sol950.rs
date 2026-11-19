@@ -447,6 +447,8 @@ pub struct Sol950Host {
     pub store: MemSol950Store,
     pub notice: [u8; 28],
     pub notice_len: u8,
+    /// Diagnostic counters copied from the DSP task: `[finishes, last_syms, last_tracks, total_decoded]`.
+    pub diag: [u32; 4],
 }
 
 impl Default for Sol950Host {
@@ -488,6 +490,7 @@ impl Sol950Host {
             store: MemSol950Store::new(),
             notice: [0; 28],
             notice_len: 0,
+            diag: [0; 4],
         }
     }
 
@@ -538,8 +541,10 @@ impl Sol950Host {
         }
         let slot = utc_sec / 10;
         let sec_in_slot = utc_sec % 10;
-        // Finish the RX slot decoder inside the 1.20 s inter-slot guard (after +9.20 s).
-        if sec_in_slot == 9 && ms_in_sec >= 300 && self.finish_sent_slot != slot {
+        // Finish the RX slot decoder at `+9.55 s` (after the latest valid burst at `start_sym=9` ends at `+9.52 s`).
+        // On the 120 MHz M4, 8-track x 3-branch LDPC `finish_slot()` takes ~420 ms, so `Receiver::reset()` +
+        // `audio::capture_start()` land right at `+9.97..10.00 s` (aligned with the `0.00 s` UTC slot edge).
+        if sec_in_slot == 9 && ms_in_sec >= 550 && self.finish_sent_slot != slot {
             self.finish_sent_slot = slot;
             if !self.tx_in_flight {
                 self.finish_due = true;
@@ -547,6 +552,12 @@ impl Sol950Host {
         }
         // Advance the session state machine on each 10 s UTC slot boundary.
         if slot != self.last_slot {
+            // Safety net: if the previous slot rolled over before `ms_in_sec >= 940` was polled, still
+            // flush the RX decoder once so no slot is ever silently dropped.
+            if self.last_slot != u32::MAX && self.finish_sent_slot != self.last_slot && !self.tx_in_flight {
+                self.finish_sent_slot = self.last_slot;
+                self.finish_due = true;
+            }
             self.last_slot = slot;
             let utc_ok = self.utc_ready() && self.profile.callsign().is_some();
             let plan = self.engine.begin_slot(slot, utc_ok);
@@ -708,5 +719,23 @@ impl App {
     pub fn sol950_take_finish(&mut self) -> bool {
         let Some(h) = self.sol950d.as_deref_mut() else { return false };
         core::mem::take(&mut h.finish_due)
+    }
+
+    /// Maximum sleep duration (ms) for the UI task while SOL950 is active, so `DspCmd::Sol950Finish`
+    /// (`+9.94 s`) and `Sol950Tx` (`0.00 s`) fire within `<= 10 ms` even when the display is dark.
+    pub fn sol950_next_wake_ms(&self) -> Option<u32> {
+        if !self.sol950_open() {
+            return None;
+        }
+        let h = self.sol950d.as_deref()?;
+        if h.utc_sec == 0 {
+            return Some(250);
+        }
+        let slot_ms = (h.utc_sec % 10) * 1000 + h.utc_ms_in_sec as u32;
+        if !(50..9_500).contains(&slot_ms) {
+            Some(10)
+        } else {
+            Some(9_500 - slot_ms)
+        }
     }
 }

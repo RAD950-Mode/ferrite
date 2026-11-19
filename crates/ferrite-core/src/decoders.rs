@@ -108,6 +108,16 @@ impl Decoder {
         }
     }
 
+    /// Diagnostic snapshot of the active SOL950 receiver: `(symbols, active_tracks, acquired)`.
+    pub fn sol950_diag(&self) -> (u16, u8, bool) {
+        if self.kind == DecoderKind::Sol950 {
+            let d = unsafe { &*self.inner.sol950 };
+            d.diag()
+        } else {
+            (0, 0, false)
+        }
+    }
+
     /// Finish the current 10 s SOL950 UTC slot, write decoded frames to `out`, and reset for the next slot.
     #[inline(never)]
     pub fn sol950_finish(&mut self, out: &mut [usol950::Decoded; usol950::MAX_DECODED]) -> usize {

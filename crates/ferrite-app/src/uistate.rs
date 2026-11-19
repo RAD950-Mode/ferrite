@@ -772,38 +772,44 @@ fn body<S: ChannelStore>(app: &App, cx: &Cx<S>, d: &mut Desc) {
             use crate::sol950::Sol950Store;
             use ferrite_core::sol950::usol950::{frame::decode_grid4, Callsign, GRID_UNKNOWN};
             use ferrite_core::sol950::{ActivityRow, MAX_PEERS};
+            let mut rows = [ActivityRow {
+                peer: Callsign::from_raw(0).unwrap(),
+                grid4: GRID_UNKNOWN,
+                snr_db: 0,
+                last_seen_slot: 0,
+                window: 0,
+                owed_reply: None,
+                logged: false,
+            }; MAX_PEERS];
+            let n = app.sol950_host().map_or(0, |h| h.engine.activity_rows(&mut rows));
             if let Some(l) = d.ln() {
                 l.push(b"sol950 ");
                 l.push(screens::sol950::page_id(&s).as_bytes());
                 if let Some(h) = app.sol950_host() {
-                    let mut rows = [ActivityRow {
-                        peer: Callsign::from_raw(0).unwrap(),
-                        grid4: GRID_UNKNOWN,
-                        snr_db: 0,
-                        last_seen_slot: 0,
-                        window: 0,
-                        owed_reply: None,
-                        logged: false,
-                    }; MAX_PEERS];
-                    let n = h.engine.activity_rows(&mut rows);
+                    let slot_ms = (h.utc_sec % 10) * 1000 + h.utc_ms_in_sec as u32;
                     let _ = ufmt::uwrite!(
                         l,
-                        " utc={} rx={} saved={} tx={}",
+                        " utc={} slot_ms={} rx={} saved={} tx={} fin={} sym={} trk={} dec={}",
                         h.utc_ready() as u8,
+                        slot_ms,
                         n,
                         h.store.count(),
-                        h.tx_in_flight as u8
+                        h.tx_in_flight as u8,
+                        h.diag[0],
+                        h.diag[1],
+                        h.diag[2],
+                        h.diag[3]
                     );
-                    for r in &rows[..n.min(4)] {
-                        if let Some(pl) = d.ln() {
-                            let mut cb = [0u8; 6];
-                            let cn = r.peer.decode(&mut cb);
-                            let cs = core::str::from_utf8(&cb[..cn]).unwrap_or("?");
-                            let gb = decode_grid4(r.grid4).unwrap_or(*b"----");
-                            let gs = core::str::from_utf8(&gb).unwrap_or("----");
-                            let _ = ufmt::uwrite!(pl, "sol950_peer {} {} {}dB", cs, gs, r.snr_db);
-                        }
-                    }
+                }
+            }
+            for r in &rows[..n.min(4)] {
+                if let Some(pl) = d.ln() {
+                    let mut cb = [0u8; 6];
+                    let cn = r.peer.decode(&mut cb);
+                    let cs = core::str::from_utf8(&cb[..cn]).unwrap_or("?");
+                    let gb = decode_grid4(r.grid4).unwrap_or(*b"----");
+                    let gs = core::str::from_utf8(&gb).unwrap_or("----");
+                    let _ = ufmt::uwrite!(pl, "sol950_peer {} {} {}dB", cs, gs, r.snr_db);
                 }
             }
         }

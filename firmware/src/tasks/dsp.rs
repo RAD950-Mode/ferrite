@@ -359,6 +359,9 @@ fn feed(slot: &mut Decoder, x: &[i16], level: u16, heard: &mut bool, since_cap: 
     }
     *heard = busy;
 }
+/// Bench diagnostic counters for `DspCmd::Sol950Finish`: `[finishes, last_syms, last_tracks, total_decoded]`.
+#[cfg(feature = "bench")]
+pub static SOL950_DIAG: [AtomicU32; 4] = [AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0)];
 #[cfg(feature = "bench")]
 pub static WORK_MAX_US: AtomicU32 = AtomicU32::new(0);
 
@@ -462,8 +465,17 @@ pub async fn task() {
                         audio::capture_stop();
                     }
                     use ferrite_core::sol950::usol950::{Decoded, MAX_DECODED};
+                    #[cfg(feature = "bench")]
+                    let (d_syms, d_trk, _d_acq) = slot.sol950_diag();
                     let mut out = [Decoded::EMPTY; MAX_DECODED];
                     let n = slot.sol950_finish(&mut out);
+                    #[cfg(feature = "bench")]
+                    {
+                        SOL950_DIAG[0].fetch_add(1, Relaxed);
+                        SOL950_DIAG[1].store(d_syms as u32, Relaxed);
+                        SOL950_DIAG[2].store(d_trk as u32, Relaxed);
+                        SOL950_DIAG[3].fetch_add(n as u32, Relaxed);
+                    }
                     for d in &out[..n] {
                         if crate::chan::SOL950_RX.try_send(*d).is_err() {
                             DROPPED.fetch_add(1, Relaxed);

@@ -612,6 +612,13 @@ impl Receiver {
         Some(out)
     }
 
+    /// Diagnostic snapshot: `(completed_symbols, active_tracks, acquired)`.
+    pub fn diag(&self) -> (u16, u8, bool) {
+        let syms = (self.decim_count / SYM_SAMPLES as u32).min(u16::MAX as u32) as u16;
+        let active = self.tracks.iter().filter(|t| t.active).count() as u8;
+        (syms, active, self.acquired)
+    }
+
     /// Run serial normalized min-sum LDPC + CRC-14 decoding across all admitted tracks at end of slot, reusing
     /// `self.work` (`[i16; 4800]`) for `post` (`184`) and `c2v` (`525`) scratch and ranking drift branches by `S2`.
     pub fn finish_slot(&mut self, out: &mut [Decoded; MAX_DECODED]) -> usize {

@@ -1148,6 +1148,9 @@ pub async fn task() {
         if !draw && !asleep {
             period = period.min(frame_min.saturating_sub(since).max(1) as u64); // the frame held back, drawn on time
         }
+        if let Some(w) = app.sol950_next_wake_ms() {
+            period = period.min(w as u64);
+        }
         if leds.next_ms != 0 {
             period = period.min(leds.next_ms as u64);
         }
@@ -1650,6 +1653,12 @@ async fn sol950_step(
     };
     if let Some(h) = app.sol950_host_mut() {
         h.update_clock(utc_sec, ms_in_sec, uncert_ms, gps_grid);
+        #[cfg(feature = "bench")]
+        {
+            for (dst, src) in h.diag.iter_mut().zip(&crate::tasks::dsp::SOL950_DIAG) {
+                *dst = src.load(Relaxed);
+            }
+        }
     }
 
     if app.sol950_take_finish() {
