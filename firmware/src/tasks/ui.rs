@@ -1470,6 +1470,17 @@ fn sol950_mount_flash(store: &crate::store::Store, app: &mut App) -> ferrite_sto
             h.profile.tx_power = cfg.tx_power;
             h.profile.coop_rx = ferrite_app::sol950::CoopRxMode::from_u8(cfg.coop_rx);
             h.profile.coop_link = ferrite_app::sol950::CoopLink::from_u8(cfg.coop_link);
+            h.chat.station_card.rig = cfg.card_rig;
+            h.chat.station_card.ant = cfg.card_ant;
+            h.chat.station_card.height_m = cfg.card_height_m;
+            h.chat.station_card.amp = cfg.card_amp;
+            h.chat.station_card.pwr_dbm = match cfg.tx_power {
+                0 => 30,
+                1 => 34,
+                _ => 37,
+            };
+            h.rdv.band_mask = cfg.rdv_band_mask;
+            h.rdv.follow_schedule = cfg.rdv_follow;
             h.sync_engine_config();
         }
     }
@@ -1521,12 +1532,12 @@ async fn sol950_step(
         let dirty_prof = app.sol950_host_mut().and_then(|h| {
             if h.profile_dirty {
                 h.profile_dirty = false;
-                Some(h.profile)
+                Some((h.profile, h.chat.station_card, h.rdv.band_mask, h.rdv.follow_schedule))
             } else {
                 None
             }
         });
-        if let Some(p) = dirty_prof {
+        if let Some((p, sc, rdv_mask, rdv_follow)) = dirty_prof {
             let mut rec = ferrite_store::sol950::Sol950CfgRecord {
                 gen: 0,
                 base_call: p.base_call,
@@ -1541,6 +1552,12 @@ async fn sol950_step(
                 tx_power: p.tx_power,
                 coop_rx: p.coop_rx as u8,
                 coop_link: p.coop_link as u8,
+                card_rig: sc.rig,
+                card_ant: sc.ant,
+                card_height_m: sc.height_m,
+                card_amp: sc.amp,
+                rdv_band_mask: rdv_mask,
+                rdv_follow,
             };
             let mut nor = store.sol950_nor();
             let _ = ferrite_store::sol950::save_cfg(&mut nor, &mut rec).await;
@@ -1639,10 +1656,13 @@ async fn sol950_step(
         }
     }
 
-    // Update sub-second UTC & onboard GPS grid from `store.extra.gps.onboard_fix()` + NMEA `$` burst tick.
+    // Update sub-second UTC & onboard GPS grid + Distress position from `store.extra.gps.onboard_fix()` + NMEA `$` burst tick.
     let g = &store.extra.gps;
     let (utc_sec, ms_in_sec, uncert_ms, gps_grid) = if let Some(fix) = g.onboard_fix() {
         let grid = Some(ferrite_app::gpsdata::pos_to_grid4(fix.lat, fix.lon));
+        if let Some(h) = app.sol950_host_mut() {
+            h.chat.distress.update_gps_pos(fix.lat, fix.lon, true);
+        }
         if fix.unix != 0 {
             let burst_tick = crate::tasks::gps::last_burst_tick();
             let now_tick = Instant::now().as_ticks() as u32;

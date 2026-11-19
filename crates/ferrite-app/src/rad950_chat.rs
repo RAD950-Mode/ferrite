@@ -79,6 +79,17 @@ impl DistressState {
         self.armed_alert.is_some() || self.armed_pos.is_some()
     }
 
+    /// Update distress coordinates from an onboard GPS fix (`lat_1e7`, `lon_1e7` in `1e-7` degrees).
+    /// Respects operator-selected `Manual` or `Unavailable` modes without overwriting them.
+    pub fn update_gps_pos(&mut self, lat_1e7: i32, lon_1e7: i32, fresh: bool) {
+        if matches!(self.loc_src, DistressLocSource::FreshGps | DistressLocSource::LastKnownGps) {
+            self.lat_e4 = (lat_1e7 / 1_000).clamp(-900_000, 900_000);
+            let lon = (lon_1e7 / 1_000).clamp(-1_800_000, 1_800_000);
+            self.lon_e4 = if lon == 1_800_000 { -1_800_000 } else { lon };
+            self.loc_src = if fresh { DistressLocSource::FreshGps } else { DistressLocSource::LastKnownGps };
+        }
+    }
+
     pub fn arm_tx(&mut self, sender: Callsign, grid4: Option<u16>, dial_hz10: u32) {
         self.tx_seq = self.tx_seq.wrapping_add(1) & 0x1F;
         self.armed_dial_hz10 = dial_hz10;

@@ -17,7 +17,8 @@ pub const CAPACITY: usize = SECTORS * PER_SECTOR; // 1,008 durable contacts
 const LOG_MAGIC: [u8; 2] = *b"SL";
 const LOG_VERSION: u8 = 1;
 const CFG_MAGIC: [u8; 2] = *b"SC";
-const CFG_VERSION: u8 = 1;
+const CFG_VERSION_V1: u8 = 1;
+const CFG_VERSION: u8 = 2;
 
 /// Durable 64-byte SOL950 contact record stored in `SOL950_LOG`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -437,7 +438,7 @@ impl Sol950Journal {
 
 // ---- SOL950_CFG A/B profile store ----
 
-const CFG_BYTES: usize = 32;
+const CFG_BYTES: usize = 40;
 
 /// Persisted SOL950 station profile stored in `SOL950_CFG` (A/B sectors).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -457,6 +458,18 @@ pub struct Sol950CfgRecord {
     pub coop_rx: u8,
     /// Cooperative RX link transport (`0 = USB`, `1 = Bluetooth`).
     pub coop_link: u8,
+    /// Station Card rig catalog ID (`1` = RT-950 Pro).
+    pub card_rig: u16,
+    /// Station Card antenna catalog ID (`1` = dipole).
+    pub card_ant: u8,
+    /// Station Card antenna height in whole meters (`127` = unset).
+    pub card_height_m: u8,
+    /// Station Card external amplifier flag.
+    pub card_amp: bool,
+    /// Ad-hoc Rendezvous enabled band mask (`bit 0=10m, 1=12m, 2=15m, 3=17m`).
+    pub rdv_band_mask: u8,
+    /// Ad-hoc Rendezvous `Follow schedule` toggle.
+    pub rdv_follow: bool,
 }
 
 impl Sol950CfgRecord {
@@ -477,20 +490,37 @@ impl Sol950CfgRecord {
         b[21] = self.dial_idx;
         b[22..26].copy_from_slice(&self.manual_grid);
         b[26..28].copy_from_slice(&self.rx_corr_hz.to_le_bytes());
+        b[28..30].copy_from_slice(&self.card_rig.to_le_bytes());
+        b[30] = self.card_ant;
+        b[31] = self.card_height_m;
+        b[32] = (self.card_amp as u8) | ((self.rdv_follow as u8) << 1);
+        b[33] = self.rdv_band_mask & 0x0F;
         let mut c = Crc32::new();
-        c.update(&b[..28]);
-        b[28..32].copy_from_slice(&c.get().to_le_bytes());
+        c.update(&b[..36]);
+        b[36..40].copy_from_slice(&c.get().to_le_bytes());
         b
     }
 
     pub fn decode(b: &[u8; CFG_BYTES]) -> Option<Self> {
-        if b[0..2] != CFG_MAGIC || b[2] != CFG_VERSION {
+        if b[0..2] != CFG_MAGIC {
             return None;
         }
-        let mut c = Crc32::new();
-        c.update(&b[..28]);
-        let want = u32::from_le_bytes([b[28], b[29], b[30], b[31]]);
-        if c.get() != want {
+        let ver = b[2];
+        if ver == CFG_VERSION_V1 {
+            let mut c = Crc32::new();
+            c.update(&b[..28]);
+            let want = u32::from_le_bytes([b[28], b[29], b[30], b[31]]);
+            if c.get() != want {
+                return None;
+            }
+        } else if ver == CFG_VERSION {
+            let mut c = Crc32::new();
+            c.update(&b[..36]);
+            let want = u32::from_le_bytes([b[36], b[37], b[38], b[39]]);
+            if c.get() != want {
+                return None;
+            }
+        } else {
             return None;
         }
         let mut base_call = [0u8; 6];
@@ -499,6 +529,18 @@ impl Sol950CfgRecord {
         base_call.copy_from_slice(&b[8..14]);
         prefix.copy_from_slice(&b[16..20]);
         manual_grid.copy_from_slice(&b[22..26]);
+        let (card_rig, card_ant, card_height_m, card_amp, rdv_band_mask, rdv_follow) = if ver >= CFG_VERSION {
+            (
+                u16::from_le_bytes([b[28], b[29]]) & 0x3FF,
+                b[30] & 0x1F,
+                b[31].min(127),
+                (b[32] & 1) != 0,
+                b[33] & 0x0F,
+                (b[32] & 2) != 0,
+            )
+        } else {
+            (1, 1, 8, false, 0b1111, false)
+        };
         Some(Self {
             gen: u32::from_le_bytes([b[4], b[5], b[6], b[7]]),
             base_call,
@@ -513,6 +555,12 @@ impl Sol950CfgRecord {
             tx_power: (b[3] >> 1) & 3,
             coop_rx: (b[3] >> 3) & 3,
             coop_link: (b[3] >> 5) & 1,
+            card_rig,
+            card_ant,
+            card_height_m,
+            card_amp,
+            rdv_band_mask,
+            rdv_follow,
         })
     }
 }
@@ -701,6 +749,12 @@ mod tests {
             tx_power: 1,
             coop_rx: 1,
             coop_link: 1,
+            card_rig: 2,
+            card_ant: 3,
+            card_height_m: 12,
+            card_amp: true,
+            rdv_band_mask: 0b1001,
+            rdv_follow: true,
         };
         block(save_cfg(&mut flash, &mut cfg)).unwrap();
         assert_eq!(cfg.gen, 1);

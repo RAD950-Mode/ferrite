@@ -2572,21 +2572,25 @@ impl Sol950Scr {
             Key::Digit(1) => {
                 if let Some(h) = app.sol950_host_mut() {
                     h.rdv.toggle_band(0);
+                    h.profile_dirty = true;
                 }
             }
             Key::Digit(2) => {
                 if let Some(h) = app.sol950_host_mut() {
                     h.rdv.toggle_band(1);
+                    h.profile_dirty = true;
                 }
             }
             Key::Digit(3) => {
                 if let Some(h) = app.sol950_host_mut() {
                     h.rdv.toggle_band(2);
+                    h.profile_dirty = true;
                 }
             }
             Key::Digit(4) => {
                 if let Some(h) = app.sol950_host_mut() {
                     h.rdv.toggle_band(3);
+                    h.profile_dirty = true;
                 }
             }
             Key::Left | Key::Right if self.sel == 2 => {
@@ -2599,6 +2603,7 @@ impl Sol950Scr {
                     match self.sel {
                         0 => {
                             h.rdv.follow_schedule = !h.rdv.follow_schedule;
+                            h.profile_dirty = true;
                             // If already inside an active window, tune immediately when Follow turns ON.
                             if h.rdv.follow_schedule {
                                 if let Some(win) = h.rdv.window_status(h.utc_sec) {
@@ -2618,6 +2623,7 @@ impl Sol950Scr {
                         }
                         _ => {
                             h.rdv.toggle_band(self.sub);
+                            h.profile_dirty = true;
                         }
                     }
                 }

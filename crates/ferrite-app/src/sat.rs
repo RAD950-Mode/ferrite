@@ -85,6 +85,9 @@ impl App {
         self.sat.utc = utc.map(|u| (u, self.now));
         self.sat.by_gps = by_gps;
         self.sat.here = here;
+        if let (Some((lat, lon, _)), Some(h)) = (here, self.sol950d.as_deref_mut()) {
+            h.chat.distress.update_gps_pos(lat, lon, by_gps);
+        }
     }
 
     /// UTC seconds now.
