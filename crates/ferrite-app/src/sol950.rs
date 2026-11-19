@@ -691,7 +691,7 @@ impl Sol950Host {
         // While transmitting, push our own live 4-FSK tone trace onto the panafall at 5 Hz (200 ms).
         if self.tx_in_flight {
             let slot_ms = sec_in_slot * 1000 + ms_in_sec as u32;
-            let tick = slot * 50 + (slot_ms / 200);
+            let tick = slot.wrapping_mul(50).wrapping_add(slot_ms / 200);
             if tick != self.tx_wf_tick {
                 self.tx_wf_tick = tick;
                 let sym = (slot_ms / 80) as usize;
