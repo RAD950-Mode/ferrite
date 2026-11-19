@@ -637,6 +637,10 @@ impl SimCore {
             let sat_t = if secs < 1_700_000_000 { ferrite_app::sat::SIM_T0 + now / 1000 } else { secs as u32 };
             let here = store.extra.fix.get().map(|f| (f.pos.lat, f.pos.lon, f.alt_m));
             app.sat_clock(Some(sat_t), true, here);
+            if let Some(h) = app.sol950_host_mut() {
+                let gps_grid = here.map(|(lat, lon, _)| ferrite_app::gpsdata::pos_to_grid4(lat, lon));
+                h.update_clock(sat_t, (now % 1000) as u16, 40, gps_grid);
+            }
             app.tick(now, &radio.live, store);
             while let Some(c) = app.pop_cmd() {
                 send(radio, c);
@@ -1279,6 +1283,7 @@ fn power_on(store: &Store, radio: &mut FakeRadio) -> App {
     let st: &'static Store = unsafe { &*(store as *const Store) };
     let sats = ferrite_core::sat::data::Live::new(ferrite_store::sats::StoreSats(st));
     app.sat_attach(Box::leak(Box::new(sats)));
+    app.sol950_attach(Box::leak(Box::new(ferrite_app::sol950::Sol950Host::new())));
     store.restore(&mut app);
     while let Some(c) = app.pop_cmd() {
         radio.cmd(c);
