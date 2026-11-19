@@ -156,14 +156,14 @@ impl View for Sol950Scr {
         true
     }
 
-    fn key(self, app: &mut App, e: KeyEvent, _: &impl ChannelStore) {
+    fn key(self, app: &mut App, e: KeyEvent, store: &impl ChannelStore) {
         if !matches!(e.press, Press::Short | Press::Repeat) {
             return;
         }
         match self.page {
             PAGE_OPERATE => self.key_operate(app, e.key),
             PAGE_ACTIVE => self.key_active(app, e.key),
-            PAGE_SETUP => self.key_setup(app, e.key),
+            PAGE_SETUP => self.key_setup(app, e.key, store),
             PAGE_LOG => self.key_log(app, e.key),
             PAGE_LOG_DETAIL => self.key_log_detail(app, e.key),
             PAGE_STATS => self.key_stats(app, e.key),
@@ -318,7 +318,8 @@ impl Sol950Scr {
         }
     }
 
-    fn key_setup(mut self, app: &mut App, k: Key) {
+    fn key_setup(mut self, app: &mut App, k: Key, store: &impl ChannelStore) {
+        use super::text::{open as open_text, TextFor};
         let mut retune = false;
         match k {
             Key::Exit => {
@@ -327,6 +328,15 @@ impl Sol950Scr {
             }
             Key::Up => self.sel = if self.sel == 0 { (SETUP_ROWS - 1) as u8 } else { self.sel - 1 },
             Key::Down => self.sel = (self.sel + 1) % SETUP_ROWS as u8,
+            Key::Menu if matches!(self.sel, 0 | 1 | 4) => {
+                let target = match self.sel {
+                    0 => TextFor::Sol950Call,
+                    1 => TextFor::Sol950Prefix,
+                    _ => TextFor::Sol950Grid,
+                };
+                open_text(app, target, store);
+                return;
+            }
             Key::Left | Key::Right | Key::Menu => {
                 let dir: i32 = if k == Key::Left { -1 } else { 1 };
                 if let Some(h) = app.sol950_host_mut() {
@@ -351,6 +361,7 @@ impl Sol950Scr {
                         }
                         _ => {}
                     }
+                    h.profile_dirty = true;
                     h.sync_engine_config();
                 }
                 if retune {

@@ -52,6 +52,10 @@ pub enum TextFor {
     ContactName,
     /// 0 5 9 9: who auto reply answers (APRS-57.1): capitals, digits and `-`, * typing the wildcard.
     ReplyTo,
+    /// SOL950 Setup: base callsign (up to 6 chars), optional prefix (up to 4 chars), manual 4-char grid.
+    Sol950Call,
+    Sol950Prefix,
+    Sol950Grid,
 }
 
 /// What a text takes: any text, a channel name (the name set, CHAN-31), capitals and digits (a callsign, a grid
@@ -83,6 +87,9 @@ impl TextFor {
             TextFor::ContactCall => "Contact callsign",
             TextFor::ContactName => "Contact name",
             TextFor::ReplyTo => "Reply to",
+            TextFor::Sol950Call => "SOL950 call",
+            TextFor::Sol950Prefix => "SOL950 prefix",
+            TextFor::Sol950Grid => "SOL950 grid",
         }
     }
 
@@ -93,6 +100,8 @@ impl TextFor {
             TextFor::ContactCall | TextFor::ReplyTo => 9,
             TextFor::DtmfName(_) => 10,
             TextFor::GridFixed | TextFor::GridWaypoint => 6,
+            TextFor::Sol950Call => 6,
+            TextFor::Sol950Prefix | TextFor::Sol950Grid => 4,
             TextFor::Capcode => 7,
             TextFor::Clock => 12,
             _ => 16,
@@ -123,12 +132,21 @@ impl TextFor {
             TextFor::ReplyTo => Buf::from(app.aprs_cfg().reply_to_text()),
             TextFor::ContactCall => Buf::from(app.contact_call.as_bytes()),
             TextFor::ContactName => store.data().contact_of(app.contact_call.as_bytes()).map_or(Buf::new(), |c| Buf::from(c.name.as_bytes())),
+            TextFor::Sol950Call => app.sol950_host().map_or(Buf::new(), |h| Buf::from(h.profile.base_call_bytes())),
+            TextFor::Sol950Prefix => app.sol950_host().map_or(Buf::new(), |h| Buf::from(&h.profile.prefix[..h.profile.prefix_len as usize])),
+            TextFor::Sol950Grid => app.sol950_host().map_or(Buf::new(), |h| Buf::from(&h.profile.manual_grid)),
         }
     }
 
     fn kind(self) -> Kind {
         match self {
-            TextFor::Callsign | TextFor::GridFixed | TextFor::GridWaypoint | TextFor::ContactCall => Kind::Caps,
+            TextFor::Callsign
+            | TextFor::GridFixed
+            | TextFor::GridWaypoint
+            | TextFor::ContactCall
+            | TextFor::Sol950Call
+            | TextFor::Sol950Prefix
+            | TextFor::Sol950Grid => Kind::Caps,
             TextFor::Capcode | TextFor::Clock => Kind::Digits,
             TextFor::AprsPath => Kind::Path,
             TextFor::ReplyTo => Kind::Pattern,
@@ -184,7 +202,7 @@ impl Text {
             (_, Kind::Name, 3) => 4,
             // the capitals of a callsign, grid square or path: their own key 1 (APRS-37, SETUP-12)
             (TextFor::Callsign, _, 0) => 6,
-            (TextFor::GridFixed | TextFor::GridWaypoint, _, 0) => 7,
+            (TextFor::GridFixed | TextFor::GridWaypoint | TextFor::Sol950Call | TextFor::Sol950Prefix | TextFor::Sol950Grid, _, 0) => 7,
             (_, Kind::Caps | Kind::Path | Kind::Pattern, 0) => 5,
             (_, _, m) => m,
         }
@@ -453,6 +471,36 @@ fn keep(to: TextFor, app: &mut App, store: &impl ChannelStore) {
                 app.show_toast(b"Waypoint", b"no room", false);
             }
             return;
+        }
+        TextFor::Sol950Call => {
+            if !t.is_empty() && ferrite_core::sol950::usol950::Callsign::encode(t.as_bytes()).is_err() {
+                return app.show_toast(b"SOL950 call", b"like NQ6N or W1AW", false);
+            }
+            if let Some(h) = app.sol950_host_mut() {
+                h.profile.set_base_call(t.as_bytes());
+                h.profile_dirty = true;
+                h.sync_engine_config();
+            }
+        }
+        TextFor::Sol950Prefix => {
+            if let Some(h) = app.sol950_host_mut() {
+                h.profile.set_prefix(t.as_bytes());
+                h.profile_dirty = true;
+                h.sync_engine_config();
+            }
+        }
+        TextFor::Sol950Grid => {
+            let b = t.as_bytes();
+            let valid = b.len() == 4
+                && ferrite_core::sol950::usol950::frame::encode_grid4(&[b[0], b[1], b[2], b[3]]).is_some();
+            if !valid {
+                return app.show_toast(b"SOL950 grid", b"4 chars like FN31", false);
+            }
+            if let Some(h) = app.sol950_host_mut() {
+                h.profile.manual_grid = [b[0], b[1], b[2], b[3]];
+                h.profile_dirty = true;
+                h.sync_engine_config();
+            }
         }
     }
     app.back();

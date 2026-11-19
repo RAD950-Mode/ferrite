@@ -189,6 +189,31 @@ async fn wait_nor<N: Nor>(flash: &mut N) -> Result {
     Err(NorError)
 }
 
+/// Short-lived `Nor` adapter over `&crate::io::Flash<N>` that drops its `RefMut` before every `N::pause().await`.
+pub struct FlashNor<'a, N: Nor>(pub &'a crate::io::Flash<N>);
+
+impl<N: Nor> Nor for FlashNor<'_, N> {
+    fn read(&mut self, addr: u32, buf: &mut [u8]) -> Result {
+        self.0.nor().read(addr, buf)
+    }
+
+    fn start_program(&mut self, addr: u32, data: &[u8]) -> Result {
+        self.0.nor().start_program(addr, data)
+    }
+
+    fn start_erase(&mut self, addr: u32) -> Result {
+        self.0.nor().start_erase(addr)
+    }
+
+    fn busy(&mut self) -> Result<bool> {
+        self.0.nor().busy()
+    }
+
+    async fn pause() {
+        N::pause().await;
+    }
+}
+
 /// Compact RAM index over `SOL950_LOG` (64 B total RAM!).
 #[derive(Clone, Copy, Debug)]
 pub struct Sol950Journal {

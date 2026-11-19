@@ -439,6 +439,10 @@ pub struct Sol950Host {
     pub target_peer: Option<Callsign>,
     /// Optional 4-char grid filter when opening Log from Worked Grids drill-down.
     pub log_grid_filter: Option<[u8; 4]>,
+    /// True when Setup changed the profile and the firmware should write `SOL950_CFG`.
+    pub profile_dirty: bool,
+    /// Completed contact waiting for durable SPI flash persistence (`SOL950_LOG`).
+    pub pending_save: Option<SavedContact>,
     /// In-memory / mirrored durable contact store for Log, Stats, and Worked Grids.
     pub store: MemSol950Store,
     pub notice: [u8; 28],
@@ -479,6 +483,8 @@ impl Sol950Host {
             last_qso: None,
             target_peer: None,
             log_grid_filter: None,
+            profile_dirty: false,
+            pending_save: None,
             store: MemSol950Store::new(),
             notice: [0; 28],
             notice_len: 0,
@@ -585,7 +591,12 @@ impl Sol950Host {
             seq: 0,
         };
         match self.store.save_contact(&contact) {
-            SaveOutcome::Saved(_) | SaveOutcome::Duplicate => {
+            SaveOutcome::Saved(_) => {
+                self.pending_save = Some(contact);
+                self.saved_ack = true;
+                self.log_full = self.store.is_full();
+            }
+            SaveOutcome::Duplicate => {
                 self.saved_ack = true;
                 self.log_full = self.store.is_full();
             }

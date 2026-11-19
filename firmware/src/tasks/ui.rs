@@ -451,6 +451,7 @@ pub async fn task() {
     let mut app = App::new(set, store::last_alert());
     app.sat_attach(crate::sat::data(store)); // chapter 28a: the satellites (the store's, SAT-2) and their passes
     app.sol950_attach(sol950_host()); // SOL950 10 m weak-signal mode host
+    let mut sol950_journal = sol950_mount_flash(store, &mut app);
     let mut sol950_dec_on = false;
     // The slots as they were saved (frequencies, VFO settings, the channel each is on, watch, Battery Save).
     store.restore(&mut app);
@@ -966,7 +967,7 @@ pub async fn task() {
         if house {
             gps.step(&mut app, store, &mut dev); // PWR-26.15: fixes come once a second
         }
-        sol950_step(&mut app, store, &mut sol950_dec_on);
+        sol950_step(&mut app, store, &mut sol950_dec_on, &mut sol950_journal).await;
         sec!(4); // gps
         // LINK-38: a redraw for live changes alone at most every FRAME_MIN_MS. During a scan the Radio task reports
         // every step and each scan page redraw is ~14 KB (12-17 ms): back to back they left the Link task (same
@@ -1447,9 +1448,140 @@ fn sol950_host() -> &'static mut ferrite_app::sol950::Sol950Host {
     unsafe { (*core::ptr::addr_of_mut!(HOST)).write(ferrite_app::sol950::Sol950Host::new()) }
 }
 
-/// Drive SOL950 DSP decoder switching, GPS sub-second UTC slot timing, RX frames, and TX dispatch.
-fn sol950_step(app: &mut App, store: &crate::store::Store, dec_on: &mut bool) {
+/// Mount `SOL950_CFG` (A/B profile) and `SOL950_LOG` (64 KiB durable contact journal) at boot.
+fn sol950_mount_flash(store: &crate::store::Store, app: &mut App) -> ferrite_store::sol950::Sol950Journal {
+    use ferrite_app::sol950::{GridSource, SavedContact, Sol950Store, MEM_LOG_CAP};
+    use ferrite_store::sol950::{load_cfg, Sol950Journal};
+    let mut nor = store.nor();
+    if let Ok(Some(cfg)) = load_cfg(&mut *nor) {
+        if let Some(h) = app.sol950_host_mut() {
+            h.profile.base_call = cfg.base_call;
+            h.profile.call_len = cfg.call_len;
+            h.profile.prefix = cfg.prefix;
+            h.profile.prefix_len = cfg.prefix_len;
+            h.profile.suffix = cfg.suffix;
+            h.profile.use_gps_grid = cfg.use_gps_grid;
+            h.profile.manual_grid = cfg.manual_grid;
+            h.profile.dial_idx = cfg.dial_idx;
+            h.profile.rx_corr_hz = cfg.rx_corr_hz;
+            h.profile.tx_power = cfg.tx_power;
+            h.sync_engine_config();
+        }
+    }
+    let journal = Sol950Journal::mount(&mut *nor).unwrap_or_default();
+    if journal.count > 0 {
+        let mut recent = [None; MEM_LOG_CAP];
+        if let Ok(n) = journal.read_newest(&mut *nor, 0, None, &mut recent) {
+            if let Some(h) = app.sol950_host_mut() {
+                for rec in recent[..n].iter().rev().flatten() {
+                    let src = match rec.my_grid_src {
+                        1 => GridSource::Gps,
+                        2 => GridSource::Manual,
+                        _ => GridSource::Unset,
+                    };
+                    let sc = SavedContact {
+                        utc_sec: rec.utc_sec,
+                        dial_hz10: rec.dial_hz10,
+                        peer_id: rec.peer_id,
+                        my_id: rec.my_id,
+                        peer_grid: rec.peer_grid,
+                        my_grid: rec.my_grid,
+                        rx_snr_db: rec.rx_snr_db,
+                        tx_snr_db: rec.tx_snr_db,
+                        my_grid_src: src,
+                        slot: rec.slot,
+                        seq: rec.seq,
+                    };
+                    let _ = h.store.save_contact(&sc);
+                }
+                h.log_full = journal.is_full();
+            }
+        }
+    }
+    journal
+}
+
+/// Drive SOL950 DSP decoder switching, GPS sub-second UTC slot timing, RX frames, TX dispatch,
+/// and durable SPI flash persistence (`SOL950_CFG` / `SOL950_LOG`).
+async fn sol950_step(
+    app: &mut App,
+    store: &crate::store::Store,
+    dec_on: &mut bool,
+    journal: &mut ferrite_store::sol950::Sol950Journal,
+) {
     use ferrite_core::msg::{DecoderKind, DspCmd};
+
+    // Persist profile changes and completed contacts to SPI flash whenever the store queue is idle.
+    if store.idle() && !cfg!(feature = "bringup") {
+        let dirty_prof = app.sol950_host_mut().and_then(|h| {
+            if h.profile_dirty {
+                h.profile_dirty = false;
+                Some(h.profile)
+            } else {
+                None
+            }
+        });
+        if let Some(p) = dirty_prof {
+            let mut rec = ferrite_store::sol950::Sol950CfgRecord {
+                gen: 0,
+                base_call: p.base_call,
+                call_len: p.call_len,
+                prefix: p.prefix,
+                prefix_len: p.prefix_len,
+                suffix: p.suffix,
+                use_gps_grid: p.use_gps_grid,
+                manual_grid: p.manual_grid,
+                dial_idx: p.dial_idx,
+                rx_corr_hz: p.rx_corr_hz,
+                tx_power: p.tx_power,
+            };
+            let mut nor = store.sol950_nor();
+            let _ = ferrite_store::sol950::save_cfg(&mut nor, &mut rec).await;
+        }
+        let pending_c = app.sol950_host_mut().and_then(|h| h.pending_save.take());
+        if let Some(c) = pending_c {
+            let fc = ferrite_store::sol950::Sol950Contact {
+                utc_sec: c.utc_sec,
+                dial_hz10: c.dial_hz10,
+                peer_id: c.peer_id,
+                my_id: c.my_id,
+                peer_grid: c.peer_grid,
+                my_grid: c.my_grid,
+                rx_snr_db: c.rx_snr_db,
+                tx_snr_db: c.tx_snr_db,
+                my_grid_src: match c.my_grid_src {
+                    ferrite_app::sol950::GridSource::Gps => 1,
+                    ferrite_app::sol950::GridSource::Manual => 2,
+                    ferrite_app::sol950::GridSource::Unset => 0,
+                },
+                flags: 0,
+                slot: c.slot,
+                seq: 0,
+            };
+            let outcome = {
+                let mut nor = store.sol950_nor();
+                journal.append(&mut nor, &fc).await
+            };
+            if let Some(h) = app.sol950_host_mut() {
+                match outcome {
+                    Ok(ferrite_store::sol950::AppendOutcome::Saved(_) | ferrite_store::sol950::AppendOutcome::Duplicate) => {
+                        h.saved_ack = true;
+                        h.log_full = journal.is_full();
+                    }
+                    Ok(ferrite_store::sol950::AppendOutcome::LogFull) => {
+                        h.saved_ack = false;
+                        h.log_full = true;
+                        h.set_notice(b"Log full - not saved");
+                    }
+                    Err(_) => {
+                        h.saved_ack = false;
+                        h.set_notice(b"Flash write failed");
+                    }
+                }
+            }
+        }
+    }
+
     let open = app.sol950_open();
     if open != *dec_on {
         let cmd = if open {
@@ -1502,7 +1634,19 @@ fn sol950_step(app: &mut App, store: &crate::store::Store, dec_on: &mut bool) {
             (0, 0, u16::MAX, grid)
         }
     } else {
-        (0, 0, u16::MAX, None)
+        // Bench builds only: provide a monotonic UTC fallback indoors when no GPS fix is present,
+        // enabling on-MCU `DspCmd::Sol950Finish` and conducted `Sol950Tx` testing.
+        #[cfg(feature = "bench")]
+        {
+            let ms_total = Instant::now().as_millis();
+            let secs = (ms_total / 1000) as u32;
+            let ms = (ms_total % 1000) as u16;
+            (1_763_500_000u32.wrapping_add(secs), ms, 50, None)
+        }
+        #[cfg(not(feature = "bench"))]
+        {
+            (0, 0, u16::MAX, None)
+        }
     };
     if let Some(h) = app.sol950_host_mut() {
         h.update_clock(utc_sec, ms_in_sec, uncert_ms, gps_grid);

@@ -769,9 +769,42 @@ fn body<S: ChannelStore>(app: &App, cx: &Cx<S>, d: &mut Desc) {
         Screen::Hf(h) => hf_lines(app, cx, h, d),
         Screen::Sat(s) => sat_lines(app, &s, d),
         Screen::Sol950(s) => {
+            use crate::sol950::Sol950Store;
+            use ferrite_core::sol950::usol950::{frame::decode_grid4, Callsign, GRID_UNKNOWN};
+            use ferrite_core::sol950::{ActivityRow, MAX_PEERS};
             if let Some(l) = d.ln() {
                 l.push(b"sol950 ");
                 l.push(screens::sol950::page_id(&s).as_bytes());
+                if let Some(h) = app.sol950_host() {
+                    let mut rows = [ActivityRow {
+                        peer: Callsign::from_raw(0).unwrap(),
+                        grid4: GRID_UNKNOWN,
+                        snr_db: 0,
+                        last_seen_slot: 0,
+                        window: 0,
+                        owed_reply: None,
+                        logged: false,
+                    }; MAX_PEERS];
+                    let n = h.engine.activity_rows(&mut rows);
+                    let _ = ufmt::uwrite!(
+                        l,
+                        " utc={} rx={} saved={} tx={}",
+                        h.utc_ready() as u8,
+                        n,
+                        h.store.count(),
+                        h.tx_in_flight as u8
+                    );
+                    for r in &rows[..n.min(4)] {
+                        if let Some(pl) = d.ln() {
+                            let mut cb = [0u8; 6];
+                            let cn = r.peer.decode(&mut cb);
+                            let cs = core::str::from_utf8(&cb[..cn]).unwrap_or("?");
+                            let gb = decode_grid4(r.grid4).unwrap_or(*b"----");
+                            let gs = core::str::from_utf8(&gb).unwrap_or("----");
+                            let _ = ufmt::uwrite!(pl, "sol950_peer {} {} {}dB", cs, gs, r.snr_db);
+                        }
+                    }
+                }
             }
         }
         Screen::Pin(p) => {

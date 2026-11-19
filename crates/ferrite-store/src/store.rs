@@ -634,6 +634,11 @@ impl<N: Nor, D: Data> FlashStore<N, D> {
         self.f.nor()
     }
 
+    /// Borrow a `Nor` adapter over the underlying flash that drops its `RefMut` before every async pause.
+    pub fn sol950_nor(&self) -> crate::sol950::FlashNor<'_, N> {
+        crate::sol950::FlashNor(&self.f)
+    }
+
     /// HF-20: the SSB patch in SPI flash, if its header parses and its bytes hash to the header's SHA-256.
     pub fn ssb_check(&self) -> Result<Option<ferrite_core::ssb::Patch>> {
         crate::ssb::check(&self.f)
