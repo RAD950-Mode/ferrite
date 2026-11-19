@@ -7,7 +7,7 @@ use super::shared::*;
 use super::{Cx, Hints, View};
 use crate::chan::ChannelStore;
 use crate::keys::{KeyEvent, Press};
-use crate::sol950::{field_letters, GridSource, SavedContact, Sol950Store, DIALS_10M};
+use crate::sol950::{band_label, field_letters, GridSource, SavedContact, Sol950Store, SOL950_DIALS};
 use crate::{App, Screen};
 use ferrite_core::freq::Freq10;
 use ferrite_core::keys::Key;
@@ -257,7 +257,8 @@ impl Sol950Scr {
             }
             Key::Digit(1) => {
                 if let Some(h) = app.sol950_host_mut() {
-                    let parity = if h.last_slot == u32::MAX { 0 } else { (h.last_slot & 1) as u8 };
+                    // Transmit on the very next 10 s UTC slot boundary (`(last_slot + 1) & 1`).
+                    let parity = if h.last_slot == u32::MAX { 0 } else { (h.last_slot.wrapping_add(1) & 1) as u8 };
                     h.saved_ack = false;
                     h.target_peer = None;
                     h.engine.start_cq(parity);
@@ -348,7 +349,7 @@ impl Sol950Scr {
                             h.profile.use_gps_grid = !h.profile.use_gps_grid;
                         }
                         5 => {
-                            let n = DIALS_10M.len() as i32;
+                            let n = SOL950_DIALS.len() as i32;
                             h.profile.dial_idx = (h.profile.dial_idx as i32 + dir).rem_euclid(n) as u8;
                             retune = true;
                         }
@@ -382,7 +383,7 @@ impl Sol950Scr {
         let mut id_len = 0usize;
         let mut grid_bytes = *b"----";
         let mut grid_src = GridSource::Unset;
-        let mut dial = DIALS_10M[0];
+        let mut dial = SOL950_DIALS[0];
         let mut utc_ok = false;
         let mut mode_tag = 0u32;
         let mut rows = [empty_row(); MAX_PEERS];
@@ -480,7 +481,9 @@ impl Sol950Scr {
                         let _ = uwrite!(right, "{}dB", r.snr_db);
                         lcd.text4(W - 48, y + 22, right.as_bytes(), &UI_12, dim, bg);
                     } else if i == 0 && n_rows == 0 {
-                        lcd.text4(8, y + 22, b"Listening on 10m USB...", &UI_12, DIM, BG);
+                        let mut empty = Buf::<28>::new();
+                        let _ = uwrite!(empty, "Listening on {} USB...", band_label(dial));
+                        lcd.text4(8, y + 22, empty.as_bytes(), &UI_12, DIM, BG);
                     }
                 });
             }
@@ -589,7 +592,9 @@ impl Sol950Scr {
                     b"Man grid"
                 }
                 5 => {
-                    push_khz3(&mut val, prof.dial());
+                    let d = prof.dial();
+                    let _ = uwrite!(val, "{} ", band_label(d));
+                    push_khz3(&mut val, d);
                     b"USB dial"
                 }
                 6 => {
@@ -613,7 +618,7 @@ impl Sol950Scr {
                 let fg = if selected { BLUE_FG } else { TEXT };
                 redraw_box!(clear || selected, lcd, (0, y, W, row_h, bg), {
                     lcd.text4(8, y + 16, label, &UI_12, fg, bg);
-                    lcd.text4(W - 84, y + 16, val.as_bytes(), &UI_12, fg, bg);
+                    lcd.text4(W - 96, y + 16, val.as_bytes(), &UI_12, fg, bg);
                 });
             }
         }

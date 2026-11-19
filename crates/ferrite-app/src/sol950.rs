@@ -10,8 +10,33 @@ use ferrite_core::sol950::usol950::frame::encode_grid4;
 use ferrite_core::sol950::usol950::{Callsign, Decoded, Frame, GRID_UNKNOWN};
 use ferrite_core::sol950::{Config, Engine, OpMode, QsoRecord, SlotPlan};
 
-/// Nominal 10 m USB dial windows for SOL950 (`28.078`, `28.082`, `28.120`, `28.180` MHz).
-pub const DIALS_10M: [Freq10; 4] = [2_807_800, 2_808_200, 2_812_000, 2_818_000];
+/// Nominal HF USB dial windows for SOL950 (10 m, 12 m, 15 m, and 17 m; FT8-adjacent +4 kHz windows).
+/// Index `0` stays `28.078 MHz` so existing `SOL950_CFG` flash records remain backward-compatible.
+pub const SOL950_DIALS: [Freq10; 10] = [
+    2_807_800, // 10m: 28.078 MHz (+4 kHz above FT8 28.074)
+    2_808_200, // 10m: 28.082 MHz
+    2_812_000, // 10m: 28.120 MHz
+    2_818_000, // 10m: 28.180 MHz
+    2_491_900, // 12m: 24.919 MHz (+4 kHz above FT8 24.915)
+    2_492_300, // 12m: 24.923 MHz
+    2_107_800, // 15m: 21.078 MHz (+4 kHz above FT8 21.074)
+    2_108_200, // 15m: 21.082 MHz
+    1_810_400, // 17m: 18.104 MHz (+4 kHz above FT8 18.100)
+    1_810_800, // 17m: 18.108 MHz
+];
+
+/// Short amateur band label for a SOL950 HF dial frequency (`17m`, `15m`, `12m`, or `10m`).
+pub fn band_label(dial: Freq10) -> &'static str {
+    if dial < 2_000_000 {
+        "17m"
+    } else if dial < 2_300_000 {
+        "15m"
+    } else if dial < 2_650_000 {
+        "12m"
+    } else {
+        "10m"
+    }
+}
 
 /// Maximum GPS UTC uncertainty (ms) permitted to transmit on a 10 s slot edge (`docs/sol950-firmware-feature.md` §3).
 pub const MAX_TX_UNCERT_MS: u16 = 150;
@@ -314,7 +339,7 @@ impl Sol950Profile {
     }
 
     pub fn dial(&self) -> Freq10 {
-        DIALS_10M[self.dial_idx as usize % DIALS_10M.len()]
+        SOL950_DIALS[self.dial_idx as usize % SOL950_DIALS.len()]
     }
 
     pub fn set_base_call(&mut self, s: &[u8]) {
@@ -682,7 +707,7 @@ impl App {
         let (dial, rx_corr_hz) = self
             .sol950d
             .as_ref()
-            .map_or((DIALS_10M[0], 0), |h| (h.profile.dial(), h.profile.rx_corr_hz));
+            .map_or((SOL950_DIALS[0], 0), |h| (h.profile.dial(), h.profile.rx_corr_hz));
         self.out.push(RadioCmd::Sol950Rx { dial, rx_corr_hz, on: true });
     }
 
@@ -702,7 +727,7 @@ impl App {
             let (dial, rx_corr_hz) = self
                 .sol950d
                 .as_ref()
-                .map_or((DIALS_10M[0], 0), |h| (h.profile.dial(), h.profile.rx_corr_hz));
+                .map_or((SOL950_DIALS[0], 0), |h| (h.profile.dial(), h.profile.rx_corr_hz));
             self.out.push(RadioCmd::Sol950Rx { dial, rx_corr_hz, on: true });
         }
     }
