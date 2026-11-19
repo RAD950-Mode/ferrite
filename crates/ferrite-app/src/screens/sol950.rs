@@ -35,10 +35,12 @@ pub const PAGE_CHAT: u8 = 8;
 pub const PAGE_CHAT_REPLY: u8 = 9;
 pub const PAGE_CHAT_PICK: u8 = 10;
 pub const PAGE_CHAT_PREVIEW: u8 = 11;
+pub const PAGE_CHAT_MORE: u8 = 12;
+pub const PAGE_DISTRESS: u8 = 13;
 
 const OPERATE_ROWS: usize = 4;
 const LOG_ROWS: usize = 6;
-const SETUP_ROWS: usize = 10;
+const SETUP_ROWS: usize = 14;
 const SETUP_VISIBLE: usize = 8;
 const TOP_Y: i32 = w::SBAR_H;
 
@@ -92,6 +94,8 @@ pub fn page_id(s: &Sol950Scr) -> &'static str {
         PAGE_CHAT_REPLY => "rad950.chat_reply",
         PAGE_CHAT_PICK => "rad950.chat_pick",
         PAGE_CHAT_PREVIEW => "rad950.chat_preview",
+        PAGE_CHAT_MORE => "rad950.chat_more",
+        PAGE_DISTRESS => "rad950.distress",
         _ => "sol950.operate",
     }
 }
@@ -153,6 +157,8 @@ impl View for Sol950Scr {
             PAGE_CHAT_REPLY => "RAD950 Reply",
             PAGE_CHAT_PICK => "RAD950 Pick",
             PAGE_CHAT_PREVIEW => "RAD950 Send",
+            PAGE_CHAT_MORE => "RAD950 More",
+            PAGE_DISTRESS => "RAD950 Distress",
             _ => "RAD950",
         }
     }
@@ -168,6 +174,8 @@ impl View for Sol950Scr {
             PAGE_CHAT_REPLY => b"REPLY",
             PAGE_CHAT_PICK => b"PICK",
             PAGE_CHAT_PREVIEW => b"SEND",
+            PAGE_CHAT_MORE => b"MORE",
+            PAGE_DISTRESS => b"DISTRESS",
             _ => b"RAD950",
         };
         b.set(t);
@@ -194,6 +202,8 @@ impl View for Sol950Scr {
             PAGE_CHAT_REPLY => self.key_chat_reply(app, e.key, store),
             PAGE_CHAT_PICK => self.key_chat_pick(app, e.key),
             PAGE_CHAT_PREVIEW => self.key_chat_preview(app, e.key),
+            PAGE_CHAT_MORE => self.key_chat_more(app, e.key),
+            PAGE_DISTRESS => self.key_distress(app, e.key),
             _ => app.screen = Screen::Sol950(Sol950Scr::OPERATE),
         }
     }
@@ -223,6 +233,8 @@ impl View for Sol950Scr {
             PAGE_CHAT_REPLY => self.draw_chat_reply(app, lcd),
             PAGE_CHAT_PICK => self.draw_chat_pick(app, lcd),
             PAGE_CHAT_PREVIEW => self.draw_chat_preview(app, lcd),
+            PAGE_CHAT_MORE => self.draw_chat_more(app, lcd),
+            PAGE_DISTRESS => self.draw_distress(app, lcd),
             _ => self.draw_operate(app, lcd, cx.live),
         }
     }
@@ -246,12 +258,17 @@ impl View for Sol950Scr {
             PAGE_CHAT => {
                 if app.sol950_host().is_some_and(|h| h.chat.phase == ChatPhase::IncomingInvite) {
                     Hints::new(&[("OK", "Accept"), ("0", "Decline"), ("BACK", "Back")])
+                } else if app.sol950_host().is_some_and(|h| h.chat.pending_offer.is_some()) {
+                    Hints::new(&[("OK", "Accept"), ("1", "Counter"), ("0", "Decline")])
+                } else if app.sol950_host().is_some_and(|h| h.chat.active_move.is_some_and(|m| !m.expired && !m.retuned)) {
+                    Hints::new(&[("OK", "Reply"), ("3", "Retune"), ("0", "End")])
                 } else {
                     Hints::new(&[("OK", "Reply"), ("0", "End"), ("BACK", "Back")])
                 }
             }
-            PAGE_CHAT_REPLY | PAGE_CHAT_PICK => Hints::new(&[("OK", "Select"), ("BACK", "Back")]),
+            PAGE_CHAT_REPLY | PAGE_CHAT_PICK | PAGE_CHAT_MORE => Hints::new(&[("OK", "Select"), ("BACK", "Back")]),
             PAGE_CHAT_PREVIEW => Hints::new(&[("OK", "Send"), ("BACK", "Back")]),
+            PAGE_DISTRESS => Hints::new(&[(ARROWS_LR, "Change"), ("OK", "Send"), ("BACK", "Cancel")]),
             _ => Hints::new(&[("BACK", "Back")]),
         }
     }
@@ -339,6 +356,10 @@ impl Sol950Scr {
             }
             Key::Digit(4) => {
                 app.screen = Screen::Sol950(Sol950Scr::GRIDS);
+                return;
+            }
+            Key::Digit(9) => {
+                app.screen = Screen::Sol950(Sol950Scr { page: PAGE_DISTRESS, sel: 0, top: 0, field: 0, sub: 0 });
                 return;
             }
             Key::Star => {
@@ -442,6 +463,11 @@ impl Sol950Scr {
                         }
                         7 => {
                             h.profile.tx_power = (h.profile.tx_power as i32 + dir).rem_euclid(3) as u8;
+                            h.chat.station_card.pwr_dbm = match h.profile.tx_power {
+                                0 => 30, // 1 W
+                                1 => 34, // 2.5 W
+                                _ => 37, // 5 W
+                            };
                         }
                         8 => {
                             h.profile.coop_rx = match h.profile.coop_rx {
@@ -458,6 +484,20 @@ impl Sol950Scr {
                                 CoopLink::Usb => CoopLink::Bluetooth,
                                 CoopLink::Bluetooth => CoopLink::Usb,
                             };
+                        }
+                        10 => {
+                            h.chat.station_card.rig = ((h.chat.station_card.rig as i32 + dir).rem_euclid(4)) as u16;
+                        }
+                        11 => {
+                            h.chat.station_card.ant = ((h.chat.station_card.ant as i32 + dir).rem_euclid(6)) as u8;
+                        }
+                        12 => {
+                            let cur = if h.chat.station_card.height_m == 127 { 0 } else { h.chat.station_card.height_m as i32 };
+                            let next = (cur + dir * 2).clamp(0, 40);
+                            h.chat.station_card.height_m = if next == 0 { 127 } else { next as u8 };
+                        }
+                        13 => {
+                            h.chat.station_card.amp = !h.chat.station_card.amp;
                         }
                         _ => {}
                     }
@@ -489,6 +529,7 @@ impl Sol950Scr {
         let mut coop_link = CoopLink::Usb;
         let mut rows = [empty_row(); MAX_PEERS];
         let mut n_rows = 0usize;
+        let mut rx_distress = None;
         if let Some(h) = app.sol950_host() {
             id_len = h.profile.format_identity(&mut id_buf);
             (grid_bytes, grid_src) = h.profile.effective_grid(h.gps_grid);
@@ -502,6 +543,7 @@ impl Sol950Scr {
                 OpMode::Pounce => 3,
             };
             n_rows = h.engine.activity_rows(&mut rows);
+            rx_distress = h.chat.distress.rx;
         }
 
         let top_h = Mix::new()
@@ -517,44 +559,77 @@ impl Sol950Scr {
             .n(mode_tag)
             .n(coop_rx as u32)
             .n(coop_link as u32)
+            .n(rx_distress.map_or(0, |d| d.alert.sender.raw() ^ ((d.status as u32) << 28)))
             .get();
         if let Some(clear) = app.dirty_shape(R_TOP, top_h, true) {
             let y0 = TOP_Y;
             redraw_box!(clear, lcd, (0, y0, W, 44, BG), {
-                let mut line1 = Buf::<32>::new();
-                let src_tag = match grid_src {
-                    GridSource::Gps => "GPS",
-                    GridSource::Manual => "MAN",
-                    GridSource::Unset => "---",
-                };
-                let id_s = core::str::from_utf8(&id_buf[..id_len]).unwrap_or("?");
-                let g_s = core::str::from_utf8(&grid_bytes).unwrap_or("----");
-                let _ = uwrite!(line1, "{} {} {}", id_s, g_s, src_tag);
-                lcd.text4(8, y0 + 16, line1.as_bytes(), &UI_14, TEXT, BG);
-
-                let mut line2 = Buf::<36>::new();
-                push_khz3(&mut line2, dial);
-                let st = if loading < 100 {
-                    " LOAD"
-                } else if tx_active {
-                    " TX"
-                } else if rx_ready {
-                    " RX"
+                if let Some(inc) = rx_distress {
+                    use crate::rad950_chat::DistressRxStatus;
+                    lcd.fill(0, y0, W, 43, RED);
+                    let mut cb = [0u8; 6];
+                    let cn = inc.alert.sender.decode(&mut cb);
+                    let cs = core::str::from_utf8(&cb[..cn]).unwrap_or("?");
+                    let mut l1 = Buf::<32>::new();
+                    let _ = uwrite!(l1, "DISTRESS {} [{}]", cs, inc.alert.category.label());
+                    lcd.text4(8, y0 + 16, l1.as_bytes(), &UI_12B, WHITE, RED);
+                    let mut l2 = Buf::<34>::new();
+                    match inc.status {
+                        DistressRxStatus::AlertReceived => {
+                            let _ = uwrite!(l2, "Alert received");
+                        }
+                        DistressRxStatus::PositionPending => {
+                            let _ = uwrite!(l2, "Position pending...");
+                        }
+                        DistressRxStatus::PositionLinked => {
+                            let lat = inc.lat_e4.unwrap_or(0);
+                            let lon = inc.lon_e4.unwrap_or(0);
+                            let lf = (lat.abs() % 10_000) / 100;
+                            let of = (lon.abs() % 10_000) / 100;
+                            let _ = uwrite!(l2, "Pos {}.{}{}, {}.{}{}", lat / 10_000, lf / 10, lf % 10, lon / 10_000, of / 10, of % 10);
+                        }
+                        DistressRxStatus::PositionConflict => {
+                            let _ = uwrite!(l2, "Alert ok (pos conflict)");
+                        }
+                    }
+                    lcd.text4(8, y0 + 35, l2.as_bytes(), &UI_12, WHITE, RED);
+                    lcd.fill(0, y0 + 42, W, 1, RULE);
                 } else {
-                    " INIT"
-                };
-                let utc_s = if utc_ok { " UTC OK" } else { " NO UTC" };
-                let _ = uwrite!(line2, "{}{}", st, utc_s);
-                let col = if tx_active { RED } else if utc_ok && rx_ready { GREEN } else { AMBER };
-                lcd.text4(8, y0 + 35, line2.as_bytes(), &UI_12, col, BG);
-                if coop_rx == CoopRxMode::Capture {
-                    let badge: &[u8] = match coop_link {
-                        CoopLink::Usb => b"COOP USB",
-                        CoopLink::Bluetooth => b"COOP BT",
+                    let mut line1 = Buf::<32>::new();
+                    let src_tag = match grid_src {
+                        GridSource::Gps => "GPS",
+                        GridSource::Manual => "MAN",
+                        GridSource::Unset => "---",
                     };
-                    lcd.text4(W - 64, y0 + 35, badge, &UI_12, BLUE, BG);
+                    let id_s = core::str::from_utf8(&id_buf[..id_len]).unwrap_or("?");
+                    let g_s = core::str::from_utf8(&grid_bytes).unwrap_or("----");
+                    let _ = uwrite!(line1, "{} {} {}", id_s, g_s, src_tag);
+                    lcd.text4(8, y0 + 16, line1.as_bytes(), &UI_14, TEXT, BG);
+
+                    let mut line2 = Buf::<36>::new();
+                    push_khz3(&mut line2, dial);
+                    let st = if loading < 100 {
+                        " LOAD"
+                    } else if tx_active {
+                        " TX"
+                    } else if rx_ready {
+                        " RX"
+                    } else {
+                        " INIT"
+                    };
+                    let utc_s = if utc_ok { " UTC OK" } else { " NO UTC" };
+                    let _ = uwrite!(line2, "{}{}", st, utc_s);
+                    let col = if tx_active { RED } else if utc_ok && rx_ready { GREEN } else { AMBER };
+                    lcd.text4(8, y0 + 35, line2.as_bytes(), &UI_12, col, BG);
+                    if coop_rx == CoopRxMode::Capture {
+                        let badge: &[u8] = match coop_link {
+                            CoopLink::Usb => b"COOP USB",
+                            CoopLink::Bluetooth => b"COOP BT",
+                        };
+                        lcd.text4(W - 64, y0 + 35, badge, &UI_12, BLUE, BG);
+                    }
+                    lcd.fill(0, y0 + 42, W, 1, RULE);
                 }
-                lcd.fill(0, y0 + 42, W, 1, RULE);
             });
         }
 
@@ -736,6 +811,7 @@ impl Sol950Scr {
     fn draw_setup(self, app: &mut App, lcd: &mut impl Panel) {
         let Some(h) = app.sol950_host() else { return };
         let prof = h.profile;
+        let sc = h.chat.station_card;
         let gps_grid = h.gps_grid;
         let y0 = TOP_Y + 4;
         let row_h = 24;
@@ -801,13 +877,35 @@ impl Sol950Scr {
                     let _ = uwrite!(val, "{}", c);
                     b"Coop RX"
                 }
-                _ => {
+                9 => {
                     let l = match prof.coop_link {
                         CoopLink::Usb => "USB",
                         CoopLink::Bluetooth => "Bluetooth",
                     };
                     let _ = uwrite!(val, "{}", l);
                     b"Coop link"
+                }
+                10 => {
+                    use ferrite_core::sol950::usol950::chat::rig_name;
+                    let _ = uwrite!(val, "{}", rig_name(sc.rig));
+                    b"Card rig"
+                }
+                11 => {
+                    use ferrite_core::sol950::usol950::chat::ant_name;
+                    let _ = uwrite!(val, "{}", ant_name(sc.ant));
+                    b"Card ant"
+                }
+                12 => {
+                    if sc.height_m == 127 {
+                        let _ = uwrite!(val, "Unset");
+                    } else {
+                        let _ = uwrite!(val, "{} m", sc.height_m);
+                    }
+                    b"Ant height"
+                }
+                _ => {
+                    let _ = uwrite!(val, "{}", if sc.amp { "Ext amp" } else { "Barefoot" });
+                    b"Card amp"
                 }
             };
             let rh = Mix::new().n(i as u32).n(selected as u32).b(label).b(val.as_bytes()).get();
@@ -1224,14 +1322,46 @@ impl Sol950Scr {
     // ---- RAD950 Conversation Extension (Invite -> Ask -> Station Card -> Phrase -> Typed -> End) ----
 
     fn key_chat(mut self, app: &mut App, k: Key) {
-        let phase = app.sol950_host().map_or(ChatPhase::Idle, |h| h.chat.phase);
-        let count = app.sol950_host().map_or(0usize, |h| h.chat.entry_count as usize);
+        use ferrite_core::sol950::usol950::chat::RendezvousAction;
+        let (phase, has_offer, has_move, move_expired, has_rem, count) = app.sol950_host().map_or(
+            (ChatPhase::Idle, false, false, false, false, 0usize),
+            |h| {
+                (
+                    h.chat.phase,
+                    h.chat.pending_offer.is_some(),
+                    h.chat.active_move.is_some(),
+                    h.chat.active_move.is_some_and(|m| m.expired),
+                    h.chat.saved_reminder.is_some(),
+                    h.chat.entry_count as usize,
+                )
+            },
+        );
         match k {
             Key::Exit => {
                 app.screen = Screen::Sol950(Sol950Scr::OPERATE);
                 return;
             }
             Key::Digit(0) => {
+                if has_offer {
+                    if let Some(h) = app.sol950_host_mut() {
+                        let slot = if h.last_slot == u32::MAX { 0 } else { h.last_slot };
+                        h.chat.respond_offer(RendezvousAction::Decline, slot);
+                    }
+                    return;
+                }
+                if move_expired {
+                    if let Some(h) = app.sol950_host_mut() {
+                        if let Some(src_dial) = h.chat.return_from_move() {
+                            if let Some(idx) = SOL950_DIALS.iter().position(|&d| d == src_dial) {
+                                h.profile.dial_idx = idx as u8;
+                                h.sync_engine_config();
+                            }
+                        }
+                    }
+                    app.sol950_retune();
+                    app.show_toast(b"RAD950", b"Returned to source", false);
+                    return;
+                }
                 if let Some(h) = app.sol950_host_mut() {
                     if phase == ChatPhase::IncomingInvite {
                         h.chat.decline_invite();
@@ -1242,6 +1372,45 @@ impl Sol950Scr {
                 app.screen = Screen::Sol950(Sol950Scr::OPERATE);
                 return;
             }
+            Key::Digit(1) if has_offer => {
+                if let Some(h) = app.sol950_host_mut() {
+                    let slot = if h.last_slot == u32::MAX { 0 } else { h.last_slot };
+                    h.chat.respond_offer(RendezvousAction::Counter, slot);
+                }
+                return;
+            }
+            Key::Digit(3) if has_move && !move_expired => {
+                let mut retuned = false;
+                if let Some(h) = app.sol950_host_mut() {
+                    if let Some(dest_dial) = h.chat.confirm_move_retune() {
+                        if let Some(idx) = SOL950_DIALS.iter().position(|&d| d == dest_dial) {
+                            h.profile.dial_idx = idx as u8;
+                            h.sync_engine_config();
+                            retuned = true;
+                        }
+                    }
+                }
+                if retuned {
+                    app.sol950_retune();
+                    app.show_toast(b"RAD950", b"Retuned to move dial", false);
+                }
+                return;
+            }
+            Key::Digit(3) if !has_move && has_rem => {
+                if let Some(h) = app.sol950_host_mut() {
+                    if let Some(rem) = h.chat.saved_reminder {
+                        h.profile.dial_idx = rem.dial_preset.min((SOL950_DIALS.len() - 1) as u8);
+                        h.sync_engine_config();
+                    }
+                }
+                app.sol950_retune();
+                app.show_toast(b"RAD950", b"Tuned to reminder", false);
+                return;
+            }
+            Key::Digit(9) => {
+                app.screen = Screen::Sol950(Sol950Scr { page: PAGE_DISTRESS, sel: 0, top: 0, field: 0, sub: 1 });
+                return;
+            }
             Key::Up if self.top > 0 => self.top -= 1,
             Key::Down if (self.top as usize) + 3 < count => self.top += 1,
             Key::Menu => {
@@ -1249,12 +1418,21 @@ impl Sol950Scr {
                     if let Some(h) = app.sol950_host_mut() {
                         h.chat.accept_invite();
                     }
+                } else if has_offer {
+                    if let Some(h) = app.sol950_host_mut() {
+                        let slot = if h.last_slot == u32::MAX { 0 } else { h.last_slot };
+                        h.chat.respond_offer(RendezvousAction::Accept, slot);
+                    }
                 } else if phase == ChatPhase::Active {
-                    // Context-aware default: highlight "My station" (row 1) when peer asked about antenna/rig.
+                    // Context-aware default: highlight "My station" (row 1) for antenna/rig, "More..." (row 4) for weather.
                     let default_sel = app
                         .sol950_host()
                         .and_then(|h| h.chat.last_peer_topic)
-                        .map_or(0u8, |t| if t <= 1 { 1 } else { 0 });
+                        .map_or(0u8, |t| match t {
+                            0 | 1 => 1,
+                            2 => 4,
+                            _ => 0,
+                        });
                     app.screen = Screen::Sol950(Sol950Scr { page: PAGE_CHAT_REPLY, sel: default_sel, top: 0, field: 0, sub: 0 });
                     return;
                 }
@@ -1267,7 +1445,7 @@ impl Sol950Scr {
     fn key_chat_reply(mut self, app: &mut App, k: Key, store: &impl ChannelStore) {
         use super::text::{open as open_text, TextFor};
         let has_out = app.sol950_host().is_some_and(|h| h.chat.has_outgoing());
-        let n_items: u8 = if has_out { 6 } else { 5 };
+        let n_items: u8 = if has_out { 7 } else { 6 };
         match k {
             Key::Exit => {
                 app.screen = Screen::Sol950(Sol950Scr::CHAT);
@@ -1296,7 +1474,11 @@ impl Sol950Scr {
                         open_text(app, TextFor::Sol950Chat, store);
                         return;
                     }
-                    4 if has_out => {
+                    4 => {
+                        app.screen = Screen::Sol950(Sol950Scr { page: PAGE_CHAT_MORE, sel: 0, top: 0, field: 0, sub: 0 });
+                        return;
+                    }
+                    5 if has_out => {
                         if let Some(h) = app.sol950_host_mut() {
                             h.chat.cancel_send();
                         }
@@ -1308,6 +1490,95 @@ impl Sol950Scr {
                             h.chat.end_chat();
                         }
                         app.screen = Screen::Sol950(Sol950Scr::OPERATE);
+                        return;
+                    }
+                }
+            }
+            _ => {}
+        }
+        app.screen = Screen::Sol950(self);
+    }
+
+    fn key_chat_more(mut self, app: &mut App, k: Key) {
+        use ferrite_core::sol950::usol950::chat::{dial_to_move_band, RendezvousAction, RendezvousCard};
+        const MORE_ITEMS: u8 = 4;
+        match k {
+            Key::Exit => {
+                app.screen = Screen::Sol950(Sol950Scr::CHAT_REPLY);
+                return;
+            }
+            Key::Up => self.sel = if self.sel == 0 { MORE_ITEMS - 1 } else { self.sel - 1 },
+            Key::Down => self.sel = (self.sel + 1) % MORE_ITEMS,
+            Key::Left | Key::Right => {
+                let dir: i32 = if k == Key::Left { -1 } else { 1 };
+                if let Some(h) = app.sol950_host_mut() {
+                    match self.sel {
+                        0 => {
+                            h.chat.weather_card.cond = ((h.chat.weather_card.cond as i32 - 1 + dir).rem_euclid(7) + 1) as u8;
+                        }
+                        1 => {
+                            let cur = if h.chat.about_card.year_licensed == 0 { 1994 } else { h.chat.about_card.year_licensed as i32 };
+                            h.chat.about_card.year_licensed = (cur + dir).clamp(1960, 2026) as u16;
+                        }
+                        _ => {
+                            let n = SOL950_DIALS.len() as i32;
+                            h.chat.offer_dial_idx = (h.chat.offer_dial_idx as i32 + dir).rem_euclid(n) as u8;
+                        }
+                    }
+                }
+            }
+            Key::Menu => {
+                match self.sel {
+                    0 => {
+                        if let Some(h) = app.sol950_host_mut() {
+                            h.chat.draft = Some(ChatDraft::WeatherCard);
+                        }
+                        app.screen = Screen::Sol950(Sol950Scr::CHAT_PREVIEW);
+                        return;
+                    }
+                    1 => {
+                        if let Some(h) = app.sol950_host_mut() {
+                            h.chat.draft = Some(ChatDraft::AboutCard);
+                        }
+                        app.screen = Screen::Sol950(Sol950Scr::CHAT_PREVIEW);
+                        return;
+                    }
+                    2 => {
+                        if let Some(h) = app.sol950_host_mut() {
+                            let utc_min = ((h.utc_sec / 60) % 1440) as u16;
+                            h.chat.session_utc_day = h.utc_sec / 86_400;
+                            h.chat.draft = Some(ChatDraft::Rendezvous(RendezvousCard::Schedule {
+                                action: RendezvousAction::Offer,
+                                days_ahead: 1, // Tomorrow at this time
+                                utc_min,
+                                dial_preset: h.chat.offer_dial_idx,
+                                profile: 0,
+                                subch: 2,
+                                offer_ref: h.chat.next_seq & 7,
+                            }));
+                        }
+                        app.screen = Screen::Sol950(Sol950Scr::CHAT_PREVIEW);
+                        return;
+                    }
+                    _ => {
+                        if let Some(h) = app.sol950_host_mut() {
+                            let dest = SOL950_DIALS
+                                .get(h.chat.offer_dial_idx as usize)
+                                .copied()
+                                .unwrap_or(SOL950_DIALS[1]);
+                            let (band_id, off) = dial_to_move_band(dest).unwrap_or((0, 8200));
+                            let slot = if h.last_slot == u32::MAX { 0 } else { h.last_slot };
+                            h.chat.source_dial_hz10 = h.profile.dial();
+                            h.chat.draft = Some(ChatDraft::Rendezvous(RendezvousCard::MoveFreq {
+                                action: RendezvousAction::Offer,
+                                band_id,
+                                dial_offset_10hz: off,
+                                profile: 0,
+                                turn_mod64: ((slot + 4) & 0x3F) as u8,
+                                subch: 2,
+                            }));
+                        }
+                        app.screen = Screen::Sol950(Sol950Scr::CHAT_PREVIEW);
                         return;
                     }
                 }
@@ -1366,6 +1637,10 @@ impl Sol950Scr {
         let secs = h.chat.secs_until_tx(h.utc_sec);
         let count = h.chat.entry_count as usize;
         let entries = h.chat.entries;
+        let pending_offer = h.chat.pending_offer;
+        let active_move = h.chat.active_move;
+        let saved_rem = h.chat.saved_reminder;
+        let cur_slot = if h.last_slot == u32::MAX { 0 } else { h.last_slot };
 
         let mut th = Mix::new()
             .n(phase as u32)
@@ -1373,7 +1648,10 @@ impl Sol950Scr {
             .n(secs as u32)
             .n(tx_active as u32)
             .n(count as u32)
-            .n(self.top as u32);
+            .n(self.top as u32)
+            .n(pending_offer.is_some() as u32)
+            .n(active_move.map_or(0, |m| m.target_slot ^ ((m.retuned as u32) << 20) ^ ((m.expired as u32) << 21)))
+            .n(saved_rem.map_or(0, |r| (r.utc_min as u32) ^ ((r.dial_preset as u32) << 12)));
         for e in &entries[..count] {
             let st_key = match e.status {
                 ChatDelivery::None => 0u32,
@@ -1381,7 +1659,8 @@ impl Sol950Scr {
                 ChatDelivery::Sending { sent, total } => 2 + ((sent as u32) << 8) + ((total as u32) << 16),
                 ChatDelivery::AwaitingAck => 3,
                 ChatDelivery::Delivered => 4,
-                ChatDelivery::Cancelled => 5,
+                ChatDelivery::Incomplete => 5,
+                ChatDelivery::Cancelled => 6,
             };
             th = th.n(e.from_me as u32).n(st_key).b(e.bytes());
         }
@@ -1427,56 +1706,102 @@ impl Sol950Scr {
                     let _ = uwrite!(inv, "{} invites you to chat", ps);
                     lcd.text4(8, y0 + 56, inv.as_bytes(), &UI_14, AMBER, BG);
                     lcd.text4(8, y0 + 82, b"OK Accept   0 Decline", &UI_12, TEXT, BG);
-                } else if count == 0 {
-                    let msg: &[u8] = if phase == ChatPhase::Inviting {
-                        b"Waiting for peer to accept..."
-                    } else {
-                        b"Connected. Press OK to reply."
-                    };
-                    lcd.text4(8, y0 + 54, msg, &UI_12, DIM, BG);
                 } else {
-                    // Show up to 4 transcript rows (each 38 px tall: sender+status on top, text below).
-                    let start = (self.top as usize).min(count.saturating_sub(1));
-                    for slot in 0..4usize {
-                        let idx = start + slot;
-                        if idx >= count {
-                            break;
-                        }
-                        let e = &entries[idx];
-                        let ry = y0 + 28 + slot as i32 * 38;
-                        let who: &[u8] = if e.from_me { b"You" } else { ps.as_bytes() };
-                        let who_col = if e.from_me { BLUE } else { GREEN };
-                        lcd.text4(8, ry + 12, who, &UI_12, who_col, BG);
-                        let mut dtag = Buf::<16>::new();
-                        let dcol = match e.status {
-                            ChatDelivery::None => DIM,
-                            ChatDelivery::Queued => {
-                                let _ = uwrite!(dtag, "Queued");
-                                AMBER
-                            }
-                            ChatDelivery::Sending { sent, total } => {
-                                let _ = uwrite!(dtag, "Send {}/{}", sent, total);
-                                RED
-                            }
-                            ChatDelivery::AwaitingAck => {
-                                let _ = uwrite!(dtag, "Wait ACK");
-                                AMBER
-                            }
-                            ChatDelivery::Delivered => {
-                                let _ = uwrite!(dtag, "Delivered");
-                                GREEN
-                            }
-                            ChatDelivery::Cancelled => {
-                                let _ = uwrite!(dtag, "Cancelled");
-                                DIM
-                            }
+                    // Optional Rendezvous banner (offer, move countdown, or saved reminder).
+                    let mut list_y = y0 + 28;
+                    let mut max_rows = 4usize;
+                    if let Some(offer) = pending_offer {
+                        let mut ob = [0u8; 64];
+                        let on = crate::rad950_chat::format_rendezvous_card(&offer, &mut ob);
+                        lcd.fill(0, y0 + 23, W, 34, LINE);
+                        lcd.text4(8, y0 + 37, &ob[..on.min(30)], &UI_12, AMBER, LINE);
+                        lcd.text4(8, y0 + 52, b"OK Accept  1 Counter  0 Decline", &UI_12, TEXT, LINE);
+                        list_y = y0 + 62;
+                        max_rows = 3;
+                    } else if let Some(mv) = active_move {
+                        lcd.fill(0, y0 + 23, W, 22, LINE);
+                        let mut mb = Buf::<34>::new();
+                        let mcol = if mv.expired {
+                            let _ = uwrite!(mb, "Peer not heard - 0 Return");
+                            AMBER
+                        } else if mv.retuned {
+                            let _ = uwrite!(mb, "Listening on ");
+                            push_khz3(&mut mb, mv.dest_dial_hz10);
+                            GREEN
+                        } else {
+                            let rem_s = mv.target_slot.saturating_sub(cur_slot) * 10;
+                            let _ = uwrite!(mb, "Move ");
+                            push_khz3(&mut mb, mv.dest_dial_hz10);
+                            let _ = uwrite!(mb, " in {}s (3 Go)", rem_s);
+                            AMBER
                         };
-                        if !dtag.as_bytes().is_empty() {
-                            lcd.text4(W - 72, ry + 12, dtag.as_bytes(), &UI_12, dcol, BG);
+                        lcd.text4(8, y0 + 38, mb.as_bytes(), &UI_12, mcol, LINE);
+                        list_y = y0 + 50;
+                        max_rows = 3;
+                    } else if let Some(rem) = saved_rem {
+                        lcd.fill(0, y0 + 23, W, 22, LINE);
+                        let mut rb = Buf::<34>::new();
+                        let hh = rem.utc_min / 60;
+                        let mm = rem.utc_min % 60;
+                        let _ = uwrite!(rb, "Saved {}{}:{}{}Z (3 Go preset)", hh / 10, hh % 10, mm / 10, mm % 10);
+                        lcd.text4(8, y0 + 38, rb.as_bytes(), &UI_12, GREEN, LINE);
+                        list_y = y0 + 50;
+                        max_rows = 3;
+                    }
+                    if count == 0 {
+                        let msg: &[u8] = if phase == ChatPhase::Inviting {
+                            b"Waiting for peer to accept..."
+                        } else {
+                            b"Connected. Press OK to reply."
+                        };
+                        lcd.text4(8, list_y + 26, msg, &UI_12, DIM, BG);
+                    } else {
+                        let start = (self.top as usize).min(count.saturating_sub(1));
+                        for slot in 0..max_rows {
+                            let idx = start + slot;
+                            if idx >= count {
+                                break;
+                            }
+                            let e = &entries[idx];
+                            let ry = list_y + slot as i32 * 38;
+                            let who: &[u8] = if e.from_me { b"You" } else { ps.as_bytes() };
+                            let who_col = if e.from_me { BLUE } else { GREEN };
+                            lcd.text4(8, ry + 12, who, &UI_12, who_col, BG);
+                            let mut dtag = Buf::<16>::new();
+                            let dcol = match e.status {
+                                ChatDelivery::None => DIM,
+                                ChatDelivery::Queued => {
+                                    let _ = uwrite!(dtag, "Queued");
+                                    AMBER
+                                }
+                                ChatDelivery::Sending { sent, total } => {
+                                    let _ = uwrite!(dtag, "Send {}/{}", sent, total);
+                                    RED
+                                }
+                                ChatDelivery::AwaitingAck => {
+                                    let _ = uwrite!(dtag, "Wait ACK");
+                                    AMBER
+                                }
+                                ChatDelivery::Delivered => {
+                                    let _ = uwrite!(dtag, "Delivered");
+                                    GREEN
+                                }
+                                ChatDelivery::Incomplete => {
+                                    let _ = uwrite!(dtag, "Incomplete");
+                                    AMBER
+                                }
+                                ChatDelivery::Cancelled => {
+                                    let _ = uwrite!(dtag, "Cancelled");
+                                    DIM
+                                }
+                            };
+                            if !dtag.as_bytes().is_empty() {
+                                lcd.text4(W - 72, ry + 12, dtag.as_bytes(), &UI_12, dcol, BG);
+                            }
+                            let txt = e.bytes();
+                            let show = &txt[..txt.len().min(30)];
+                            lcd.text4(8, ry + 28, show, &UI_12, TEXT, BG);
                         }
-                        let txt = e.bytes();
-                        let show = &txt[..txt.len().min(30)];
-                        lcd.text4(8, ry + 28, show, &UI_12, TEXT, BG);
                     }
                 }
             });
@@ -1486,14 +1811,14 @@ impl Sol950Scr {
 
     fn draw_chat_reply(self, app: &mut App, lcd: &mut impl Panel) {
         let has_out = app.sol950_host().is_some_and(|h| h.chat.has_outgoing());
-        let labels: [&[u8]; 6] = if has_out {
-            [b"Quick phrase", b"My station", b"Ask a question", b"Type message", b"Cancel send", b"End chat"]
+        let labels: [&[u8]; 7] = if has_out {
+            [b"Quick phrase", b"My station", b"Ask a question", b"Type message", b"More...", b"Cancel send", b"End chat"]
         } else {
-            [b"Quick phrase", b"My station", b"Ask a question", b"Type message", b"End chat", b""]
+            [b"Quick phrase", b"My station", b"Ask a question", b"Type message", b"More...", b"End chat", b""]
         };
-        let n_items = if has_out { 6 } else { 5 };
-        let y0 = TOP_Y + 6;
-        let row_h = 30;
+        let n_items = if has_out { 7 } else { 6 };
+        let y0 = TOP_Y + 4;
+        let row_h = 28;
         for (i, &label) in labels.iter().enumerate().take(n_items) {
             let selected = i == self.sel as usize;
             let rh = Mix::new().n(selected as u32).b(label).get();
@@ -1502,7 +1827,57 @@ impl Sol950Scr {
                 let bg = if selected { BLUE } else { BG };
                 let fg = if selected { BLUE_FG } else { TEXT };
                 redraw_box!(clear || selected, lcd, (0, y, W, row_h, bg), {
-                    lcd.text4(10, y + 20, label, &UI_14, fg, bg);
+                    lcd.text4(10, y + 19, label, &UI_14, fg, bg);
+                });
+            }
+        }
+    }
+
+    fn draw_chat_more(self, app: &mut App, lcd: &mut impl Panel) {
+        use ferrite_core::sol950::usol950::chat::wx_cond_name;
+        let Some(h) = app.sol950_host() else { return };
+        let wc = h.chat.weather_card;
+        let ac = h.chat.about_card;
+        let offer_dial = SOL950_DIALS
+            .get(h.chat.offer_dial_idx as usize)
+            .copied()
+            .unwrap_or(SOL950_DIALS[1]);
+        let y0 = TOP_Y + 6;
+        let row_h = 34;
+        for i in 0..4usize {
+            let selected = i == self.sel as usize;
+            let mut val = Buf::<16>::new();
+            let label: &[u8] = match i {
+                0 => {
+                    let _ = uwrite!(val, "{} {}C", wx_cond_name(wc.cond), wc.temp_c);
+                    b"Weather"
+                }
+                1 => {
+                    if ac.year_licensed > 0 {
+                        let _ = uwrite!(val, "Lic {}", ac.year_licensed);
+                    } else {
+                        let _ = uwrite!(val, "Set");
+                    }
+                    b"About me"
+                }
+                2 => {
+                    push_khz3(&mut val, offer_dial);
+                    b"Schedule QSO"
+                }
+                _ => {
+                    push_khz3(&mut val, offer_dial);
+                    b"Move freq"
+                }
+            };
+            let rh = Mix::new().n(selected as u32).b(label).b(val.as_bytes()).get();
+            if let Some(clear) = app.dirty_shape(R_ROW + i, rh, selected) {
+                let y = y0 + i as i32 * row_h;
+                let bg = if selected { BLUE } else { BG };
+                let fg = if selected { BLUE_FG } else { TEXT };
+                let dim = if selected { BLUE_FG } else { DIM };
+                redraw_box!(clear || selected, lcd, (0, y, W, row_h, bg), {
+                    lcd.text4(8, y + 22, label, &UI_14, fg, bg);
+                    lcd.text4(W - 96, y + 22, val.as_bytes(), &UI_12, dim, bg);
                 });
             }
         }
@@ -1558,6 +1933,139 @@ impl Sol950Scr {
                 }
                 lcd.text4(8, y0 + 114, est.as_bytes(), &UI_14, AMBER, BG);
                 lcd.text4(8, y0 + 144, b"Press OK to queue TX.", &UI_12, GREEN, BG);
+            });
+        }
+    }
+
+    fn key_distress(mut self, app: &mut App, k: Key) {
+        use ferrite_core::sol950::usol950::distress::{DistressCategory, DistressLocSource};
+        use ferrite_core::sol950::usol950::frame::encode_grid4;
+        let ret_screen = if self.sub == 1 { Sol950Scr::CHAT } else { Sol950Scr::OPERATE };
+        match k {
+            Key::Exit => {
+                app.screen = Screen::Sol950(ret_screen);
+                return;
+            }
+            Key::Up | Key::Down => {
+                self.sel ^= 1;
+                self.field = 0;
+            }
+            Key::Left | Key::Right => {
+                let dir: i32 = if k == Key::Left { -1 } else { 1 };
+                self.field = 0;
+                if let Some(h) = app.sol950_host_mut() {
+                    if self.sel == 0 {
+                        let c = (h.chat.distress.category as i32 + dir).rem_euclid(DistressCategory::COUNT as i32) as u8;
+                        h.chat.distress.category = DistressCategory::from_u8(c);
+                    } else {
+                        let l = (h.chat.distress.loc_src as i32 + dir).rem_euclid(4) as u8;
+                        h.chat.distress.loc_src = DistressLocSource::from_u8(l);
+                    }
+                }
+            }
+            Key::Menu => {
+                if self.field == 0 {
+                    self.field = 1; // Step 1: arm explicit confirmation
+                } else {
+                    // Step 2: confirmed -> queue standalone Distress TX!
+                    let armed = if let Some(h) = app.sol950_host_mut() {
+                        if let Some(me) = h.profile.callsign() {
+                            let (g4_bytes, _) = h.profile.effective_grid(h.gps_grid);
+                            let g4 = encode_grid4(&g4_bytes);
+                            let dial = h.profile.dial();
+                            h.chat.distress.arm_tx(me, g4, dial);
+                            true
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    };
+                    if armed {
+                        app.show_toast(b"DISTRESS", b"Alert queued next slot", false);
+                        app.screen = Screen::Sol950(ret_screen);
+                        return;
+                    } else {
+                        app.show_toast(b"DISTRESS", b"Set callsign first", false);
+                    }
+                }
+            }
+            _ => {}
+        }
+        app.screen = Screen::Sol950(self);
+    }
+
+    fn draw_distress(self, app: &mut App, lcd: &mut impl Panel) {
+        use ferrite_core::sol950::usol950::distress::DistressLocSource;
+        let Some(h) = app.sol950_host() else { return };
+        let mut id_buf = [0u8; 16];
+        let id_len = h.profile.format_identity(&mut id_buf);
+        let (eff_g, _) = h.profile.effective_grid(h.gps_grid);
+        let d = h.chat.distress;
+        let dh = Mix::new()
+            .n(self.sel as u32)
+            .n(self.field as u32)
+            .n(d.category as u32)
+            .n(d.loc_src as u32)
+            .n(d.lat_e4 as u32)
+            .n(d.lon_e4 as u32)
+            .b(&id_buf[..id_len])
+            .b(&eff_g)
+            .get();
+        if let Some(clear) = app.dirty_shape(R_TOP, dh, true) {
+            let y0 = TOP_Y + 4;
+            redraw_box!(clear, lcd, (0, y0, W, 232, BG), {
+                lcd.fill(0, y0, W, 24, RED);
+                lcd.text4(8, y0 + 17, b"SEND DISTRESS ALERT", &UI_14, WHITE, RED);
+
+                let mut l1 = Buf::<32>::new();
+                let id_s = core::str::from_utf8(&id_buf[..id_len]).unwrap_or("?");
+                let g_s = core::str::from_utf8(&eff_g).unwrap_or("----");
+                let _ = uwrite!(l1, "ID: {}  Grid: {}", id_s, g_s);
+                lcd.text4(8, y0 + 44, l1.as_bytes(), &UI_14, TEXT, BG);
+
+                // Row 0: Category selector
+                let bg0 = if self.sel == 0 { BLUE } else { BG };
+                let fg0 = if self.sel == 0 { BLUE_FG } else { TEXT };
+                lcd.fill(0, y0 + 58, W, 26, bg0);
+                lcd.text4(8, y0 + 76, b"Category:", &UI_12, fg0, bg0);
+                lcd.text4(W - 104, y0 + 76, d.category.label().as_bytes(), &UI_12, fg0, bg0);
+
+                // Row 1: Location source selector
+                let bg1 = if self.sel == 1 { BLUE } else { BG };
+                let fg1 = if self.sel == 1 { BLUE_FG } else { TEXT };
+                lcd.fill(0, y0 + 86, W, 26, bg1);
+                lcd.text4(8, y0 + 104, b"Location:", &UI_12, fg1, bg1);
+                lcd.text4(W - 104, y0 + 104, d.loc_src.label().as_bytes(), &UI_12, fg1, bg1);
+
+                // Coordinate preview
+                let mut pos = Buf::<32>::new();
+                if d.loc_src != DistressLocSource::Unavailable {
+                    let lat_i = d.lat_e4 / 10_000;
+                    let lat_f = (d.lat_e4.abs() % 10_000) / 100;
+                    let lon_i = d.lon_e4 / 10_000;
+                    let lon_f = (d.lon_e4.abs() % 10_000) / 100;
+                    let _ = uwrite!(
+                        pos,
+                        "Pos: {}.{}{}, {}.{}{}",
+                        lat_i,
+                        lat_f / 10,
+                        lat_f % 10,
+                        lon_i,
+                        lon_f / 10,
+                        lon_f % 10
+                    );
+                } else {
+                    let _ = uwrite!(pos, "Grid-only alert (1 burst)");
+                }
+                lcd.text4(8, y0 + 134, pos.as_bytes(), &UI_12, DIM, BG);
+
+                if self.field == 1 {
+                    lcd.fill(0, y0 + 152, W, 28, RED);
+                    lcd.text4(8, y0 + 170, b"Press OK again to SEND!", &UI_14, WHITE, RED);
+                } else {
+                    lcd.text4(8, y0 + 170, "OK to arm · BACK to cancel".as_bytes(), &UI_12, AMBER, BG);
+                }
             });
         }
     }

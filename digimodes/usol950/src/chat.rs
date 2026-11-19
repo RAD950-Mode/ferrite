@@ -75,6 +75,79 @@ impl StationCard {
     }
 }
 
+/// Local weather card (`38` bits on the air — fits in a single 10 s burst).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WeatherCard {
+    /// Condition ID (`0` = Unspecified, `1` = Clear, `2` = Cloudy, `3` = Light rain, `4` = Rain, `5` = Snow, `6` = Fog, `7` = Storm).
+    pub cond: u8,
+    /// Temperature in whole degrees Celsius (`-60..=+65`, `i8::MIN` = unknown).
+    pub temp_c: i8,
+    /// Wind speed in km/h (`0..=126`, `127` = unknown).
+    pub wind_kph: u8,
+    /// Wind direction (`0` = unknown, `1..=8` = N, NE, E, SE, S, SW, W, NW).
+    pub wind_dir: u8,
+}
+
+impl WeatherCard {
+    pub const DEFAULT: Self = Self {
+        cond: 3,      // Light rain
+        temp_c: 12,   // 12 C
+        wind_kph: 15, // 15 km/h
+        wind_dir: 8,  // NW
+    };
+
+    pub fn pack38(&self) -> u64 {
+        let cond = (self.cond as u64) & 0x1F;
+        let tc = if self.temp_c == i8::MIN {
+            0xFFu64
+        } else {
+            ((self.temp_c as i32 + 60).clamp(0, 254) as u64) & 0xFF
+        };
+        let wk = (self.wind_kph as u64) & 0x7F;
+        let wd = (self.wind_dir as u64) & 0x0F;
+        (cond << 19) | (tc << 11) | (wk << 4) | wd
+    }
+
+    pub fn unpack38(v: u64) -> Self {
+        let cond = ((v >> 19) & 0x1F) as u8;
+        let tc_raw = ((v >> 11) & 0xFF) as u8;
+        let temp_c = if tc_raw == 0xFF { i8::MIN } else { (tc_raw as i32 - 60).clamp(-60, 127) as i8 };
+        let wind_kph = ((v >> 4) & 0x7F) as u8;
+        let wind_dir = (v & 0x0F) as u8;
+        Self { cond, temp_c, wind_kph, wind_dir }
+    }
+}
+
+/// Optional operator "About me" card (`38` bits on the air — fits in a single 10 s burst).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AboutCard {
+    /// Optional operator age (`0` = omitted, `1..=126`).
+    pub age: u8,
+    /// Optional year first licensed (`0` = omitted, `1920..=2174`).
+    pub year_licensed: u16,
+}
+
+impl AboutCard {
+    pub const DEFAULT: Self = Self { age: 0, year_licensed: 1994 };
+
+    pub fn pack38(&self) -> u64 {
+        let age = (self.age.min(126) as u64) & 0x7F;
+        let yr = if self.year_licensed >= 1920 && self.year_licensed <= 2174 {
+            ((self.year_licensed - 1920 + 1) as u64) & 0xFF
+        } else {
+            0
+        };
+        (age << 8) | yr
+    }
+
+    pub fn unpack38(v: u64) -> Self {
+        let age = ((v >> 8) & 0x7F) as u8;
+        let yr_raw = (v & 0xFF) as u16;
+        let year_licensed = if yr_raw == 0 { 0 } else { 1920 + yr_raw - 1 };
+        Self { age, year_licensed }
+    }
+}
+
 /// Control frame subtypes (`msg_type = 0`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ChatCtrl {
@@ -83,6 +156,127 @@ pub enum ChatCtrl {
     Decline,
     End,
     Ack { ack_seq: u8, frag_mask: u8 },
+}
+
+/// Action on a directed Rendezvous offer (`Schedule QSO` or `Move to frequency`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RendezvousAction {
+    Offer = 0,
+    Accept = 1,
+    Counter = 2,
+    Decline = 3,
+}
+
+impl RendezvousAction {
+    pub const fn from_u8(v: u8) -> Self {
+        match v & 3 {
+            0 => Self::Offer,
+            1 => Self::Accept,
+            2 => Self::Counter,
+            _ => Self::Decline,
+        }
+    }
+}
+
+/// Directed rendezvous offer (`38` bits on the air — fits in a single 10 s burst).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RendezvousCard {
+    /// Schedule a future QSO (`subtype = 0`):
+    /// `1b subtype | 2b action | 7b days_ahead | 11b utc_min | 8b dial_preset | 3b profile | 3b subch | 3b offer_ref`.
+    Schedule {
+        action: RendezvousAction,
+        days_ahead: u8,
+        utc_min: u16,
+        dial_preset: u8,
+        profile: u8,
+        subch: u8,
+        offer_ref: u8,
+    },
+    /// Near-term move to another frequency (`subtype = 1`):
+    /// `1b subtype | 2b action | 5b band_id | 18b dial_offset_10hz | 3b profile | 6b turn_mod64 | 3b subch`.
+    MoveFreq {
+        action: RendezvousAction,
+        band_id: u8,
+        dial_offset_10hz: u32,
+        profile: u8,
+        turn_mod64: u8,
+        subch: u8,
+    },
+}
+
+impl RendezvousCard {
+    pub fn pack38(&self) -> u64 {
+        match *self {
+            Self::Schedule { action, days_ahead, utc_min, dial_preset, profile, subch, offer_ref } => {
+                (((action as u64) & 3) << 35)
+                    | (((days_ahead as u64) & 0x7F) << 28)
+                    | (((utc_min.min(1439) as u64) & 0x7FF) << 17)
+                    | (((dial_preset as u64) & 0xFF) << 9)
+                    | (((profile as u64) & 7) << 6)
+                    | (((subch as u64) & 7) << 3)
+                    | ((offer_ref as u64) & 7)
+            }
+            Self::MoveFreq { action, band_id, dial_offset_10hz, profile, turn_mod64, subch } => {
+                (1u64 << 37)
+                    | (((action as u64) & 3) << 35)
+                    | (((band_id as u64) & 0x1F) << 30)
+                    | (((dial_offset_10hz as u64) & 0x3_FFFF) << 12)
+                    | (((profile as u64) & 7) << 9)
+                    | (((turn_mod64 as u64) & 0x3F) << 3)
+                    | ((subch as u64) & 7)
+            }
+        }
+    }
+
+    pub fn unpack38(v: u64) -> Option<Self> {
+        let subtype = ((v >> 37) & 1) as u8;
+        let action = RendezvousAction::from_u8(((v >> 35) & 3) as u8);
+        if subtype == 0 {
+            let days_ahead = ((v >> 28) & 0x7F) as u8;
+            let utc_min = ((v >> 17) & 0x7FF) as u16;
+            if utc_min > 1439 {
+                return None;
+            }
+            let dial_preset = ((v >> 9) & 0xFF) as u8;
+            let profile = ((v >> 6) & 7) as u8;
+            let subch = ((v >> 3) & 7) as u8;
+            let offer_ref = (v & 7) as u8;
+            Some(Self::Schedule { action, days_ahead, utc_min, dial_preset, profile, subch, offer_ref })
+        } else {
+            let band_id = ((v >> 30) & 0x1F) as u8;
+            let dial_offset_10hz = ((v >> 12) & 0x3_FFFF) as u32;
+            let profile = ((v >> 9) & 7) as u8;
+            let turn_mod64 = ((v >> 3) & 0x3F) as u8;
+            let subch = (v & 7) as u8;
+            Some(Self::MoveFreq { action, band_id, dial_offset_10hz, profile, turn_mod64, subch })
+        }
+    }
+}
+
+/// Band reference USB dial in 10 Hz units for `RendezvousCard::MoveFreq::band_id`.
+pub const fn move_band_ref_hz10(band_id: u8) -> Option<u32> {
+    match band_id {
+        0 => Some(2_800_000), // 10 m (28.000 MHz)
+        1 => Some(2_489_000), // 12 m (24.890 MHz)
+        2 => Some(2_100_000), // 15 m (21.000 MHz)
+        3 => Some(1_806_800), // 17 m (18.068 MHz)
+        _ => None,
+    }
+}
+
+/// Convert a USB dial in 10 Hz units to `(band_id, offset_10hz)` for `MoveFreq`.
+pub const fn dial_to_move_band(dial_hz10: u32) -> Option<(u8, u32)> {
+    if dial_hz10 >= 2_800_000 && dial_hz10 < 2_970_000 {
+        Some((0, dial_hz10 - 2_800_000))
+    } else if dial_hz10 >= 2_489_000 && dial_hz10 < 2_499_000 {
+        Some((1, dial_hz10 - 2_489_000))
+    } else if dial_hz10 >= 2_100_000 && dial_hz10 < 2_145_000 {
+        Some((2, dial_hz10 - 2_100_000))
+    } else if dial_hz10 >= 1_806_800 && dial_hz10 < 1_816_800 {
+        Some((3, dial_hz10 - 1_806_800))
+    } else {
+        None
+    }
 }
 
 /// Decoded single-burst conversation payload (`38` bits).
@@ -99,6 +293,9 @@ pub enum ChatBody {
         is_name: bool,
         chars: [u8; 5],
     },
+    Weather(WeatherCard),
+    About(AboutCard),
+    Rendezvous(RendezvousCard),
 }
 
 /// Complete 64-bit conversation wire frame (`session_ref`, `seq`, `body`).
@@ -150,6 +347,35 @@ pub fn ant_name(id: u8) -> &'static str {
     }
 }
 
+/// Weather condition catalog names (`WeatherCard::cond`).
+pub fn wx_cond_name(id: u8) -> &'static str {
+    match id {
+        1 => "Clear",
+        2 => "Cloudy",
+        3 => "Light rain",
+        4 => "Rain",
+        5 => "Snow",
+        6 => "Fog",
+        7 => "Storm",
+        _ => "Weather",
+    }
+}
+
+/// Wind direction catalog names (`WeatherCard::wind_dir`).
+pub fn wind_dir_name(id: u8) -> &'static str {
+    match id {
+        1 => "N",
+        2 => "NE",
+        3 => "E",
+        4 => "SE",
+        5 => "S",
+        6 => "SW",
+        7 => "W",
+        8 => "NW",
+        _ => "",
+    }
+}
+
 /// Compute a 11-bit session reference from two callsigns and the QSO completion slot.
 pub fn session_ref_for(a: u32, b: u32, slot: u32) -> u16 {
     let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
@@ -188,6 +414,9 @@ pub fn encode_chat_frame(pkt: ChatPacket) -> Frame {
             }
             (4, packed)
         }
+        ChatBody::Weather(wc) => (5, wc.pack38()),
+        ChatBody::About(ac) => (6, ac.pack38()),
+        ChatBody::Rendezvous(rv) => (7, rv.pack38()),
     };
     let bits55 = ((mtype & 7) << 52)
         | (((pkt.session_ref as u64) & 0x7FF) << 41)
@@ -242,6 +471,9 @@ pub fn decode_chat_frame(frame: Frame) -> Option<ChatPacket> {
             }
             ChatBody::LiteralFrag { frag_idx, is_final, char_cnt, is_name, chars }
         }
+        5 => ChatBody::Weather(WeatherCard::unpack38(body38)),
+        6 => ChatBody::About(AboutCard::unpack38(body38)),
+        7 => ChatBody::Rendezvous(RendezvousCard::unpack38(body38)?),
         _ => return None,
     };
     Some(ChatPacket { session_ref, seq, body })
@@ -382,6 +614,14 @@ impl LiteralReassembler {
     pub fn bytes(&self, len: usize) -> &[u8] {
         &self.chars[..len.min(CHAT_LITERAL_MAX)]
     }
+
+    pub fn received_mask(&self) -> u8 {
+        self.received_mask
+    }
+
+    pub fn active_seq(&self) -> u8 {
+        self.active_seq
+    }
 }
 
 fn encode_char6(b: u8) -> u8 {
@@ -411,12 +651,33 @@ mod tests {
         // Confirm legacy callsign range strictly rejects the out-of-range sender marker.
         assert!(Callsign::from_raw(0x0FC0_0000).is_none());
 
-        // 2. Question & Phrase round-trip (1 burst each)
+        // 2. Question, Phrase, Weather, About round-trip (1 burst each)
         for body in [
             ChatBody::Ctrl(ChatCtrl::Invite),
             ChatBody::Ctrl(ChatCtrl::Ack { ack_seq: 5, frag_mask: 0x3F }),
             ChatBody::Question { topic: 0, variant: 0 },
             ChatBody::Phrase(1),
+            ChatBody::Weather(WeatherCard::DEFAULT),
+            ChatBody::Weather(WeatherCard { cond: 0, temp_c: i8::MIN, wind_kph: 127, wind_dir: 0 }),
+            ChatBody::About(AboutCard::DEFAULT),
+            ChatBody::About(AboutCard { age: 42, year_licensed: 0 }),
+            ChatBody::Rendezvous(RendezvousCard::Schedule {
+                action: RendezvousAction::Offer,
+                days_ahead: 1,
+                utc_min: 18 * 60 + 30,
+                dial_preset: 1,
+                profile: 0,
+                subch: 2,
+                offer_ref: 3,
+            }),
+            ChatBody::Rendezvous(RendezvousCard::MoveFreq {
+                action: RendezvousAction::Accept,
+                band_id: 0,
+                dial_offset_10hz: 8200, // 28.082 MHz
+                profile: 0,
+                turn_mod64: 45,
+                subch: 4,
+            }),
         ] {
             let p = ChatPacket { session_ref: 42, seq: 5, body };
             let f = Frame::from_bits78(&encode_chat_frame(p).to_bits78()).unwrap();

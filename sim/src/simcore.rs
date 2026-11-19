@@ -680,7 +680,7 @@ impl SimCore {
                     }
                 }
             }
-            if app.sol950_take_finish() && app.sol950_open() {
+            if app.sol950_take_finish().is_some() && app.sol950_open() {
                 use ferrite_core::sol950::usol950::frame::encode_grid4;
                 use ferrite_core::sol950::usol950::{Callsign, Decoded, Frame};
                 const ROSTER: [(&[u8], [u8; 4], i8, u16); 4] = [
@@ -746,7 +746,30 @@ impl SimCore {
                                         }
                                         ChatBody::Station(_) => {
                                             feed(pkt.seq, ChatBody::Ctrl(ChatCtrl::Ack { ack_seq: pkt.seq, frag_mask: 1 }));
-                                            feed(pkt.seq.wrapping_add(1), ChatBody::Phrase(0));
+                                            feed(pkt.seq.wrapping_add(1), ChatBody::Question { topic: 2, variant: 0 });
+                                        }
+                                        ChatBody::Weather(_) => {
+                                            use ferrite_core::sol950::usol950::chat::WeatherCard;
+                                            feed(pkt.seq, ChatBody::Ctrl(ChatCtrl::Ack { ack_seq: pkt.seq, frag_mask: 1 }));
+                                            feed(pkt.seq.wrapping_add(1), ChatBody::Weather(WeatherCard::DEFAULT));
+                                        }
+                                        ChatBody::About(_) => {
+                                            use ferrite_core::sol950::usol950::chat::AboutCard;
+                                            feed(pkt.seq, ChatBody::Ctrl(ChatCtrl::Ack { ack_seq: pkt.seq, frag_mask: 1 }));
+                                            feed(pkt.seq.wrapping_add(1), ChatBody::About(AboutCard::DEFAULT));
+                                        }
+                                        ChatBody::Rendezvous(rv) => {
+                                            use ferrite_core::sol950::usol950::chat::{RendezvousAction, RendezvousCard};
+                                            feed(pkt.seq, ChatBody::Ctrl(ChatCtrl::Ack { ack_seq: pkt.seq, frag_mask: 1 }));
+                                            let accepted = match rv {
+                                                RendezvousCard::Schedule { days_ahead, utc_min, dial_preset, profile, subch, offer_ref, .. } => {
+                                                    RendezvousCard::Schedule { action: RendezvousAction::Accept, days_ahead, utc_min, dial_preset, profile, subch, offer_ref }
+                                                }
+                                                RendezvousCard::MoveFreq { band_id, dial_offset_10hz, profile, turn_mod64, subch, .. } => {
+                                                    RendezvousCard::MoveFreq { action: RendezvousAction::Accept, band_id, dial_offset_10hz, profile, turn_mod64, subch }
+                                                }
+                                            };
+                                            feed(pkt.seq.wrapping_add(1), ChatBody::Rendezvous(accepted));
                                         }
                                         ChatBody::Question { .. } => {
                                             feed(pkt.seq, ChatBody::Ctrl(ChatCtrl::Ack { ack_seq: pkt.seq, frag_mask: 1 }));

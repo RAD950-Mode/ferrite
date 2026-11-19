@@ -12,6 +12,7 @@
 #![allow(clippy::needless_range_loop)]
 
 pub mod chat;
+pub mod distress;
 pub mod ext;
 pub mod frame;
 pub mod ldpc;

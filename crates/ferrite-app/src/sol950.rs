@@ -8,7 +8,7 @@ use ferrite_core::freq::Freq10;
 use ferrite_core::msg::RadioCmd;
 use ferrite_core::sol950::usol950::frame::encode_grid4;
 use ferrite_core::sol950::usol950::{Callsign, Decoded, Frame, SoftCandidate, GRID_UNKNOWN};
-use ferrite_core::sol950::{Config, Engine, OpMode, QsoRecord, SlotPlan};
+use ferrite_core::sol950::{Config, CoopRxReport, Engine, OpMode, QsoRecord, SlotPlan};
 
 /// Nominal HF USB dial windows for SOL950 (10 m, 12 m, 15 m, and 17 m; FT8-adjacent +4 kHz windows).
 /// Index `0` stays `28.078 MHz` so existing `SOL950_CFG` flash records remain backward-compatible.
@@ -600,6 +600,16 @@ pub struct Sol950Host {
     /// Latest onboard GPS 4-char grid (never from fixed position `0 6 9`).
     pub gps_grid: Option<[u8; 4]>,
     pub last_slot: u32,
+    /// RF and Cooperative RX state captured at the start of the current 10 s receive slot. The dial can change in
+    /// Setup while the decoder is still ingesting samples, so end-of-slot telemetry must use this snapshot.
+    rx_slot_start: u32,
+    rx_slot_dial_hz: u32,
+    rx_slot_coop_capture: bool,
+    /// Metadata frozen when a slot finish is queued. It remains valid if the UI reaches the next UTC slot before
+    /// the DSP task can start the previous slot's decode.
+    finish_utc_slot: u32,
+    finish_dial_hz: u32,
+    finish_coop_capture: bool,
     pub finish_sent_slot: u32,
     /// A live SOL950 TX burst is currently keyed on BK4829.
     pub tx_in_flight: bool,
@@ -635,6 +645,8 @@ pub struct Sol950Host {
     tx_wf_tick: u32,
     /// Most recent failed-CRC soft candidate `(slot, SoftCandidate)` for Cooperative RX host capture.
     pub last_soft: Option<(u32, SoftCandidate)>,
+    /// Most recent finished receive slot for the Cooperative RX host link.
+    pub last_coop: Option<CoopRxReport>,
     /// Conversation extension session state (`docs/sol950-conversation-extension.md`).
     pub chat: crate::rad950_chat::ChatState,
 }
@@ -664,6 +676,12 @@ impl Sol950Host {
             utc_uncert_ms: u16::MAX,
             gps_grid: None,
             last_slot: u32::MAX,
+            rx_slot_start: 0,
+            rx_slot_dial_hz: 0,
+            rx_slot_coop_capture: false,
+            finish_utc_slot: 0,
+            finish_dial_hz: 0,
+            finish_coop_capture: false,
             finish_sent_slot: u32::MAX,
             tx_in_flight: false,
             pending_tx: None,
@@ -684,6 +702,7 @@ impl Sol950Host {
             tx_tones: [0; ferrite_core::sol950::usol950::phy::N_SYMBOLS],
             tx_wf_tick: u32::MAX,
             last_soft: None,
+            last_coop: None,
             chat: crate::rad950_chat::ChatState::new(),
         }
     }
@@ -756,7 +775,7 @@ impl Sol950Host {
         if sec_in_slot == 9 && ms_in_sec >= 550 && self.finish_sent_slot != slot {
             self.finish_sent_slot = slot;
             if !self.tx_in_flight {
-                self.finish_due = true;
+                self.queue_finish();
             }
         }
         // Advance the session state machine on each 10 s UTC slot boundary.
@@ -765,9 +784,12 @@ impl Sol950Host {
             // flush the RX decoder once so no slot is ever silently dropped.
             if self.last_slot != u32::MAX && self.finish_sent_slot != self.last_slot && !self.tx_in_flight {
                 self.finish_sent_slot = self.last_slot;
-                self.finish_due = true;
+                self.queue_finish();
             }
             self.last_slot = slot;
+            self.rx_slot_start = utc_sec - sec_in_slot;
+            self.rx_slot_dial_hz = self.profile.dial().saturating_mul(10);
+            self.rx_slot_coop_capture = self.profile.coop_rx == CoopRxMode::Capture;
             let utc_ok = self.utc_ready() && self.profile.callsign().is_some();
             if self.chat.is_open() {
                 if let Some(frame) = self.chat.on_slot_start(slot, utc_ok) {
@@ -877,6 +899,22 @@ impl Sol950Host {
             self.set_notice(b"TX aborted");
         }
     }
+
+    /// Whether this radio is parked in receive-only Cooperative RX capture for the browser host.
+    pub fn coop_bluetooth_armed(&self) -> bool {
+        self.profile.coop_rx == CoopRxMode::Capture
+            && self.profile.coop_link == CoopLink::Bluetooth
+            && matches!(self.engine.mode(), OpMode::Monitor)
+            && !self.tx_in_flight
+    }
+
+    /// Freeze the current receive slot's association metadata when its DSP decode is scheduled.
+    fn queue_finish(&mut self) {
+        self.finish_utc_slot = self.rx_slot_start;
+        self.finish_dial_hz = self.rx_slot_dial_hz;
+        self.finish_coop_capture = self.rx_slot_coop_capture;
+        self.finish_due = true;
+    }
 }
 
 impl App {
@@ -945,10 +983,18 @@ impl App {
         Some(tx)
     }
 
-    /// Take the `DspCmd::Sol950Finish` trigger at the end of a 10 s RX slot.
-    pub fn sol950_take_finish(&mut self) -> bool {
-        let Some(h) = self.sol950d.as_deref_mut() else { return false };
-        core::mem::take(&mut h.finish_due)
+    /// Take the `DspCmd::Sol950Finish` trigger at the end of a 10 s RX slot, preserving the slot identity for
+    /// Cooperative RX telemetry even while the decode finishes during the following guard interval.
+    pub fn sol950_take_finish(&mut self) -> Option<(u32, u32, bool)> {
+        let h = self.sol950d.as_deref_mut()?;
+        if !core::mem::take(&mut h.finish_due) {
+            return None;
+        }
+        let coop_capture = h.finish_coop_capture
+            && h.coop_bluetooth_armed()
+            && h.utc_ready()
+            && h.profile.dial().saturating_mul(10) == h.finish_dial_hz;
+        Some((h.finish_utc_slot, h.finish_dial_hz, coop_capture))
     }
 
     /// Maximum sleep duration (ms) for the UI task while SOL950 is active, so `DspCmd::Sol950Finish`
