@@ -40,7 +40,7 @@ pub const PAGE_DISTRESS: u8 = 13;
 
 const OPERATE_ROWS: usize = 4;
 const LOG_ROWS: usize = 6;
-const SETUP_ROWS: usize = 14;
+const SETUP_ROWS: usize = 15;
 const SETUP_VISIBLE: usize = 8;
 const TOP_Y: i32 = w::SBAR_H;
 
@@ -218,6 +218,75 @@ impl View for Sol950Scr {
         }
     }
 
+    fn ptt(mut self, app: &mut App, down: bool) {
+        if self.page != PAGE_DISTRESS {
+            if down {
+                super::nav::transmit(app);
+            }
+            return;
+        }
+        // On the Distress screen, PTT never keys FM voice; after confirmation (`field == 1`),
+        // require 3 consecutive PTT presses, holding the 3rd press for 700 ms to initiate TX.
+        if self.field == 0 {
+            return;
+        }
+        let now = app.now;
+        if down {
+            if self.top < 3 {
+                self.top += 1;
+            }
+            if self.top == 3 {
+                if let Some(h) = app.sol950_host_mut() {
+                    h.chat.distress.ptt_hold_start_ms = Some(now);
+                }
+            }
+        } else if self.top == 3 {
+            // Released before the 700 ms hold completed: step back to 2/3 so a quick tap cannot fire.
+            self.top = 2;
+            if let Some(h) = app.sol950_host_mut() {
+                h.chat.distress.ptt_hold_start_ms = None;
+            }
+        }
+        app.screen = Screen::Sol950(self);
+    }
+
+    fn tick(self, app: &mut App, _live: &LiveAll) {
+        use ferrite_core::sol950::usol950::frame::encode_grid4;
+        if self.page != PAGE_DISTRESS || self.field != 1 || self.top < 3 {
+            return;
+        }
+        let now = app.now;
+        let held_ok = app
+            .sol950_host()
+            .and_then(|h| h.chat.distress.ptt_hold_start_ms)
+            .is_some_and(|t0| now.wrapping_sub(t0) >= 700);
+        if !held_ok {
+            return;
+        }
+        let armed = if let Some(h) = app.sol950_host_mut() {
+            h.chat.distress.ptt_hold_start_ms = None;
+            if let Some(me) = h.profile.callsign() {
+                let (g4_bytes, _) = h.profile.effective_grid(h.gps_grid);
+                let g4 = encode_grid4(&g4_bytes);
+                let dial = h.profile.dial();
+                h.chat.distress.arm_tx(me, g4, dial);
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+        let ret_screen = if self.sub == 1 { Sol950Scr::CHAT } else { Sol950Scr::OPERATE };
+        if armed {
+            app.show_toast(b"DISTRESS", b"Alert queued next slot", false);
+            app.screen = Screen::Sol950(ret_screen);
+        } else {
+            app.show_toast(b"DISTRESS", b"Set callsign first", false);
+            app.screen = Screen::Sol950(Sol950Scr { field: 0, top: 0, ..self });
+        }
+    }
+
     fn render(self, app: &mut App, lcd: &mut impl Panel, cx: &Cx<impl ChannelStore>) {
         app.new_page(lcd, self.page as u32);
         match self.page {
@@ -358,10 +427,6 @@ impl Sol950Scr {
                 app.screen = Screen::Sol950(Sol950Scr::GRIDS);
                 return;
             }
-            Key::Digit(9) => {
-                app.screen = Screen::Sol950(Sol950Scr { page: PAGE_DISTRESS, sel: 0, top: 0, field: 0, sub: 0 });
-                return;
-            }
             Key::Star => {
                 app.screen = Screen::Sol950(Sol950Scr::SETUP);
                 return;
@@ -432,6 +497,10 @@ impl Sol950Scr {
                 } else if self.sel as usize >= self.top as usize + SETUP_VISIBLE {
                     self.top = (self.sel as usize + 1 - SETUP_VISIBLE) as u8;
                 }
+            }
+            Key::Menu if self.sel == 14 => {
+                app.screen = Screen::Sol950(Sol950Scr { page: PAGE_DISTRESS, sel: 0, top: 0, field: 0, sub: 0 });
+                return;
             }
             Key::Menu if matches!(self.sel, 0 | 1 | 4) => {
                 let target = match self.sel {
@@ -903,9 +972,13 @@ impl Sol950Scr {
                     }
                     b"Ant height"
                 }
-                _ => {
+                13 => {
                     let _ = uwrite!(val, "{}", if sc.amp { "Ext amp" } else { "Barefoot" });
                     b"Card amp"
+                }
+                _ => {
+                    let _ = uwrite!(val, "Open");
+                    b"Send distress..."
                 }
             };
             let rh = Mix::new().n(i as u32).n(selected as u32).b(label).b(val.as_bytes()).get();
@@ -1407,10 +1480,6 @@ impl Sol950Scr {
                 app.show_toast(b"RAD950", b"Tuned to reminder", false);
                 return;
             }
-            Key::Digit(9) => {
-                app.screen = Screen::Sol950(Sol950Scr { page: PAGE_DISTRESS, sel: 0, top: 0, field: 0, sub: 1 });
-                return;
-            }
             Key::Up if self.top > 0 => self.top -= 1,
             Key::Down if (self.top as usize) + 3 < count => self.top += 1,
             Key::Menu => {
@@ -1501,7 +1570,7 @@ impl Sol950Scr {
 
     fn key_chat_more(mut self, app: &mut App, k: Key) {
         use ferrite_core::sol950::usol950::chat::{dial_to_move_band, RendezvousAction, RendezvousCard};
-        const MORE_ITEMS: u8 = 4;
+        const MORE_ITEMS: u8 = 5;
         match k {
             Key::Exit => {
                 app.screen = Screen::Sol950(Sol950Scr::CHAT_REPLY);
@@ -1520,10 +1589,11 @@ impl Sol950Scr {
                             let cur = if h.chat.about_card.year_licensed == 0 { 1994 } else { h.chat.about_card.year_licensed as i32 };
                             h.chat.about_card.year_licensed = (cur + dir).clamp(1960, 2026) as u16;
                         }
-                        _ => {
+                        2 | 3 => {
                             let n = SOL950_DIALS.len() as i32;
                             h.chat.offer_dial_idx = (h.chat.offer_dial_idx as i32 + dir).rem_euclid(n) as u8;
                         }
+                        _ => {}
                     }
                 }
             }
@@ -1560,7 +1630,7 @@ impl Sol950Scr {
                         app.screen = Screen::Sol950(Sol950Scr::CHAT_PREVIEW);
                         return;
                     }
-                    _ => {
+                    3 => {
                         if let Some(h) = app.sol950_host_mut() {
                             let dest = SOL950_DIALS
                                 .get(h.chat.offer_dial_idx as usize)
@@ -1579,6 +1649,10 @@ impl Sol950Scr {
                             }));
                         }
                         app.screen = Screen::Sol950(Sol950Scr::CHAT_PREVIEW);
+                        return;
+                    }
+                    _ => {
+                        app.screen = Screen::Sol950(Sol950Scr { page: PAGE_DISTRESS, sel: 0, top: 0, field: 0, sub: 1 });
                         return;
                     }
                 }
@@ -1844,7 +1918,7 @@ impl Sol950Scr {
             .unwrap_or(SOL950_DIALS[1]);
         let y0 = TOP_Y + 6;
         let row_h = 34;
-        for i in 0..4usize {
+        for i in 0..5usize {
             let selected = i == self.sel as usize;
             let mut val = Buf::<16>::new();
             let label: &[u8] = match i {
@@ -1864,9 +1938,13 @@ impl Sol950Scr {
                     push_khz3(&mut val, offer_dial);
                     b"Schedule QSO"
                 }
-                _ => {
+                3 => {
                     push_khz3(&mut val, offer_dial);
                     b"Move freq"
+                }
+                _ => {
+                    let _ = uwrite!(val, "3x PTT");
+                    b"Send distress..."
                 }
             };
             let rh = Mix::new().n(selected as u32).b(label).b(val.as_bytes()).get();
@@ -1939,21 +2017,29 @@ impl Sol950Scr {
 
     fn key_distress(mut self, app: &mut App, k: Key) {
         use ferrite_core::sol950::usol950::distress::{DistressCategory, DistressLocSource};
-        use ferrite_core::sol950::usol950::frame::encode_grid4;
         let ret_screen = if self.sub == 1 { Sol950Scr::CHAT } else { Sol950Scr::OPERATE };
         match k {
             Key::Exit => {
+                if let Some(h) = app.sol950_host_mut() {
+                    h.chat.distress.ptt_hold_start_ms = None;
+                }
                 app.screen = Screen::Sol950(ret_screen);
                 return;
             }
             Key::Up | Key::Down => {
                 self.sel ^= 1;
                 self.field = 0;
+                self.top = 0;
+                if let Some(h) = app.sol950_host_mut() {
+                    h.chat.distress.ptt_hold_start_ms = None;
+                }
             }
             Key::Left | Key::Right => {
                 let dir: i32 = if k == Key::Left { -1 } else { 1 };
                 self.field = 0;
+                self.top = 0;
                 if let Some(h) = app.sol950_host_mut() {
+                    h.chat.distress.ptt_hold_start_ms = None;
                     if self.sel == 0 {
                         let c = (h.chat.distress.category as i32 + dir).rem_euclid(DistressCategory::COUNT as i32) as u8;
                         h.chat.distress.category = DistressCategory::from_u8(c);
@@ -1964,30 +2050,10 @@ impl Sol950Scr {
                 }
             }
             Key::Menu => {
+                // Confirm settings and arm the 3x PTT + hold interlock (OK alone never transmits Distress!).
                 if self.field == 0 {
-                    self.field = 1; // Step 1: arm explicit confirmation
-                } else {
-                    // Step 2: confirmed -> queue standalone Distress TX!
-                    let armed = if let Some(h) = app.sol950_host_mut() {
-                        if let Some(me) = h.profile.callsign() {
-                            let (g4_bytes, _) = h.profile.effective_grid(h.gps_grid);
-                            let g4 = encode_grid4(&g4_bytes);
-                            let dial = h.profile.dial();
-                            h.chat.distress.arm_tx(me, g4, dial);
-                            true
-                        } else {
-                            false
-                        }
-                    } else {
-                        false
-                    };
-                    if armed {
-                        app.show_toast(b"DISTRESS", b"Alert queued next slot", false);
-                        app.screen = Screen::Sol950(ret_screen);
-                        return;
-                    } else {
-                        app.show_toast(b"DISTRESS", b"Set callsign first", false);
-                    }
+                    self.field = 1;
+                    self.top = 0;
                 }
             }
             _ => {}
@@ -2005,6 +2071,7 @@ impl Sol950Scr {
         let dh = Mix::new()
             .n(self.sel as u32)
             .n(self.field as u32)
+            .n(self.top as u32)
             .n(d.category as u32)
             .n(d.loc_src as u32)
             .n(d.lat_e4 as u32)
@@ -2061,10 +2128,17 @@ impl Sol950Scr {
                 lcd.text4(8, y0 + 134, pos.as_bytes(), &UI_12, DIM, BG);
 
                 if self.field == 1 {
-                    lcd.fill(0, y0 + 152, W, 28, RED);
-                    lcd.text4(8, y0 + 170, b"Press OK again to SEND!", &UI_14, WHITE, RED);
+                    lcd.fill(0, y0 + 150, W, 38, RED);
+                    let mut p = Buf::<32>::new();
+                    if self.top >= 3 {
+                        let _ = uwrite!(p, "HOLD PTT TO SEND (3/3)...");
+                    } else {
+                        let _ = uwrite!(p, "Press PTT 3x, hold 3rd ({}/3)", self.top);
+                    }
+                    lcd.text4(8, y0 + 168, p.as_bytes(), &UI_12B, WHITE, RED);
+                    lcd.text4(8, y0 + 183, b"BACK to cancel", &UI_12, WHITE, RED);
                 } else {
-                    lcd.text4(8, y0 + 170, "OK to arm · BACK to cancel".as_bytes(), &UI_12, AMBER, BG);
+                    lcd.text4(8, y0 + 170, "OK to confirm · BACK to cancel".as_bytes(), &UI_12, AMBER, BG);
                 }
             });
         }

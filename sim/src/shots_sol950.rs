@@ -262,11 +262,14 @@ pub fn run(scale: u32) {
     step(&mut app, &mut fb, &mut radio, 100, &mut t);
     crate::save(&fb, "sol950-chat-more", scale);
 
-    // 13. Standalone Distress preview screen (reachable via 9 from Operate or Chat)
-    press(&mut app, Key::Exit, &mut t); // Reply
-    press(&mut app, Key::Exit, &mut t); // Chat
-    press(&mut app, Key::Digit(9), &mut t); // Distress
+    // 13. Standalone Distress preview screen (selected from bottom of More menu, confirmed -> 3x PTT interlock)
+    press(&mut app, Key::Down, &mut t);
+    press(&mut app, Key::Down, &mut t);
+    press(&mut app, Key::Down, &mut t);
+    press(&mut app, Key::Down, &mut t); // Send distress... (row 4)
+    press(&mut app, Key::Menu, &mut t);
     press(&mut app, Key::Right, &mut t); // Category -> Medical
+    press(&mut app, Key::Menu, &mut t); // Confirm -> shows 3x PTT hold prompt
     step(&mut app, &mut fb, &mut radio, 100, &mut t);
     crate::save(&fb, "sol950-distress", scale);
 }

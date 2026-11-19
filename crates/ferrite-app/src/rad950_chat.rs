@@ -49,6 +49,8 @@ pub struct DistressState {
     pub armed_pos: Option<(u32, DistressPosition)>,
     pub armed_dial_hz10: u32,
     pub rx: Option<RxDistress>,
+    /// Start timestamp (ms) of the 3rd consecutive PTT hold on the Distress confirmation screen.
+    pub ptt_hold_start_ms: Option<u32>,
 }
 
 impl Default for DistressState {
@@ -69,6 +71,7 @@ impl DistressState {
             armed_pos: None,
             armed_dial_hz10: crate::sol950::SOL950_DIALS[0],
             rx: None,
+            ptt_hold_start_ms: None,
         }
     }
 
