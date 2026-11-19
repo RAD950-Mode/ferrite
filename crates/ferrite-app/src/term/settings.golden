@@ -299,7 +299,7 @@ All settings are at their defaults.
 :_ :get 0 3 4_ 0 3 4 Crossband repeater: a page on the radio, not a setting
 :_ :get 0 3 5_ 0 3 5 Tone search: a page on the radio, not a setting
 :_ :get 0 3 6_ 0 3 6 Satellites: a page on the radio, not a setting
-:_ :get 0 3 7_ 0 3 7 SOL950: a page on the radio, not a setting
+:_ :get 0 3 7_ 0 3 7 RAD950: a page on the radio, not a setting
 :_ :get 0 4 1_ 0 4 1 Event log: a page on the radio, not a setting
 :_ :get 0 4 2_ a menu number from MENU, e.g. 0 7 1 (Theme)
 :_ :get 0 4 2 1_ 0 4 2 1 Decode: Off
@@ -2574,7 +2574,7 @@ Ferrite 0.9.3   N0CALL   RT-950 Pro      cable 115200                   14:32   
 :_ :get 0 3 4_ 0 3 4 Crossband repeater: a page on the radio, not a setting
 :_ :get 0 3 5_ 0 3 5 Tone search: a page on the radio, not a setting
 :_ :get 0 3 6_ 0 3 6 Satellites: a page on the radio, not a setting
-:_ :get 0 3 7_ 0 3 7 SOL950: a page on the radio, not a setting
+:_ :get 0 3 7_ 0 3 7 RAD950: a page on the radio, not a setting
 :_ :get 0 4 1_ 0 4 1 Event log: a page on the radio, not a setting
 :_ :get 0 4 2_ a menu number from MENU, e.g. 0 7 1 (Theme)
 :_ :get 0 4 2 1_ 0 4 2 1 Decode: Off
@@ -4829,7 +4829,7 @@ set 0 9 2 3 Link                  # Cable port
 :_ :get 0 3 4_ 0 3 4 Crossband repeater: a page on the radio, not a setting
 :_ :get 0 3 5_ 0 3 5 Tone search: a page on the radio, not a setting
 :_ :get 0 3 6_ 0 3 6 Satellites: a page on the radio, not a setting
-:_ :get 0 3 7_ 0 3 7 SOL950: a page on the radio, not a setting
+:_ :get 0 3 7_ 0 3 7 RAD950: a page on the radio, not a setting
 :_ :get 0 4 1_ 0 4 1 Event log: a page on the radio, not a setting
 :_ :get 0 4 2_ a menu number from MENU, e.g. 0 7 1 (Theme)
 :_ :get 0 4 2 1_ 0 4 2 1 Decode: Off
