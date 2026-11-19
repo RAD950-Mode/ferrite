@@ -151,11 +151,22 @@ impl AboutCard {
 /// Control frame subtypes (`msg_type = 0`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ChatCtrl {
-    Invite,
+    /// Invite peer to chat on `calling_dial + qsy_step * 4 kHz` (`0` = stay, `1` = +4 kHz default) and `subch` (`0..=7`).
+    Invite { qsy_step: u8, subch: u8 },
     Accept,
     Decline,
     End,
     Ack { ack_seq: u8, frag_mask: u8 },
+}
+
+/// Compute the chat USB dial in 10 Hz units (`calling_dial + qsy_step * 4 kHz`).
+pub const fn chat_qsy_dial_hz10(calling_dial_hz10: u32, qsy_step: u8) -> u32 {
+    calling_dial_hz10.saturating_add((qsy_step as u32 & 7) * 400)
+}
+
+/// Compute the audio subchannel center frequency (Hz) for `subch` (`0..=7`) on the 225 Hz grid.
+pub const fn chat_subch_hz(subch: u8) -> u16 {
+    625 + ((subch as u16) & 7) * 225
 }
 
 /// Action on a directed Rendezvous offer (`Schedule QSO` or `Move to frequency`).
@@ -390,7 +401,9 @@ pub fn encode_chat_frame(pkt: ChatPacket) -> Frame {
     let (mtype, body38): (u64, u64) = match pkt.body {
         ChatBody::Ctrl(c) => {
             let b = match c {
-                ChatCtrl::Invite => 0,
+                ChatCtrl::Invite { qsy_step, subch } => {
+                    (((qsy_step as u64) & 7) << 4) | (((subch as u64) & 7) << 7)
+                }
                 ChatCtrl::Accept => 1,
                 ChatCtrl::Decline => 2,
                 ChatCtrl::End => 3,
@@ -441,7 +454,10 @@ pub fn decode_chat_frame(frame: Frame) -> Option<ChatPacket> {
     let body = match mtype {
         0 => {
             let ctrl = match body38 & 0xF {
-                0 => ChatCtrl::Invite,
+                0 => ChatCtrl::Invite {
+                    qsy_step: ((body38 >> 4) & 7) as u8,
+                    subch: ((body38 >> 7) & 7) as u8,
+                },
                 1 => ChatCtrl::Accept,
                 2 => ChatCtrl::Decline,
                 3 => ChatCtrl::End,
@@ -653,7 +669,7 @@ mod tests {
 
         // 2. Question, Phrase, Weather, About round-trip (1 burst each)
         for body in [
-            ChatBody::Ctrl(ChatCtrl::Invite),
+            ChatBody::Ctrl(ChatCtrl::Invite { qsy_step: 1, subch: 5 }),
             ChatBody::Ctrl(ChatCtrl::Ack { ack_seq: 5, frag_mask: 0x3F }),
             ChatBody::Question { topic: 0, variant: 0 },
             ChatBody::Phrase(1),

@@ -740,7 +740,7 @@ impl SimCore {
                                         });
                                     };
                                     match pkt.body {
-                                        ChatBody::Ctrl(ChatCtrl::Invite) => {
+                                        ChatBody::Ctrl(ChatCtrl::Invite { .. }) => {
                                             feed(0, ChatBody::Ctrl(ChatCtrl::Accept));
                                             feed(1, ChatBody::Question { topic: 0, variant: 0 });
                                         }
@@ -1715,6 +1715,8 @@ mod tests {
             }
         }
         assert!(active_with_q, "peer should accept invite and ask antenna question");
+        // Verify auto-QSY off the 28.078 calling frequency to the paired +4 kHz chat dial (28.082 MHz)!
+        assert_eq!(s.app.sol950_host().unwrap().active_dial(), 2_808_200, "chat should auto-QSY to +4 kHz");
 
         // 5. Press OK (Reply -> My station auto-highlighted) -> OK (Preview) -> OK (Send)
         tap(&mut s, Key::Menu, &mut t);
@@ -1739,5 +1741,9 @@ mod tests {
             }
         }
         assert!(delivered, "StationCard should transmit and become Delivered in simulator");
+
+        // 7. Press 0 (End chat) and verify auto-return to the 28.078 MHz calling frequency!
+        tap(&mut s, Key::Digit(0), &mut t);
+        assert_eq!(s.app.sol950_host().unwrap().active_dial(), 2_807_800, "ending chat should return to calling dial");
     }
 }

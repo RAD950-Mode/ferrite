@@ -5,10 +5,10 @@
 //! Chat traffic never adds QSO or worked-grid credit.
 
 use ferrite_core::sol950::usol950::chat::{
-    ant_name, decode_chat_frame, encode_chat_frame, encode_literal_frags, estimate_airtime_s, literal_bursts,
-    move_band_ref_hz10, normalize_literal, rig_name, session_ref_for, wind_dir_name, wx_cond_name, AboutCard, ChatBody,
-    ChatCtrl, ChatPacket, LiteralReassembler, RendezvousAction, RendezvousCard, StationCard, WeatherCard,
-    CHAT_LITERAL_MAX, CHAT_MAX_FRAGS, PHRASES, QUESTIONS,
+    ant_name, chat_qsy_dial_hz10, chat_subch_hz, decode_chat_frame, encode_chat_frame, encode_literal_frags,
+    estimate_airtime_s, literal_bursts, move_band_ref_hz10, normalize_literal, rig_name, session_ref_for,
+    wind_dir_name, wx_cond_name, AboutCard, ChatBody, ChatCtrl, ChatPacket, LiteralReassembler, RendezvousAction,
+    RendezvousCard, StationCard, WeatherCard, CHAT_LITERAL_MAX, CHAT_MAX_FRAGS, PHRASES, QUESTIONS,
 };
 use ferrite_core::sol950::usol950::distress::{
     decode_distress_frame, distress_assoc_cksum, encode_distress_frame, grid4_matches_coords, DistressAlert,
@@ -519,9 +519,14 @@ pub struct ChatState {
     pub active_move: Option<ActiveMove>,
     /// Dial preset index staged in More menu for Schedule/Move offers (`0..SOL950_DIALS.len()`).
     pub offer_dial_idx: u8,
-    /// Current session UTC day (for resolving Schedule days_ahead across midnight) and source dial.
+    /// Current session UTC day (for resolving Schedule days_ahead across midnight) and calling/chat QSY dials.
     pub session_utc_day: u32,
     pub source_dial_hz10: u32,
+    pub calling_dial_hz10: u32,
+    pub chat_dial_hz10: u32,
+    pub qsy_step: u8,
+    pub chat_subch: u8,
+    pending_retune: bool,
     /// Standalone Distress alert & precise location state (takes TX priority over optional chat).
     pub distress: DistressState,
 }
@@ -571,6 +576,11 @@ impl ChatState {
             offer_dial_idx: 1, // default secondary 10m preset (28.082 MHz)
             session_utc_day: 0,
             source_dial_hz10: crate::sol950::SOL950_DIALS[0],
+            calling_dial_hz10: crate::sol950::SOL950_DIALS[0],
+            chat_dial_hz10: chat_qsy_dial_hz10(crate::sol950::SOL950_DIALS[0], 1),
+            qsy_step: 1,
+            chat_subch: 2,
+            pending_retune: false,
             distress: DistressState::new(),
         }
     }
@@ -583,26 +593,47 @@ impl ChatState {
         self.tx_need_mask != 0
     }
 
-    /// Start an outgoing invitation to `peer` after a completed QSO.
-    pub fn invite(&mut self, my_call: Callsign, peer: Callsign, slot: u32) {
+    /// Returns `true` once when the radio should retune (auto-QSY on Accept, or auto-return on End).
+    pub fn take_retune(&mut self) -> bool {
+        core::mem::take(&mut self.pending_retune)
+    }
+
+    /// Active chat QSY dial (10 Hz units) while in `ChatPhase::Active`, else `None` (stay on calling dial).
+    pub fn active_chat_dial(&self) -> Option<u32> {
+        (self.phase == ChatPhase::Active).then_some(self.chat_dial_hz10)
+    }
+
+    /// Audio subchannel center frequency (Hz) for this chat session.
+    pub fn subch_hz(&self) -> u16 {
+        chat_subch_hz(self.chat_subch)
+    }
+
+    /// Start an outgoing invitation to `peer` on the calling dial, proposing `+4 kHz` QSY (`qsy_step = 1`).
+    pub fn invite(&mut self, my_call: Callsign, peer: Callsign, slot: u32, calling_dial_hz10: u32) {
         self.reset_session();
         self.phase = ChatPhase::Inviting;
         self.peer = peer;
         self.session_ref = session_ref_for(my_call.raw(), peer.raw(), slot);
         self.my_parity = (slot.wrapping_add(1) & 1) as u8;
         self.expires_slot = slot.saturating_add(6);
-        self.pending_ctrl = Some(ChatCtrl::Invite);
+        self.calling_dial_hz10 = calling_dial_hz10;
+        self.source_dial_hz10 = calling_dial_hz10;
+        self.qsy_step = 1; // +4 kHz default off the calling frequency
+        self.chat_subch = (self.session_ref & 7) as u8;
+        self.chat_dial_hz10 = chat_qsy_dial_hz10(calling_dial_hz10, self.qsy_step);
+        self.pending_ctrl = Some(ChatCtrl::Invite { qsy_step: self.qsy_step, subch: self.chat_subch });
     }
 
-    /// Accept an incoming invitation from `peer`.
+    /// Accept an incoming invitation from `peer` and auto-QSY to the negotiated chat dial.
     pub fn accept_invite(&mut self) {
         if self.phase == ChatPhase::IncomingInvite {
             self.phase = ChatPhase::Active;
             self.pending_ctrl = Some(ChatCtrl::Accept);
+            self.pending_retune = true;
         }
     }
 
-    /// Decline an incoming invitation and return to listening.
+    /// Decline an incoming invitation and remain on the calling dial.
     pub fn decline_invite(&mut self) {
         if self.phase == ChatPhase::IncomingInvite {
             self.pending_ctrl = Some(ChatCtrl::Decline);
@@ -610,12 +641,16 @@ impl ChatState {
         }
     }
 
-    /// End the active conversation cleanly.
+    /// End the active conversation cleanly and auto-return to the calling dial.
     pub fn end_chat(&mut self) {
         if self.phase != ChatPhase::Idle {
+            let was_active = self.phase == ChatPhase::Active;
             self.cancel_send();
             self.pending_ctrl = Some(ChatCtrl::End);
             self.phase = ChatPhase::Idle;
+            if was_active {
+                self.pending_retune = true;
+            }
         }
     }
 
@@ -950,23 +985,33 @@ impl ChatState {
             return false;
         };
         match pkt.body {
-            ChatBody::Ctrl(ChatCtrl::Invite) => {
+            ChatBody::Ctrl(ChatCtrl::Invite { qsy_step, subch }) => {
                 if self.phase == ChatPhase::Idle {
+                    let call_dial = self.calling_dial_hz10;
                     self.reset_session();
                     self.phase = ChatPhase::IncomingInvite;
                     self.session_ref = pkt.session_ref;
                     self.my_parity = (slot.wrapping_add(1) & 1) as u8;
                     self.expires_slot = slot.saturating_add(6);
+                    self.calling_dial_hz10 = call_dial;
+                    self.qsy_step = qsy_step;
+                    self.chat_subch = subch & 7;
+                    self.chat_dial_hz10 = chat_qsy_dial_hz10(call_dial, qsy_step);
                 }
             }
             ChatBody::Ctrl(ChatCtrl::Accept) if pkt.session_ref == self.session_ref => {
                 if self.phase == ChatPhase::Inviting {
                     self.phase = ChatPhase::Active;
+                    self.pending_retune = true; // Auto-QSY to negotiated chat dial!
                 }
             }
             ChatBody::Ctrl(ChatCtrl::Decline | ChatCtrl::End) if pkt.session_ref == self.session_ref => {
+                let was_active = self.phase == ChatPhase::Active;
                 self.cancel_send();
                 self.phase = ChatPhase::Idle;
+                if was_active {
+                    self.pending_retune = true; // Auto-return to calling dial!
+                }
             }
             ChatBody::Ctrl(ChatCtrl::Ack { ack_seq, frag_mask }) if pkt.session_ref == self.session_ref => {
                 if self.tx_need_mask != 0 && ack_seq == self.tx_seq {
@@ -1138,15 +1183,19 @@ mod tests {
         let ca = Callsign::encode(b"NQ6N").unwrap();
         let cb = Callsign::encode(b"K1ABC").unwrap();
 
-        // A invites B at slot 10; B receives and accepts.
-        a.invite(ca, cb, 10);
+        // A invites B at slot 10 on calling dial 28.078 MHz; B receives and accepts -> both QSY to 28.082 MHz!
+        a.invite(ca, cb, 10, 2_807_800);
         let inv = a.on_slot_start(11, true).expect("invite frame");
         assert!(b.on_rx_frame(inv, 11));
         assert_eq!(b.phase, ChatPhase::IncomingInvite);
         b.accept_invite();
+        assert!(b.take_retune());
+        assert_eq!(b.active_chat_dial(), Some(2_808_200));
         let acc = b.on_slot_start(12, true).expect("accept frame");
         assert!(a.on_rx_frame(acc, 12));
         assert_eq!(a.phase, ChatPhase::Active);
+        assert!(a.take_retune());
+        assert_eq!(a.active_chat_dial(), Some(2_808_200));
         assert_eq!(b.phase, ChatPhase::Active);
 
         // A queues 6-burst literal message; drop fragment 2 on the air!
@@ -1200,7 +1249,7 @@ mod tests {
         let mut b = ChatState::new();
         let ca = Callsign::encode(b"NQ6N").unwrap();
         let cb = Callsign::encode(b"K1ABC").unwrap();
-        a.invite(ca, cb, 10);
+        a.invite(ca, cb, 10, 2_807_800);
         b.on_rx_frame(a.on_slot_start(11, true).unwrap(), 11);
         b.accept_invite();
         a.on_rx_frame(b.on_slot_start(12, true).unwrap(), 12);

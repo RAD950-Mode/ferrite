@@ -37,6 +37,7 @@ pub const PAGE_CHAT_PICK: u8 = 10;
 pub const PAGE_CHAT_PREVIEW: u8 = 11;
 pub const PAGE_CHAT_MORE: u8 = 12;
 pub const PAGE_DISTRESS: u8 = 13;
+pub const PAGE_OPERATE_MENU: u8 = 14;
 
 const OPERATE_ROWS: usize = 4;
 const LOG_ROWS: usize = 6;
@@ -96,6 +97,7 @@ pub fn page_id(s: &Sol950Scr) -> &'static str {
         PAGE_CHAT_PREVIEW => "rad950.chat_preview",
         PAGE_CHAT_MORE => "rad950.chat_more",
         PAGE_DISTRESS => "rad950.distress",
+        PAGE_OPERATE_MENU => "rad950.menu",
         _ => "sol950.operate",
     }
 }
@@ -164,6 +166,7 @@ impl View for Sol950Scr {
             PAGE_CHAT_PREVIEW => "RAD950 Send",
             PAGE_CHAT_MORE => "RAD950 More",
             PAGE_DISTRESS => "RAD950 Distress",
+            PAGE_OPERATE_MENU => "RAD950 Menu",
             _ => "RAD950",
         }
     }
@@ -181,6 +184,7 @@ impl View for Sol950Scr {
             PAGE_CHAT_PREVIEW => b"SEND",
             PAGE_CHAT_MORE => b"MORE",
             PAGE_DISTRESS => b"DISTRESS",
+            PAGE_OPERATE_MENU => b"RAD MENU",
             _ => b"RAD950",
         };
         b.set(t);
@@ -209,6 +213,7 @@ impl View for Sol950Scr {
             PAGE_CHAT_PREVIEW => self.key_chat_preview(app, e.key),
             PAGE_CHAT_MORE => self.key_chat_more(app, e.key),
             PAGE_DISTRESS => self.key_distress(app, e.key),
+            PAGE_OPERATE_MENU => self.key_operate_menu(app, e.key),
             _ => app.screen = Screen::Sol950(Sol950Scr::OPERATE),
         }
     }
@@ -257,6 +262,10 @@ impl View for Sol950Scr {
 
     fn tick(self, app: &mut App, _live: &LiveAll) {
         use ferrite_core::sol950::usol950::frame::encode_grid4;
+        // Apply pending Chat auto-QSY (on Accept) or auto-return to calling dial (on End).
+        if app.sol950_host_mut().is_some_and(|h| h.chat.take_retune()) {
+            app.sol950_retune();
+        }
         if self.page != PAGE_DISTRESS || self.field != 1 || self.top < 3 {
             return;
         }
@@ -309,13 +318,14 @@ impl View for Sol950Scr {
             PAGE_CHAT_PREVIEW => self.draw_chat_preview(app, lcd),
             PAGE_CHAT_MORE => self.draw_chat_more(app, lcd),
             PAGE_DISTRESS => self.draw_distress(app, lcd),
+            PAGE_OPERATE_MENU => self.draw_operate_menu(app, lcd),
             _ => self.draw_operate(app, lcd, cx.live),
         }
     }
 
     fn hints(self, app: &App) -> Hints {
         match self.page {
-            PAGE_OPERATE => Hints::new(&[("OK", "Answer"), ("1", "CQ"), ("2-4", "Log/Map")]),
+            PAGE_OPERATE => Hints::new(&[("OK", "Answer"), ("1", "CQ"), ("#", "Menu")]),
             PAGE_ACTIVE => {
                 if app.sol950_host().is_some_and(|h| h.saved_ack && h.last_qso.is_some()) {
                     Hints::new(&[("2", "Chat"), ("0", "Stop"), ("BACK", "List")])
@@ -340,7 +350,9 @@ impl View for Sol950Scr {
                     Hints::new(&[("OK", "Reply"), ("0", "End"), ("BACK", "Back")])
                 }
             }
-            PAGE_CHAT_REPLY | PAGE_CHAT_PICK | PAGE_CHAT_MORE => Hints::new(&[("OK", "Select"), ("BACK", "Back")]),
+            PAGE_CHAT_REPLY | PAGE_CHAT_PICK | PAGE_CHAT_MORE | PAGE_OPERATE_MENU => {
+                Hints::new(&[("OK", "Select"), ("BACK", "Back")])
+            }
             PAGE_CHAT_PREVIEW => Hints::new(&[("OK", "Send"), ("BACK", "Back")]),
             PAGE_DISTRESS => Hints::new(&[(ARROWS_LR, "Change"), ("OK", "Send"), ("BACK", "Cancel")]),
             _ => Hints::new(&[("BACK", "Back")]),
@@ -437,7 +449,7 @@ impl Sol950Scr {
                 return;
             }
             Key::Hash => {
-                app.screen = Screen::Sol950(Sol950Scr::ACTIVE);
+                app.screen = Screen::Sol950(Sol950Scr { page: PAGE_OPERATE_MENU, sel: 0, top: 0, field: 0, sub: 0 });
                 return;
             }
             _ => {}
@@ -453,7 +465,8 @@ impl Sol950Scr {
                 let invited = if let Some(h) = app.sol950_host_mut() {
                     if let (true, Some(rec), Some(me)) = (h.saved_ack, h.last_qso, h.profile.callsign()) {
                         let slot = if h.last_slot == u32::MAX { 0 } else { h.last_slot };
-                        h.chat.invite(me, rec.peer, slot);
+                        let calling_dial = h.profile.dial();
+                        h.chat.invite(me, rec.peer, slot, calling_dial);
                         true
                     } else {
                         false
@@ -1732,6 +1745,7 @@ impl Sol950Scr {
         let pending_offer = h.chat.pending_offer;
         let active_move = h.chat.active_move;
         let saved_rem = h.chat.saved_reminder;
+        let chat_dial = h.active_dial();
         let cur_slot = if h.last_slot == u32::MAX { 0 } else { h.last_slot };
 
         let mut th = Mix::new()
@@ -1741,6 +1755,7 @@ impl Sol950Scr {
             .n(tx_active as u32)
             .n(count as u32)
             .n(self.top as u32)
+            .n(chat_dial)
             .n(pending_offer.is_some() as u32)
             .n(active_move.map_or(0, |m| m.target_slot ^ ((m.retuned as u32) << 20) ^ ((m.expired as u32) << 21)))
             .n(saved_rem.map_or(0, |r| (r.utc_min as u32) ^ ((r.dial_preset as u32) << 12)));
@@ -1762,8 +1777,13 @@ impl Sol950Scr {
                 let mut cb = [0u8; 6];
                 let cn = peer.decode(&mut cb);
                 let ps = core::str::from_utf8(&cb[..cn]).unwrap_or("?");
-                let mut hdr = Buf::<20>::new();
-                let _ = uwrite!(hdr, "CHAT {}", ps);
+                let mut hdr = Buf::<24>::new();
+                if phase == ChatPhase::Active {
+                    let _ = uwrite!(hdr, "{} ", ps);
+                    push_khz3(&mut hdr, chat_dial);
+                } else {
+                    let _ = uwrite!(hdr, "CHAT {}", ps);
+                }
                 lcd.text4(8, y0 + 16, hdr.as_bytes(), &UI_14, TEXT, BG);
 
                 // Make the wait visible on the right of the header; red TX flag when transmitting.
@@ -2159,6 +2179,65 @@ impl Sol950Scr {
                     lcd.text4(8, y0 + 170, "OK to confirm · BACK to cancel".as_bytes(), &UI_12, AMBER, BG);
                 }
             });
+        }
+    }
+
+    fn key_operate_menu(mut self, app: &mut App, k: Key) {
+        const ITEMS: u8 = 5;
+        match k {
+            Key::Exit => {
+                app.screen = Screen::Sol950(Sol950Scr::OPERATE);
+                return;
+            }
+            Key::Up => self.sel = if self.sel == 0 { ITEMS - 1 } else { self.sel - 1 },
+            Key::Down => self.sel = (self.sel + 1) % ITEMS,
+            Key::Menu => {
+                match self.sel {
+                    0 => app.screen = Screen::Sol950(Sol950Scr::ACTIVE),
+                    1 => app.screen = Screen::Sol950(Sol950Scr::SETUP),
+                    2 => {
+                        if let Some(h) = app.sol950_host_mut() {
+                            h.log_grid_filter = None;
+                        }
+                        app.screen = Screen::Sol950(Sol950Scr::LOG);
+                    }
+                    3 => app.screen = Screen::Sol950(Sol950Scr::GRIDS),
+                    _ => {
+                        app.screen = Screen::Sol950(Sol950Scr { page: PAGE_DISTRESS, sel: 0, top: 0, field: 0, sub: 0 });
+                    }
+                }
+                return;
+            }
+            _ => {}
+        }
+        app.screen = Screen::Sol950(self);
+    }
+
+    fn draw_operate_menu(self, app: &mut App, lcd: &mut impl Panel) {
+        const LABELS: [(&[u8], &[u8]); 5] = [
+            (b"Active QSO", b""),
+            (b"Setup", b"*"),
+            (b"Contact log", b"2"),
+            (b"Worked grids", b"4"),
+            (b"Send distress...", b"3x PTT"),
+        ];
+        let y0 = TOP_Y + 6;
+        let row_h = 34;
+        for (i, &(label, tag)) in LABELS.iter().enumerate() {
+            let selected = i == self.sel as usize;
+            let rh = Mix::new().n(selected as u32).b(label).b(tag).get();
+            if app.dirty(R_ROW + i, rh) {
+                let y = y0 + i as i32 * row_h;
+                let bg = if selected { BLUE } else { BG };
+                let fg = if selected { BLUE_FG } else if i == 4 { AMBER } else { TEXT };
+                let dim = if selected { BLUE_FG } else { DIM };
+                redraw_box!(true, lcd, (0, y, W, row_h, bg), {
+                    lcd.text4(8, y + 22, label, &UI_14, fg, bg);
+                    if !tag.is_empty() {
+                        lcd.text4(W - 60, y + 22, tag, &UI_12, dim, bg);
+                    }
+                });
+            }
         }
     }
 }

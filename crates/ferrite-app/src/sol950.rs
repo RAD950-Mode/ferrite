@@ -739,12 +739,18 @@ impl Sol950Host {
         self.engine.set_config(cfg);
     }
 
+    /// Active USB dial (10 Hz units): the negotiated chat QSY dial while a chat is Active, otherwise the calling dial.
+    pub fn active_dial(&self) -> Freq10 {
+        self.chat.active_chat_dial().unwrap_or_else(|| self.profile.dial())
+    }
+
     /// Update GPS UTC time and onboard grid; trigger `DspCmd::Sol950Finish` at `+9.3 s` and `Engine::begin_slot`
     /// at each 10 s UTC boundary.
     pub fn update_clock(&mut self, utc_sec: u32, ms_in_sec: u16, uncert_ms: u16, gps_grid: Option<[u8; 4]>) {
         self.utc_sec = utc_sec;
         self.utc_ms_in_sec = ms_in_sec;
         self.utc_uncert_ms = uncert_ms;
+        self.chat.calling_dial_hz10 = self.profile.dial();
         if gps_grid != self.gps_grid {
             self.gps_grid = gps_grid;
             self.sync_engine_config();
@@ -788,14 +794,16 @@ impl Sol950Host {
             }
             self.last_slot = slot;
             self.rx_slot_start = utc_sec - sec_in_slot;
-            self.rx_slot_dial_hz = self.profile.dial().saturating_mul(10);
+            self.rx_slot_dial_hz = self.active_dial().saturating_mul(10);
             self.rx_slot_coop_capture = self.profile.coop_rx == CoopRxMode::Capture;
             let utc_ok = self.utc_ready() && self.profile.callsign().is_some();
             if self.chat.is_open() {
                 if let Some(frame) = self.chat.on_slot_start(slot, utc_ok) {
                     if utc_ok && !self.tx_in_flight {
-                        let subchannel_hz = 1300u16;
-                        let rf_freq = self.profile.dial().saturating_add(subchannel_hz as u32 / 10);
+                        let is_distress = ferrite_core::sol950::usol950::distress::decode_distress_frame(frame).is_some();
+                        let tx_dial = if is_distress { self.profile.dial() } else { self.active_dial() };
+                        let subchannel_hz = if is_distress { 1300u16 } else { self.chat.subch_hz() };
+                        let rf_freq = tx_dial.saturating_add(subchannel_hz as u32 / 10);
                         self.tx_subch_hz = subchannel_hz;
                         self.tx_tones = ferrite_core::sol950::usol950::encode_tones(frame);
                         self.pending_tx = Some((rf_freq, self.profile.tx_power, frame));
@@ -966,13 +974,13 @@ impl App {
         self.out.push(RadioCmd::Sol950Rx { dial: 0, rx_corr_hz: 0, on: false });
     }
 
-    /// Retune the SI4732 USB receiver if the user changed the dial or RX offset in Setup.
+    /// Retune the SI4732 USB receiver (for Setup dial change, Chat QSY on Accept, or return on End).
     pub(crate) fn sol950_retune(&mut self) {
         if self.radio.mode == crate::screens::activity::Mode::Sol950 {
             let (dial, rx_corr_hz) = self
                 .sol950d
                 .as_ref()
-                .map_or((SOL950_DIALS[0], 0), |h| (h.profile.dial(), h.profile.rx_corr_hz));
+                .map_or((SOL950_DIALS[0], 0), |h| (h.active_dial(), h.profile.rx_corr_hz));
             self.out.push(RadioCmd::Sol950Rx { dial, rx_corr_hz, on: true });
         }
     }
