@@ -10,10 +10,10 @@
 
 SOL950 is a standalone, slot-synchronized 10m weak-signal digital mode engineered specifically around the hardware constraints and existing driver infrastructure of the **Radtel RT-950 Pro**:
 
-- **Transmit — BK4829 #1 Reproducible Continuous-Phase 4-FSK:**
-  - On the BK4829, writing `FREQ_LO`/`FREQ_HI` (`drivers/bk4829/src/lib.rs`) **only takes effect upon re-entering TX/RX (`tx_on`/`rx_on`)**, which recalibrates the VCO with a 50 µs gap (`firmware/src/tasks/radio/synthbench.rs`). Stepping frequency registers mid-burst is therefore not viable.
-  - Instead, SOL950 uses Ferrite's **bypassed-TX-filter continuous-phase modulation** (`crates/ferrite-core/src/synthfsk.rs`): pre-shift the carrier down before `tx_on(Source::Tones)`, bypass the BK4829 TX AF/DC/HPF/pre-emphasis filters (`REG_47`, `REG_7E`, `REG_29`, `REG_2B`), scale total deviation with `REG_40`, and drive a deterministic per-symbol transition trajectory (`10 ms` raised-cosine/smoothstep ramp + `70 ms` steady hold; §2.3) via non-blocking timer-paced `REG_70` frozen-tone gain steps *(or DMA-paced `DAC1` on `PA4` via `PC12` if bench testing confirms the PCB mic-injection path is DC-coupled)*.
-  - Note: Unlike the existing `synthfsk` bench routine (`firmware/src/tasks/radio/synthbench.rs`), which is a blocking `Dry TX`-only M17 PRBS loop, SOL950's production modulator runs non-blockingly from a hardware timer/DMA schedule with a frozen reference trajectory.
+- **Transmit — BK4829 #1 Direct-PLL 4-FSK (Hardware Baseline) & Smooth Host Reference:**
+  - Bench testing (Experiment 2) eliminated both **frozen Tone 1 (`REG_71 = 0`)** (zero RF modulation on BK4829) and **MCU `DAC1` (`PA4 -> PC12 -> BK4829 mic`)** (`~22 Hz` / `~7.2 ms` PCB AC-coupling high-pass capacitor, preventing `80 ms` DC holds).
+  - Instead, hardware TX steps BK4829's `10 Hz`-resolution PLL (`REG_38`/`REG_39` = `0, +50, +100, +150 Hz`) and latches each tone change via `REG_30` VCO toggle (`sol950_bk_freq`, paced non-blockingly at `80 ms` symbol boundaries by `TMR5` / `EDGE`, saving and restoring BK4829 registers at unkey; `crates/ferrite-radio/src/chip.rs`, `firmware/src/tasks/radio/afskbk.rs`). Conducted 10 m TX measured `[49.984, 50.010] Hz` tone spacings, `80.0104 ms` symbols, `+0.12 Hz` drift over `8.72 s`, brief `< 0.5 ms` VCO relock transients, and clean decode (`CQ NQ6N FN31`, `+8 dB` SNR).
+  - The phase-continuous `10 ms` raised-cosine ramp + `70 ms` steady-hold trajectory (§2.3, `digimodes/usol950/src/phy.rs`) is retained as the **host software reference waveform** (`0.1–0.2 dB` of hardware PLL stepping in AWGN replay).
 - **Receive — SI4732 Linear USB at 28 MHz (`PA2` / `ADC1`):**
   - Uses the **SI4732** in **USB mode** (valid up to 30 MHz with the owner-imported SSB patch, `crates/ferrite-core/src/ssb.rs`).
   - Bench testing already confirmed that SI4732 receive audio is summed onto **`PA2` (`ADC1` ch 2)** alongside the BK4829s (`firmware/src/tasks/radio/debug.rs`, Oct 25, 2026). While Ferrite's interactive HF screen currently switches from SI4732 to BK4829 at 18 MHz (`firmware/src/tasks/radio/hf.rs`), SOL950 introduces an explicit 28 MHz SI4732 USB receive mode with both BK4829s muted/asleep during RX so multiple weak signals across a 3.0 kHz passband are captured linearly without FM threshold or capture effects.
@@ -37,7 +37,7 @@ SOL950 is a standalone, slot-synchronized 10m weak-signal digital mode engineere
 
 ### 2.1 Antenna-Referenced Window & Non-Overlapping Subchannel Grid
 - **Window Definition:** A SOL950 window is defined by its **USB suppressed-carrier dial frequency** $f_{\text{dial}}$ (e.g., `28.180`, `28.185`, `28.190` MHz).
-- **Usable Audio Passband & BFO Sign:** **`600 Hz` to `2,400 Hz`** above $f_{\text{dial}}$ (keeping clear of low-frequency audio roll-off near zero beat and upper-edge droop on the SI4732's 3.0 kHz SSB filter). Note that `crates/ferrite-core/src/ssb.rs:79` explicitly flags the SI4732 `SSB_BFO` sign as **unverified on air**; Gatekeeper Experiment 1 (§7) verifies BFO sign and passband edges with a two-tone RF injection test.
+- **Usable Audio Passband & BFO Sign:** **`600 Hz` to `2,400 Hz`** above $f_{\text{dial}}$ (keeping clear of low-frequency audio roll-off near zero beat and upper-edge droop on the SI4732's 3.0 kHz SSB filter). Gatekeeper Experiment 1 settled the USB `SSB_BFO` sign (`+100 Hz` BFO lowers zero-beat RF by `100 Hz` and raises USB audio by `+100 Hz`), and `crates/ferrite-core/src/ssb.rs` now negates the sub-kHz remainder accordingly (`LSB` retains the same carrier-offset sign pending LSB bench confirmation; per-radio crystal calibration is separate).
 - **Non-Overlapping Subchannel Grid (Anti-Collision):**
   - At $\Delta f = 50\text{ Hz}$ tone spacing, one 4-FSK signal occupies `4 × 50 = 200 Hz` (tone centers at $+0, +50, +100, +150\text{ Hz}$ above its lowest tone $f_{\text{off}}$). A 50 Hz subchannel grid would cause adjacent callers to share three of their four tone centers.
   - Nominal subchannels are therefore spaced by **`200 Hz` (or `250 Hz` with a 1-tone guard)** across `600–2,400 Hz`—e.g., **8 orthogonal subchannels** at $f_{\text{off}} \in \{600, 825, 1050, 1275, 1500, 1725, 1950, 2175\}\text{ Hz}$.
@@ -52,22 +52,21 @@ SOL950 is a standalone, slot-synchronized 10m weak-signal digital mode engineere
 | **Nominal First-Symbol Time** | **+0.40 s after UTC slot edge** | Even a peer `300 ms` early starts at `+0.10 s` (never clipped at `0.00 s`) |
 | **Active Burst / Guard** | **8.80 s TX / 1.20 s total guard** | `0.40 s` pre-guard + `8.80 s` burst (110 syms) + `0.80 s` post-guard = `10.00 s` |
 | **Max TX Duty Cycle** | **≤ 3 TX slots / rolling 60 s** | ≤ 6 relay switches/min (`SAFE-22` limit is 10/min) |
-| **Modulation** | **4-FSK** (2 bits/sym, Gray `00,01,11,10`) | `10 ms` raised-cosine ramp + `70 ms` steady tone per 80 ms symbol (§2.3) |
+| **Modulation** | **4-FSK** (2 bits/sym, Gray `00,01,11,10`) | Hardware baseline: BK4829 PLL stepping (`80 ms` hold, `< 0.5 ms` relock); host ref: `10 ms` RC + `70 ms` hold (§2.3) |
 | **Symbol Rate** | **12.5 baud** ($T_s = 80\text{ ms}$) | Exact 10 × 8 ms DSP audio blocks per symbol (`480` samples @ 6 kHz) |
 | **Tone Spacing ($\Delta f$)** | **50 Hz** *(sweep 30 / 40 / 50 Hz)* | At $T_s = 80\text{ ms}$, 50 Hz is $4 / T_s$; sweep 30/40/50 Hz on bench/sim |
 | **Frame Symbols** | **110 symbols** (`18 sync + 92 data`) | **`6 + 6 + 6`** 4-ary sync clusters at `0..6`, `18..24`, and `104..110` (§2.4) |
 | **FEC & Integrity** | **(184, 78) LDPC + CRC-14** | 64 payload bits + 14-bit CRC = 78 systematic bits + 106 parity bits (rate `0.424`) |
 
-### 2.3 Reproducible Transmit Waveform Trajectory
-To ensure host simulations, SDR measurements, and radio transmissions produce the exact same detector input:
+### 2.3 Host Software Reference Waveform Trajectory
+For host simulations, synthetic test vectors, and reference WAV generation (`digimodes/usol950/src/phy.rs`):
 - Each symbol $n \in [0, 109]$ lasts $T_s = 80\text{ ms}$ with target tone index $t_n \in \{0, 1, 2, 3\}$ and instantaneous frequency offset $f(t)$ above $f_{\text{dial}} + f_{\text{off}}$:
   - **Transition interval ($\tau \in [0, T_{\text{ramp}})$, $T_{\text{ramp}} = 10\text{ ms} = T_s / 8$):**
     $$f(n T_s + \tau) = \Delta f \cdot \left( t_{n-1} + (t_n - t_{n-1}) \cdot \frac{1 - \cos(\pi \tau / T_{\text{ramp}})}{2} \right)$$
-    (with $t_{-1} = t_0$ on symbol 0 so the burst starts cleanly on $t_0$ after PA ramp-up; quantized to 8 sub-steps of `1.25 ms` when driving `REG_70`).
+    (with $t_{-1} = t_0$ on symbol 0 so the burst starts cleanly on $t_0$ after PA ramp-up).
   - **Steady interval ($\tau \in [T_{\text{ramp}}, T_s)$, $70\text{ ms} = 7 T_s / 8$):**
     $$f(n T_s + \tau) = \Delta f \cdot t_n$$
-- Concentrating the smooth transition into the first `12.5%` (`10 ms`) suppresses key-click/step splatter on maximum `0 ↔ 3` (`150 Hz`) jumps while keeping the tone rock-steady on its FFT bin center for `87.5%` (`70 ms`) of every symbol.
-- Phase $\phi(t) = 2\pi \int_0^t f(u)\,du$ is continuous across all 110 symbols. Reference 48 kHz PCM and complex IQ burst vectors are generated directly from this equation alongside the bit-to-tone test vectors.
+- Phase $\phi(t) = 2\pi \int_0^t f(u)\,du$ is continuous across all 110 symbols. On RT-950 Pro hardware, direct BK4829 `REG_38/39` PLL stepping replaces the `10 ms` ramp with a single `< 0.5 ms` VCO relock transition per tone change (§1), performing within `~0.1 dB` of this smooth reference in AWGN replay (§7).
 
 ### 2.4 Exact `6 + 6 + 6` Four-Tone Sync Sequences
 Literal order-7 Costas arrays require 7 distinct tones. For 4-FSK (`tones 0..3`), exhaustive search over all $4^6 = 4,096$ sequences selects three balanced, non-repeating 6-symbol words (each containing all 4 tones, zero adjacent repeated tones $w_i \neq w_{i+1}$ for sharp fractional-symbol timing peaks, and optimal 2D auto-ambiguity $\le 1$ across all $(\Delta t, \Delta f) \neq (0, 0)$):
@@ -185,13 +184,11 @@ Two stations each within `±150 ms` of UTC can disagree by **`±300 ms` (`±3.75
 
 ## 7. Gatekeeper Experiments
 
-1. **28 MHz SI4732 Receive Route, BFO Sign & Sensitivity (Bench First):**
-   - Capture `< 18 MHz` SI4732 USB as control, then force SI4732 USB at `28.185 MHz` in a bench build (`hf si` override) and capture raw PCM via `python3 tools/ferrite_link.py PORT audio 15 sol950-rx.wav --raw 16000`.
-   - Inject two known RF tones to settle the `ssb.rs:79` BFO sign, verify `600–2,400 Hz` passband response, verify BK4829 isolation, measure SMA-to-ADC SNR sensitivity, and check SI4732 AVC recovery after a loud neighbor drops.
-2. **Overlapping-Caller Blind Acquisition (Host Software First):**
-   - Synthesize two simultaneous callers using the §2.3 reference waveform with independent timing offsets across `[-300 ms, +300 ms]`, drift, AWGN, and a **+15 dB stronger neighbor** both on an adjacent `225 Hz` subchannel and **displaced by 1 tone spacing (`±50 Hz`)**.
-   - Measure blind sync acquisition vs. known-timing/frequency decode and verify `Decoder` static footprint `≤ 13,312 B`.
-3. **28 MHz TX Trajectory & NMEA UTC Jitter on Hardware:**
-   - Measure `REG_70` (and `DAC1`/`PC12` DC-coupling check) 10 ms ramp + 70 ms hold spectrum, 99% bandwidth, and 9 s thermal drift on an SDR; measure `USART3` `$` burst-start jitter vs. a GPS PPS reference, including after `$PCAS12` standby wake.
-4. **Target Replay & Multi-Window Erasure Matrix:**
+1. **28 MHz SI4732 Receive Route & USB BFO Sign — PASSED (`docs/sol950-lab-setup.md`):**
+   - Verified SI4732 USB RX at 28.185 MHz with complete `CQ NQ6N FN31` host decodes (`+6 dB` and `+2 dB` SNR, zero lost frames/samples/clips) and settled the USB `SSB_BFO` sign (`ssb::tune()` updated accordingly). Sensitivity near `-16..-18 dB` on hardware RX and SI4732 AVC recovery remain open.
+2. **Overlapping-Caller Blind Acquisition & Captured-TX Subchannel Sweep — PASSED:**
+   - Host `usol950` passes overlapping-caller blind acquisition (`+18 dB` neighbor at `225 Hz` and `+15 dB` at `200 Hz`), `Receiver` fits in `<= 13,312 B`, and 100-trial AWGN replay of the captured Radtel BK4829 TX burst (`radtel-tx.wav`) matches the smooth reference (`~-15.3 dB` 50% threshold; `68/100` at `-15 dB`, `97/100` at `-14 dB`, `100/100` at `-13 dB`) with only `~0.3 dB` degradation from a `+15 dB` captured Radtel neighbor `+225 Hz` away (`91/100` at `-14 dB`, `54/100` at `-15 dB`), justifying the `225 Hz` subchannel grid. (Closing the remaining `1–2 dB` gap to `-16..-18 dB` sensitivity remains open.)
+3. **28 MHz BK4829 PLL TX Trajectory (`docs/sol950-lab-setup.md`) & NMEA UTC Jitter:**
+   - Conducted 28.18605 MHz TX decoded `CQ NQ6N FN31 (+8 dB)` with `[49.984, 50.010] Hz` tone spacings, `80.0104 ms` symbols, `+0.12 Hz` drift over `8.72 s`, and `291 Hz` (`±500 Hz`) / `427 Hz` (`±2 kHz` noise-subtracted) 99% OBW (`REG_38/39` + `REG_30` VCO toggle). `USART3` `$` burst-start jitter vs. GPS PPS (including `$PCAS12` standby wake) remains open.
+4. **Target Replay & Multi-Window Erasure Matrix (Pending):**
    - Replay crowded WAVs on AT32F403A to verify zero missed 8 ms blocks and guard-window completion, and run the full §4.3 single-erasure + sustained-loss multi-window scan matrix.

@@ -77,10 +77,12 @@ pub const CW_PITCH_HZ: u32 = 700;
 /// HF-19: how the SI4732 tunes a frequency (10 Hz units) in SSB: the whole kHz for its tune command, the
 /// sideband (true = USB; CW is USB), and the rest as the BFO offset in Hz, so a step under 1 kHz only moves the
 /// BFO. CW tunes [`CW_PITCH_HZ`] below. Bench measurement on USB (`SI4732` `SSB_BFO`) showed positive BFO
-/// lowers zero-beat RF (`f_tune - BFO`, raising USB audio frequency), opposite to the sign assumed here.
+/// lowers zero-beat RF (`f_tune - BFO`, raising USB audio frequency), so tuning upward by `+rem` Hz requires
+/// `-rem` in `SSB_BFO` (LSB uses the same offset convention pending LSB bench verification; per-radio crystal
+/// calibration is kept separate).
 pub fn tune(freq: crate::freq::Freq10, mode_usb: bool, cw: bool) -> (u16, bool, i16) {
     let f = if cw { freq.saturating_sub(CW_PITCH_HZ / 10) } else { freq };
-    ((f / 100) as u16, mode_usb || cw, (f % 100 * 10) as i16)
+    ((f / 100) as u16, mode_usb || cw, -((f % 100 * 10) as i16))
 }
 
 /// HF-19: SSB_MODE's audio bandwidth code for the HF screen's SSB filter (its order: 3, 2.2, 1.2, 0.5 kHz; the
@@ -93,12 +95,13 @@ pub fn audio_bw(filter: u8) -> u8 {
 mod tests {
     use super::*;
 
-    /// HF-19.1: the kHz, the sideband and the BFO rest; CW 700 Hz below on USB.
+    /// HF-19.1: the kHz, the sideband and the negated BFO rest; CW 700 Hz below on USB.
     #[test]
     fn tune_splits_khz_and_bfo() {
         assert_eq!(tune(707_400, true, false), (7074, true, 0));
-        assert_eq!(tune(707_453, false, false), (7074, false, 530));
-        assert_eq!(tune(1_405_000, false, true), (14049, true, 300), "CW: 14.050 heard 700 Hz low, on USB");
+        assert_eq!(tune(707_453, true, false), (7074, true, -530));
+        assert_eq!(tune(707_453, false, false), (7074, false, -530));
+        assert_eq!(tune(1_405_000, false, true), (14049, true, -300), "CW: 14.050 heard 700 Hz low, on USB");
         assert_eq!(tune(14, true, true), (0, true, 0), "never below 0");
     }
 
