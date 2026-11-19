@@ -308,8 +308,10 @@ pub enum DspCmd {
     /// open and for [`SQ_TAIL_MS`] after, so the core rests at 24 MHz between packets.
     Squelch(bool),
     /// SOL950 end-of-slot boundary: pause capture during the inter-slot guard, run `finish_slot`, deliver decoded
-    /// frames on `SOL950_RX`, reset the receiver, and resume capture for the next 10 s slot.
-    Sol950Finish,
+    /// frames on `SOL950_RX`, reset the receiver, and resume capture for the next 10 s slot. `utc_slot` and
+    /// `dial_hz` were captured at the slot start. `coop_capture` keeps reports from slots before Capture was armed
+    /// out of the browser Cooperative RX transport.
+    Sol950Finish { utc_slot: u32, dial_hz: u32, coop_capture: bool },
 }
 
 /// PWR-26.9: how long the AFSK capture runs on after the APRS slot's squelch closes (the frame's last flags).

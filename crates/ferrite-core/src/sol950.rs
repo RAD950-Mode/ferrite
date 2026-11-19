@@ -4,7 +4,7 @@
 use crate::decoders::BUDGET;
 use crate::freq::Freq10;
 pub use usol950;
-use usol950::{Callsign, Decoded, Frame, Receiver, GRID_UNKNOWN, SUBCHANNELS_HZ};
+use usol950::{Callsign, Decoded, Frame, Receiver, SoftCandidate, MAX_DECODED, GRID_UNKNOWN, SUBCHANNELS_HZ};
 
 // Compile-time check that the SOL950 streaming receiver fits inside Ferrite's shared 13 KB `Decoder` slot.
 const _: () = assert!(core::mem::size_of::<Receiver>() + 16 <= BUDGET);
@@ -24,6 +24,27 @@ pub const ROLLING_MIN_SLOTS: u32 = 6;
 pub const MAX_WINDOWS: usize = 8;
 pub const MAX_PEERS: usize = 16;
 pub const MAX_LOG_RECENT: usize = 16;
+
+/// One completed receive slot retained for an external Cooperative RX host. Every member identifies the original
+/// UTC slot and dial so a host can safely associate reports from separate radios before combining their LLRs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CoopRxReport {
+    pub utc_slot: u32,
+    pub dial_hz: u32,
+    pub decoded: [Decoded; MAX_DECODED],
+    pub decoded_len: u8,
+    pub soft: Option<SoftCandidate>,
+}
+
+impl CoopRxReport {
+    pub const EMPTY: Self = Self {
+        utc_slot: 0,
+        dial_hz: 0,
+        decoded: [Decoded::EMPTY; MAX_DECODED],
+        decoded_len: 0,
+        soft: None,
+    };
+}
 
 /// Operating mode selected by the user.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

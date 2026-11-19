@@ -542,6 +542,7 @@ impl Session {
                 data_read(st, p, &mut o)
             }
             msg::CLOCK => clock(app, p, &mut o), // LINK-65
+            msg::COOP_RX => coop_rx(app, p, &mut o),
             // LINK-60: raw writes from the cable only, not while the other port writes
             msg::DATA_WRITE if self.by != crate::remote::BY_CABLE => Status::Refused,
             msg::DATA_WRITE if self.other_writing => Status::Busy,
@@ -955,6 +956,71 @@ fn clock(app: &mut App, p: &[u8], o: &mut Out) -> Status {
     };
     o.put(&now.to_le_bytes());
     o.put(&[src]);
+    Status::Ok
+}
+
+/// `COOP_RX` (`LINK-73`): a browser's local cooperative receiver host polls the result of the last completed
+/// SOL950 receive slot. The payload has no caller-controlled sizes and remains below the Link frame limit even
+/// with all eight decoded frames plus the 92-byte four-bit LLR candidate.
+fn coop_rx(app: &App, p: &[u8], o: &mut Out) -> Status {
+    if !p.is_empty() {
+        return Status::BadArg;
+    }
+
+    const VERSION: u8 = 1;
+    const UTC_READY: u8 = 1 << 0;
+    const ARMED: u8 = 1 << 1;
+    const REPORT: u8 = 1 << 2;
+    const SOFT: u8 = 1 << 3;
+
+    let Some(h) = app.sol950_host() else {
+        o.put(&[VERSION, 0]);
+        o.put(&0u32.to_le_bytes());
+        o.put(&0u32.to_le_bytes());
+        o.put(&0u32.to_le_bytes());
+        o.put(&[0]);
+        return Status::Ok;
+    };
+
+    let armed = app.sol950_open() && h.coop_bluetooth_armed();
+    let current_slot = if h.utc_ready() { h.utc_sec - h.utc_sec % ferrite_core::sol950::SLOT_S } else { 0 };
+    // A host polls every receive guard. Do not revive an old report after Capture is toggled off and on again.
+    let report = armed
+        .then_some(h.last_coop)
+        .flatten()
+        .filter(|r| current_slot <= r.utc_slot.saturating_add(ferrite_core::sol950::SLOT_S));
+    let mut flags = if h.utc_ready() { UTC_READY } else { 0 };
+    if armed {
+        flags |= ARMED;
+    }
+    if report.is_some() {
+        flags |= REPORT;
+    }
+    if report.is_some_and(|r| r.soft.is_some()) {
+        flags |= SOFT;
+    }
+
+    o.put(&[VERSION, flags]);
+    o.put(&current_slot.to_le_bytes());
+    o.put(&report.map_or(0, |r| r.utc_slot).to_le_bytes());
+    o.put(&report.map_or(0, |r| r.dial_hz).to_le_bytes());
+    let n = report.map_or(0, |r| r.decoded_len.min(ferrite_core::sol950::usol950::MAX_DECODED as u8));
+    o.put(&[n]);
+    let Some(report) = report else { return Status::Ok };
+
+    for d in &report.decoded[..n as usize] {
+        o.put(&d.frame.pack_u64().to_le_bytes());
+        o.put(&d.audio_hz.to_le_bytes());
+        o.put(&d.time_offset_ms.to_le_bytes());
+        o.put(&[d.snr_db as u8]);
+    }
+    if let Some(soft) = report.soft {
+        o.put(&soft.audio_hz.to_le_bytes());
+        o.put(&soft.time_offset_ms.to_le_bytes());
+        o.put(&[soft.snr_db as u8]);
+        o.put(&soft.sync_score.to_le_bytes());
+        o.put(&soft.llrs_4bit);
+    }
     Status::Ok
 }
 

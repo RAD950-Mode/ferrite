@@ -459,8 +459,9 @@ pub async fn task() {
                 }
                 capturing = want;
             }
-            Either4::First(DspCmd::Sol950Finish) => {
+            Either4::First(DspCmd::Sol950Finish { utc_slot, dial_hz, coop_capture }) => {
                 if running == DecoderKind::Sol950 {
+                    let captured = capturing;
                     if capturing {
                         audio::capture_stop();
                     }
@@ -472,6 +473,15 @@ pub async fn task() {
                     let n = slot.sol950_finish_with_soft(&mut out, Some(&mut soft));
                     if let Some(sc) = soft {
                         crate::chan::SOL950_SOFT.signal(sc);
+                    }
+                    if coop_capture && captured {
+                        crate::chan::SOL950_COOP.signal(ferrite_core::sol950::CoopRxReport {
+                            utc_slot,
+                            dial_hz,
+                            decoded: out,
+                            decoded_len: n as u8,
+                            soft,
+                        });
                     }
                     #[cfg(feature = "bench")]
                     {

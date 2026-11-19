@@ -1626,6 +1626,11 @@ async fn sol950_step(
             h.last_soft = Some((slot, sc));
         }
     }
+    if let Some(report) = crate::chan::SOL950_COOP.try_take() {
+        if let Some(h) = app.sol950_host_mut() {
+            h.last_coop = Some(report);
+        }
+    }
     // Check live TX completion from the Radio task.
     #[cfg(feature = "tx")]
     if let Some(ok) = crate::chan::SOL950_TX_DONE.try_take() {
@@ -1679,8 +1684,8 @@ async fn sol950_step(
         }
     }
 
-    if app.sol950_take_finish() {
-        let _ = crate::chan::DSP.try_send(DspCmd::Sol950Finish);
+    if let Some((utc_slot, dial_hz, coop_capture)) = app.sol950_take_finish() {
+        let _ = crate::chan::DSP.try_send(DspCmd::Sol950Finish { utc_slot, dial_hz, coop_capture });
     }
 
     #[cfg(feature = "tx")]

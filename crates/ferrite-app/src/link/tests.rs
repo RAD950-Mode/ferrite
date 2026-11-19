@@ -166,6 +166,74 @@ fn hello_and_info() {
     assert!(!pc.link.active(pc.now + ACTIVE_MS));
 }
 
+/// LINK-73: the Cooperative RX host gets a complete, slot-bound binary report only after the radio is explicitly
+/// placed in Bluetooth capture mode. A full report occupies 127 payload bytes after the status byte.
+#[test]
+fn cooperative_rx_report_is_bounded_and_armed() {
+    use crate::sol950::{CoopLink, CoopRxMode, Sol950Host};
+    use ferrite_core::sol950::{CoopRxReport, SLOT_S};
+    use ferrite_core::sol950::usol950::{Callsign, Decoded, Frame, SoftCandidate};
+
+    let mut pc = Pc::new(true);
+    let host: &'static mut Sol950Host = std::boxed::Box::leak(std::boxed::Box::new(Sol950Host::new()));
+    host.profile.coop_rx = CoopRxMode::Capture;
+    host.profile.coop_link = CoopLink::Bluetooth;
+    host.utc_sec = 1_735_689_609;
+    host.utc_uncert_ms = 50;
+    let mut report = CoopRxReport::EMPTY;
+    report.utc_slot = host.utc_sec - host.utc_sec % SLOT_S;
+    report.dial_hz = 28_185_000;
+    report.decoded[0] = Decoded {
+        frame: Frame::Cq {
+            sender: Callsign::encode(b"W1AW").unwrap(),
+            grid4: 0x1234,
+            tx_pwr: 7,
+            reserved: 0,
+        },
+        audio_hz: 1050,
+        time_offset_ms: -40,
+        snr_db: -17,
+    };
+    let decoded = report.decoded[0];
+    for entry in &mut report.decoded[1..] {
+        *entry = decoded;
+    }
+    report.decoded_len = report.decoded.len() as u8;
+    report.soft = Some(SoftCandidate { audio_hz: 1052, time_offset_ms: -35, snr_db: -18, sync_score: 321, llrs_4bit: [0x71; 92] });
+    host.last_coop = Some(report);
+    pc.app.sol950_attach(host);
+    pc.app.open(crate::screens::nav::Dest::Sol950);
+
+    let (status, body) = pc.ask(msg::COOP_RX, &[]);
+    assert_eq!(status, Status::Ok as u8);
+    assert_eq!(body.len(), 15 + 8 * 13 + 99);
+    assert_eq!(body[0], 1);
+    assert_eq!(body[1], 0x0F, "UTC ready, Bluetooth capture armed, report, and soft candidate");
+    assert_eq!(u32::from_le_bytes(body[2..6].try_into().unwrap()), 1_735_689_600);
+    assert_eq!(u32::from_le_bytes(body[6..10].try_into().unwrap()), 1_735_689_600);
+    assert_eq!(u32::from_le_bytes(body[10..14].try_into().unwrap()), 28_185_000);
+    assert_eq!(body[14], 8);
+    assert_eq!(u64::from_le_bytes(body[15..23].try_into().unwrap()), report.decoded[0].frame.pack_u64());
+    assert_eq!(i8::from_le_bytes([body[27]]), -17);
+    let soft = 15 + 8 * 13;
+    assert_eq!(u16::from_le_bytes(body[soft..soft + 2].try_into().unwrap()), 1052);
+    assert_eq!(i16::from_le_bytes(body[soft + 2..soft + 4].try_into().unwrap()), -35);
+    assert_eq!(i8::from_le_bytes([body[soft + 4]]), -18);
+    assert_eq!(i16::from_le_bytes(body[soft + 5..soft + 7].try_into().unwrap()), 321);
+    assert_eq!(&body[soft + 7..], &[0x71; 92]);
+
+    let (bad_arg_status, bad_arg) = pc.ask(msg::COOP_RX, &[0]);
+    assert_eq!(bad_arg_status, Status::BadArg as u8);
+    assert!(bad_arg.is_empty());
+
+    pc.app.sol950_host_mut().unwrap().profile.coop_link = CoopLink::Usb;
+    let (status, disarmed) = pc.ask(msg::COOP_RX, &[]);
+    assert_eq!(status, Status::Ok as u8);
+    assert_eq!(&disarmed[..2], &[1, 1]);
+    assert_eq!(u32::from_le_bytes(disarmed[2..6].try_into().unwrap()), 1_735_689_600);
+    assert!(disarmed[6..].iter().all(|&b| b == 0));
+}
+
 /// LINK-35: HELLO's answer ends with the build after the version, INFO's after the callsign: 0 receive, 1 tx,
 /// 3 tx with Dry TX on (TX-48), from the firmware's features (`Device::tx_built`) and the switch, with bit 7 set when
 /// the bench commands are in (`Device::bench`, TERM-38): the tx-bench build answers 0x83 from power-on (TX-48.1).

@@ -26,6 +26,27 @@ Associate candidates by window, UTC slot, corrected tone frequency, and sync tim
 2. **Two-radio USB capture.** Capture PA2 audio from both radios for the same sequence. A common injected signal can verify association and bit ordering on real hardware. Then use separate antennas at the intended sites to measure actual diversity. Record each radio’s frequency calibration, gain settings, slot times, sample gaps, and clipping. Score *all* transmitted slots, including acquisition failures. Report leader-only, helper-only, both, neither, rescued joint misses, and false accepts. Give both the percentage of all frames rescued and the percentage of joint misses rescued, with counts and uncertainty. If most gains come from helper-only decodes, take only the short payload report into the first radio-link prototype.
 3. **Local packet link.** If four-bit reports materially improve recovery over either-radio decoding in paired captures, test one helper on one local VHF or UHF channel. Timestamp observation, packet arrival, combined decode, and earliest eligible 10 m reply. Measure packet loss, missed 10 m receive slots, and any desensitization of a nearby listener while a helper transmits. Add helpers only after measuring that cost. The operating decision is whether cooperation increases the fraction of contacts logged at both ends within 60 seconds, including the time spent exchanging reports.
 
+## Browser host over Bluetooth LE
+
+For nearby radios, use **Tools → Cooperative RX** on RAD950.org in desktop
+Chrome. Turn on Bluetooth, set **Cooperative RX → Capture** and **Link →
+Bluetooth**, and leave each radio in RAD950 Monitor with UTC ready and the same
+dial. The computer connects separately to each radio over Ferrite Link on the
+BT513 BLE UART. Choose one receiver as the comparison leader.
+
+The radios report ordinary decodes and at most one failed soft candidate per
+completed slot. The browser groups by exact UTC slot and dial, then checks tone
+frequency and timing before adding 4-bit soft evidence. Keep only one report
+per receiver per slot. Show CRC-checked combined decodes alongside individual
+decodes. The first browser version uses equal weighting and skips ambiguous
+timing/frequency groups. A combined decode remains a candidate result until
+checked against a known transmitted frame.
+
+The browser retains observations in the open session and can download them as
+JSON. Start the hardware trial with two radios, then repeat with three to
+measure the third receiver's contribution and Bluetooth report completeness.
+The tool is receive-only.
+
 ## Airtime and reply scheduling
 
 Four bits × 184 coded bits gives **92 bytes per soft candidate**. The figures below are lower bounds for that vector alone. The example packet adds an illustrative 20 bytes for metadata and integrity. Preamble, link framing, key-up, turnaround, contention, and retries add wall-clock time.
