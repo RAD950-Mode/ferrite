@@ -41,7 +41,7 @@ All transmissions are **Upper Sideband (USB)** (or equivalent direct-PLL 4-FSK c
 - **Modulation:** Phase-continuous **4-FSK**, tone spacing **`50 Hz`**, symbol period **`80 ms`** (`10 ms` raised-cosine ramp + `70 ms` steady tone).
 - **Gray dibit-to-tone mapping:** `(b0, b1)` → tone `0..3`: `00 → 0`, `01 → 1`, `11 → 2`, `10 → 3` (`GRAY_ENCODE = [0, 1, 3, 2]`).
 - **8 TX subchannels (`SUBCHANNELS_HZ`, lowest tone `f0` above USB dial):**
-  - `600, 825, 1050, 1275, 1500, 1725, 1950, 2175 Hz` (`225 Hz` step = `150 Hz` tone span / `~200 Hz` occupied bandwidth + `25 Hz` guard; Rendezvous table uses `625..2200 Hz`, `+25 Hz` shifted).
+  - `600, 825, 1050, 1275, 1500, 1725, 1950, 2175 Hz` (`225 Hz` step = `150 Hz` tone span / `~200 Hz` occupied bandwidth + `25 Hz` guard; shared across core PHY, Run mode, and Rendezvous).
 - **Continuous RX search:** `585.9–2,332.0 Hz` (`150` FFT bins at `11.72 Hz`/bin, `6,000 Hz` decimated processing rate), up to **`8` simultaneous tracks/decodes** (`MAX_TRACKS = MAX_DECODED = 8`) per slot, with `±11.72 Hz` linear frequency-drift tracking across the burst tail.
 
 ### 2.3 Sync & Interleaving
@@ -65,7 +65,8 @@ All transmissions are **Upper Sideband (USB)** (or equivalent direct-PLL 4-FSK c
   - `C0`: `' '`, `'A'..'Z'`, `'0'..'9'` (37) · `C1`: `'A'..'Z'`, `'0'..'9'` (36) · `C2`: `'0'..'9'` (10) · `C3..C5`: `' '`, `'A'..'Z'` (27 each).
 - **15-bit Maidenhead `grid4`:** `0..=32,399` (`AA00..RR99`); `32,400` (`GRID_UNKNOWN`) = unset/no grid.
 - **5-bit `snr_db`:** `[-24, +7] dB` in `1 dB` steps (`code = clamp(snr_db, -24, 7) + 24`, 2,500 Hz reference bandwidth).
-- **4-bit `tx_pwr`:** `0` = unspecified, `1..=15` = quantized TX power code.
+- **4-bit `tx_pwr`:** `0` = unspecified; `1..=15` = `tx_pwr_dbm = (code - 1) * 3` dBm:
+  - `1` = `0 dBm` (1 mW), `2` = `+3 dBm` (2 mW), `3` = `+6 dBm` (4 mW), `4` = `+9 dBm` (8 mW), `5` = `+12 dBm` (16 mW), `6` = `+15 dBm` (32 mW), `7` = `+18 dBm` (63 mW), `8` = `+21 dBm` (125 mW), `9` = `+24 dBm` (250 mW), `10` = `+27 dBm` (500 mW), `11` = `+30 dBm` (1 W), `12` = `+33 dBm` (2 W), `13` = `+36 dBm` (4 W), `14` = `+39 dBm` (8 W), `15` = `+42 dBm` (~16 W).
 
 ### 3.3 Frame Layouts (MSB = bit 63)
 
@@ -158,3 +159,24 @@ Skimmers and host SDRs (`rad950_hackrf --spot`) upload decoded slots asynchronou
   - `freq_hz = dial_hz + audio_hz`; `frame_type` is `"CQ"`, `"RX"`, or `"R+RX"`.
   - `spotter_grid`, `tx_grid`, and `tx_pwr_code` are omitted when unknown/`0`.
   - Self-base-call spots (`base(tx_call) == base(spotter_call)`) are skipped client-side and ignored server-side.
+
+---
+
+## 7. Golden Interoperability Test Vectors
+
+Verified against `usol950::tests::golden_spec_test_vectors`:
+
+### Vector 1: `CQ NQ6N EN61` (`tx_pwr = 11` / `+30 dBm`, `suffix = 0`)
+- **`payload64`:** `0x30DDC102171B0000`
+- **`crc14`:** `0x28CC`
+- **`ldpc184` (46 hex nibbles, MSB-first):** `0x30DDC102171B0000A330AACDF5B13048236A473BC10846`
+- **`tones110` (`0..3`, 110 symbols):**
+  `03013201020002310130320102223001300302032210012013201100032100130122210200002200030300100130332133331200310230`
+
+### Vector 2: `R+RX K1ABC de NQ6N -12 dB` (`ack = 1`)
+- **`payload64`:** `0xB0DDC1000F2C50B2`
+- **`crc14`:** `0x2574`
+- **`ldpc184` (46 hex nibbles, MSB-first):** `0xB0DDC1000F2C50B295D059FB32E01537E56358A0C06E80`
+- **`tones110` (`0..3`, 110 symbols):**
+  `03013231001001021130320112103301303131110303001033201302313312123031210303113301223010100121202231100313310230`
+

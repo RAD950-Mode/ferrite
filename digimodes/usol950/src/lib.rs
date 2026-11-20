@@ -534,6 +534,55 @@ mod tests {
         }
     }
 
+    #[test]
+    fn golden_spec_test_vectors() {
+        let nq6n = Callsign::encode(b"NQ6N").unwrap();
+        let k1abc = Callsign::encode(b"K1ABC").unwrap();
+        let en61 = encode_grid4(b"EN61").unwrap();
+
+        let cases = [
+            (
+                Frame::Cq { sender: nq6n, grid4: en61, tx_pwr: 11, reserved: 0 },
+                0x30DDC102171B0000u64,
+                0x28CCu16,
+                "30DDC102171B0000A330AACDF5B13048236A473BC10846",
+                "03013201020002310130320102223001300302032210012013201100032100130122210200002200030300100130332133331200310230",
+            ),
+            (
+                Frame::Rx { sender: nq6n, recipient: k1abc, snr_db: -12, ack: true, reserved: false },
+                0xB0DDC1000F2C50B2u64,
+                0x2574u16,
+                "B0DDC1000F2C50B295D059FB32E01537E56358A0C06E80",
+                "03013231001001021130320112103301303131110303001033201302313312123031210303113301223010100121202231100313310230",
+            ),
+        ];
+
+        for (frame, exp_p64, exp_crc, exp_cw, exp_tones) in cases {
+            let p64 = frame.pack_u64();
+            let crc = crc14_u64(p64);
+            let mut msg = [0u8; ldpc::K_BITS];
+            for i in 0..64 {
+                msg[i] = ((p64 >> (63 - i)) & 1) as u8;
+            }
+            for i in 0..14 {
+                msg[64 + i] = ((crc >> (13 - i)) & 1) as u8;
+            }
+            let cw = ldpc::encode(&msg);
+            let mut cw_hex = std::string::String::new();
+            for chunk in cw.chunks(4) {
+                let nib = (chunk[0] << 3) | (chunk[1] << 2) | (chunk[2] << 1) | chunk[3];
+                cw_hex.push(std::char::from_digit(nib as u32, 16).unwrap().to_ascii_uppercase());
+            }
+            let tones = encode_tones(frame);
+            let tone_str: std::string::String = tones.iter().map(|&t| (b'0' + t) as char).collect();
+            assert_eq!(p64, exp_p64);
+            assert_eq!(crc, exp_crc);
+            assert_eq!(cw_hex, exp_cw);
+            assert_eq!(tone_str, exp_tones);
+            assert_eq!(Frame::unpack_u64(p64), Some(frame));
+        }
+    }
+
     fn libm_pow10(x: f64) -> f64 {
         (x * core::f64::consts::LN_10).exp()
     }

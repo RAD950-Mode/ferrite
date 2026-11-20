@@ -27,8 +27,8 @@ pub const RDV_BANDS: [RdvBand; 4] = [
 /// Window duration in minutes (`5` minutes = `30` ten-second turns).
 pub const RDV_WINDOW_MIN: u8 = 5;
 
-/// Eight 225 Hz audio subchannels inside the RAD950 passband (`625..2200 Hz`).
-pub const RDV_SUBCH_HZ: [u16; 8] = [625, 850, 1075, 1300, 1525, 1750, 1975, 2200];
+/// Eight 225 Hz audio subchannels inside the RAD950 passband (`600..2175 Hz`, matching `usol950::SUBCHANNELS_HZ`).
+pub const RDV_SUBCH_HZ: [u16; 8] = [600, 825, 1050, 1275, 1500, 1725, 1950, 2175];
 
 /// Current or next scheduled rendezvous window relative to `utc_sec`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
