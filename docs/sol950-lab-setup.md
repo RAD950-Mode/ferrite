@@ -207,6 +207,16 @@ A carrier capture proves the fixture. For the **SOL950 TX waveform** measurement
       `22:32:40Z  28.078 MHz  NQ6N        grid=----  rx=-3dB  tx=+7dB`
     - **RT-950 Pro (`RAD950 Log` / `Log Detail`, SPI flash):**
       `Saved contacts: 1` · `NQ6NA FN31  -9/-3dB` · `My: NQ6N (FN31)` · `SNR RX -9 / TX -3 dB` · `Dial: 28.078 MHz` · `UTC 21:15:59 #1` (bench monotonic UTC; `TX -3 dB` matches HackRF's live `rx=-3dB` report).
+- **3-station live OTA multi-signal & opposite-parity verification (`NQ6N` RT-950 Pro + `NQ6NA` HackRF #0 + `NQ6NB` HackRF #1, 2026-11-20 04:56Z):**
+  - **Setup:** RT-950 Pro (`76a914c`, `dry=0`, Low power, `/dev/ttyUSB2`) + two HackRF Ones on `ronald` calibrated via ATSC TV pilots (`#0 ...2a9f68cd`: `-0.28 ppm`, `#1 ...3648550f`: `-0.20 ppm`), both running interactive `rad950_hackrf` with Auto-CQ ON (`a`) on `28.078 MHz` (`--ppm 43.7 --lna 8 --vga 24 --tx-gain 47 --amp --slot-offset-ms -3528`): `NQ6NA` on subch 1 (`825 Hz`, `EN61`) and `NQ6NB` on subch 4 (`1500 Hz`, `EM79`).
+  - **Simultaneous dual-signal on-MCU decode:** RT-950 Pro decoded both simultaneous HackRF CQs in the same 10 s slot (`dec=8 -> 10`): `NQ6NA EN61 WKD -5dB` and `NQ6NB EM79 NEW -10dB`.
+  - **Opposite-parity Auto-CQ QSO under active adjacent-subchannel traffic (`76a914cb`):**
+    1. `04:56:10Z` — Both `NQ6NA` (`825 Hz`) and `NQ6NB` (`1500 Hz`) transmitted Auto-CQ on the odd slot.
+    2. `04:56:20Z` — RT-950 Pro (`NQ6N`) automatically waited for the opposite-parity even slot and transmitted `NQ6NB de NQ6N RX -10dB`. Both HackRFs decoded it simultaneously: `NQ6NA` logged `RX +0dB 938Hz NQ6NB de NQ6N RX -10dB` and ignored it (not addressed to `NQ6NA`); `NQ6NB` logged `QSO logged NQ6N (rx=-8dB tx=-10dB) -> R+RX queued`.
+    3. `04:56:30Z` — `NQ6NA` transmitted `CQ NQ6NA EN61` (`825 Hz`) simultaneously with `NQ6NB` transmitting `NQ6N de NQ6NB R+RX -8dB` (`1500 Hz`). RT-950 Pro decoded both in the same slot (`NQ6NA -3dB` + `NQ6NB R+RX -8dB`), updated `NQ6NB EM79` from `NEW` to `WKD*`, and saved the contact to SPI flash.
+  - **Matching logged entries:**
+    - **`NQ6NB` (`/tmp/sol950-lab/qso_nq6nb.log`):** `04:56:20Z  28.078 MHz  NQ6N        grid=----  rx=-8dB  tx=-10dB`
+    - **`NQ6N` (RT-950 Pro `RAD950 Log`, SPI flash):** `Saved contacts: 2` · `NQ6NB EM79  -8/-8dB` · `NQ6NA FN31  -9/-3dB`
 - **On-MCU stability:** Resolved stack headroom (`ui::task` `12,096 B -> 6,560 B`, `dsp::feed` `5,536 B -> <1,600 B`, `Decoder::switch` `4,800 B -> <100 B`), Low Power Mode 24 MHz DSP starvation, World Map `lcd.rows()` band clipping, and PTT exit behavior; verified 231+ consecutive live 10-second RX slots with zero crashes.
 
 ## Conducted RAD950 transmitter measurements with the Siglent SSA3021X
