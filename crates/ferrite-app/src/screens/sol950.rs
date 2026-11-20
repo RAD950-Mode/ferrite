@@ -223,6 +223,7 @@ fn push_khz3<const N: usize>(b: &mut Buf<N>, dial: Freq10) {
 fn empty_row() -> ActivityRow {
     ActivityRow {
         peer: Callsign::from_raw(0).unwrap(),
+        suffix: 0,
         grid4: ferrite_core::sol950::usol950::GRID_UNKNOWN,
         snr_db: 0,
         last_seen_slot: 0,
@@ -881,6 +882,12 @@ impl Sol950Scr {
                         let mut cb = [0u8; 6];
                         let cn = r.peer.decode(&mut cb);
                         let cs = core::str::from_utf8(&cb[..cn]).unwrap_or("?");
+                        let mut call_disp = Buf::<12>::new();
+                        if r.suffix > 0 && r.suffix <= 15 {
+                            let _ = uwrite!(call_disp, "{}-{}", cs, r.suffix);
+                        } else {
+                            let _ = uwrite!(call_disp, "{}", cs);
+                        }
                         let gb = decode_grid4(r.grid4).unwrap_or(*b"----");
                         let gs = core::str::from_utf8(&gb).unwrap_or("----");
 
@@ -905,7 +912,7 @@ impl Sol950Scr {
                                 GridAward::None => DIM,
                             }
                         };
-                        lcd.text4(30, y + 22, cs.as_bytes(), &UI_14, call_col, bg);
+                        lcd.text4(30, y + 22, call_disp.as_bytes(), &UI_14, call_col, bg);
                         lcd.text4(104, y + 22, gs.as_bytes(), &UI_14, grid_col, bg);
 
                         // Compact badge tag (NEW / BND / WKD* / WKD+ / WKD)

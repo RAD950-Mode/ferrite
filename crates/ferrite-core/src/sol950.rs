@@ -62,6 +62,8 @@ pub enum OpMode {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Config {
     pub my_call: Callsign,
+    /// Optional 4-bit numeric suffix (`0` = none, `1..=15` = `-1`..`-15`, carried in `Frame::Cq.reserved & 0x0F`).
+    pub my_suffix: u8,
     pub my_grid4: u16,
     pub tx_pwr: u8,
     pub mode: OpMode,
@@ -84,6 +86,7 @@ pub struct QsoRecord {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ActivityRow {
     pub peer: Callsign,
+    pub suffix: u8,
     pub grid4: u16,
     pub snr_db: i8,
     pub last_seen_slot: u32,
@@ -109,6 +112,7 @@ pub enum SlotPlan {
 struct PeerSession {
     active: bool,
     peer: Callsign,
+    suffix: u8,
     window: Freq10,
     grid4: u16,
     last_heard_snr: i8,
@@ -138,6 +142,7 @@ impl PeerSession {
         Self {
             active: false,
             peer: Callsign::from_raw(0).unwrap(),
+            suffix: 0,
             window: 0,
             grid4: GRID_UNKNOWN,
             last_heard_snr: 0,
@@ -269,6 +274,7 @@ impl Engine {
             if p.active {
                 out[n] = ActivityRow {
                     peer: p.peer,
+                    suffix: p.suffix,
                     grid4: p.grid4,
                     snr_db: p.last_heard_snr,
                     last_seen_slot: p.last_seen_slot,
@@ -340,7 +346,7 @@ impl Engine {
                     sender: self.cfg.my_call,
                     grid4: self.cfg.my_grid4,
                     tx_pwr: self.cfg.tx_pwr,
-                    reserved: 0,
+                    reserved: (self.cfg.my_suffix & 0x0F) as u16,
                 };
                 let subchannel_hz = self.pick_subchannel(slot);
                 self.occupied_subch_mask = 0;
@@ -399,16 +405,21 @@ impl Engine {
         for d in decoded {
             self.mark_subchannel_busy(d.audio_hz);
             match d.frame {
-                Frame::Cq { sender, grid4, .. } => {
-                    if sender == self.cfg.my_call {
+                Frame::Cq { sender, grid4, reserved, .. } => {
+                    let suffix = (reserved & 0x0F) as u8;
+                    if sender == self.cfg.my_call && suffix == self.cfg.my_suffix {
                         continue;
                     }
-                    let idx = self.upsert_peer(slot, window, sender);
+                    let idx = self.upsert_peer_suffix(slot, window, sender, suffix);
                     let p = &mut self.peers[idx];
                     p.grid4 = grid4;
                     p.last_heard_snr = d.snr_db;
                     p.last_seen_slot = slot;
-                    if self.cfg.mode != OpMode::Monitor && p.logged_at.is_none() && p.tries < MAX_TRIES {
+                    if sender != self.cfg.my_call
+                        && self.cfg.mode != OpMode::Monitor
+                        && p.logged_at.is_none()
+                        && p.tries < MAX_TRIES
+                    {
                         // Queue initial `RX(ACK=0)` if we haven't already sent a report or queued `ACK=1`.
                         if p.owed_reply != Some(true) && p.tx_r0_done_at.is_none() && p.tx_r1_done_at.is_none() {
                             p.owed_reply = Some(false);
@@ -644,14 +655,25 @@ impl Engine {
         self.peers.iter().position(|p| p.active && p.peer == peer && p.window == window)
     }
 
+    fn find_peer_suffix(&self, peer: Callsign, suffix: u8, window: Freq10) -> Option<usize> {
+        self.peers
+            .iter()
+            .position(|p| p.active && p.peer == peer && p.suffix == suffix && p.window == window)
+    }
+
     fn upsert_peer(&mut self, slot: u32, window: Freq10, peer: Callsign) -> usize {
-        if let Some(i) = self.find_peer(peer, window) {
+        self.upsert_peer_suffix(slot, window, peer, 0)
+    }
+
+    fn upsert_peer_suffix(&mut self, slot: u32, window: Freq10, peer: Callsign, suffix: u8) -> usize {
+        if let Some(i) = self.find_peer_suffix(peer, suffix, window) {
             return i;
         }
         if let Some(i) = self.peers.iter().position(|p| !p.active) {
             self.peers[i] = PeerSession {
                 active: true,
                 peer,
+                suffix,
                 window,
                 last_seen_slot: slot,
                 ..PeerSession::empty()
@@ -669,6 +691,7 @@ impl Engine {
         self.peers[oldest] = PeerSession {
             active: true,
             peer,
+            suffix,
             window,
             last_seen_slot: slot,
             ..PeerSession::empty()
@@ -693,6 +716,7 @@ mod tests {
         }
         Engine::new(Config {
             my_call: Callsign::encode(call).unwrap(),
+            my_suffix: 0,
             my_grid4: encode_grid4(grid).unwrap(),
             tx_pwr: 10,
             mode,

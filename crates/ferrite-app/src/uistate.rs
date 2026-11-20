@@ -774,6 +774,7 @@ fn body<S: ChannelStore>(app: &App, cx: &Cx<S>, d: &mut Desc) {
             use ferrite_core::sol950::{ActivityRow, MAX_PEERS};
             let mut rows = [ActivityRow {
                 peer: Callsign::from_raw(0).unwrap(),
+                suffix: 0,
                 grid4: GRID_UNKNOWN,
                 snr_db: 0,
                 last_seen_slot: 0,

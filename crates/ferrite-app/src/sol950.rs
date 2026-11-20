@@ -806,6 +806,7 @@ impl Sol950Host {
         let profile = Sol950Profile::new();
         let cfg = Config {
             my_call: Callsign::from_raw(0).unwrap(),
+            my_suffix: 0,
             my_grid4: GRID_UNKNOWN,
             tx_pwr: 0,
             mode: OpMode::Monitor,
@@ -873,7 +874,7 @@ impl Sol950Host {
     /// Push the current profile + effective grid into the underlying `Engine`.
     pub fn sync_engine_config(&mut self) {
         if let Some(c) = self.profile.callsign() {
-            self.rdv.set_seed_from_call(c.raw());
+            self.rdv.set_seed_from_call(c.raw() ^ ((self.profile.suffix as u32) << 24));
         }
         let my_call = self.profile.callsign().unwrap_or_else(|| Callsign::from_raw(0).unwrap());
         let (grid_bytes, src) = self.profile.effective_grid(self.gps_grid);
@@ -884,6 +885,7 @@ impl Sol950Host {
         };
         let mut cfg = *self.engine.config();
         cfg.my_call = my_call;
+        cfg.my_suffix = self.profile.suffix & 0x0F;
         cfg.my_grid4 = my_grid4;
         cfg.tx_pwr = self.profile.tx_power.min(2);
         cfg.windows[0] = self.profile.dial();
@@ -1012,7 +1014,12 @@ impl Sol950Host {
                     if let Some(me) = self.profile.callsign() {
                         let (g4_bytes, _) = self.profile.effective_grid(self.gps_grid);
                         let grid4 = ferrite_core::sol950::usol950::frame::encode_grid4(&g4_bytes).unwrap_or(0);
-                        let frame = Frame::Cq { sender: me, grid4, tx_pwr: self.profile.tx_power, reserved: 0 };
+                        let frame = Frame::Cq {
+                            sender: me,
+                            grid4,
+                            tx_pwr: self.profile.tx_power,
+                            reserved: (self.profile.suffix & 0x0F) as u16,
+                        };
                         let rf_freq = self.profile.dial().saturating_add(subch_hz as u32 / 10);
                         self.tx_subch_hz = subch_hz;
                         self.tx_tones = ferrite_core::sol950::usol950::encode_tones(frame);

@@ -106,6 +106,7 @@ struct CalHit {
 #[derive(Clone)]
 struct NodeConfig {
     call: Callsign,
+    suffix: u8,
     call_str: String,
     grid4: u16,
     grid_str: String,
@@ -201,6 +202,7 @@ struct SharedState {
     running: bool,
     auto_cq: bool,
     auto_qso: bool,
+    rendezvous: bool,
     cq_parity: u64,
     tx_queue: VecDeque<TxJob>,
     heard: Vec<HeardEntry>,
@@ -294,7 +296,7 @@ fn usage() {
     eprintln!("  rad950_hackrf [OPTIONS]");
     eprintln!();
     eprintln!("Options:");
-    eprintln!("  --call <CALL>             Station callsign (default: NQ6N)");
+    eprintln!("  --call <CALL[-1..15]>     Station callsign with optional numeric suffix (default: NQ6N)");
     eprintln!("  --grid <GRID4|NONE>       4-char Maidenhead grid (default: FN31)");
     eprintln!("  --band <10m|12m|15m|17m>  RAD950 calling band (default: 10m = 28.078 MHz)");
     eprintln!("  --freq <HZ>               Custom USB dial frequency in Hz (e.g. 28185000)");
@@ -306,6 +308,7 @@ fn usage() {
     eprintln!("  --amp                     Enable HackRF RF amplifier (default: off)");
     eprintln!("  --serial <HEX>            HackRF serial number suffix (if multiple connected)");
     eprintln!("  --dry-tx                  Dry TX safety mode (synthesize without keying HackRF)");
+    eprintln!("  --rendezvous              Enable hourly UTC Rendezvous band-hopping & 50/50 turn cadence");
     eprintln!("  --tx-once                 Transmit a single CQ immediately and exit (for bench/OTA tests)");
     eprintln!("  --log <PATH>              QSO log file path (default: rad950_hackrf.log)");
     eprintln!("  --slot-offset-ms <MS>     Shift 10 s slot clock by signed ms (for indoor non-GPS bench sync)");
@@ -342,6 +345,74 @@ fn band_name(dial_hz: u64) -> &'static str {
 fn parse_call(s: &str) -> Result<Callsign, String> {
     Callsign::encode(s.trim().to_ascii_uppercase().as_bytes())
         .map_err(|e| format!("invalid callsign '{s}': {e:?}"))
+}
+
+fn parse_call_with_suffix(s: &str) -> Result<(Callsign, u8, String), String> {
+    let up = s.trim().to_ascii_uppercase();
+    let (base_s, suffix) = if let Some((b, suf)) = up.split_once('-') {
+        let n: u8 = suf
+            .parse()
+            .map_err(|_| format!("invalid numeric suffix in '{s}' (use -1..-15)"))?;
+        if !(1..=15).contains(&n) {
+            return Err(format!("suffix must be 1..=15 in '{s}'"));
+        }
+        (b, n)
+    } else {
+        (up.as_str(), 0u8)
+    };
+    let call = parse_call(base_s)?;
+    let disp = format_call_with_suffix(call, suffix);
+    Ok((call, suffix, disp))
+}
+
+fn format_call_with_suffix(c: Callsign, suffix: u8) -> String {
+    let base = format_call(c);
+    if (1..=15).contains(&suffix) {
+        format!("{base}-{suffix}")
+    } else {
+        base
+    }
+}
+
+/// Published hourly UTC Rendezvous schedule matching `crates/ferrite-app/src/rad950_rdv.rs`:
+/// `:00-:04` 10m (28.078), `:15-:19` 12m (24.919), `:30-:34` 15m (21.078), `:45-:49` 17m (18.104).
+fn rdv_active_band(utc_sec: u64) -> Option<(&'static str, u64)> {
+    const RDV: [(&str, u64, u64); 4] = [
+        ("10m", 0, 28_078_000),
+        ("12m", 15, 24_919_000),
+        ("15m", 30, 21_078_000),
+        ("17m", 45, 18_104_000),
+    ];
+    let sec_in_hour = utc_sec % 3600;
+    for &(lbl, start_min, dial) in &RDV {
+        let start = start_min * 60;
+        if sec_in_hour >= start && sec_in_hour < start + 300 {
+            return Some((lbl, dial));
+        }
+    }
+    None
+}
+
+/// Fast avalanche hash matching `rad950_rdv::mix32` for independent 50/50 even-slot Rendezvous CQs.
+fn rdv_plan_cq(call: Callsign, suffix: u8, slot: u64) -> Option<usize> {
+    if !slot.is_multiple_of(2) {
+        return None;
+    }
+    let raw = call.raw() ^ ((suffix as u32) << 24);
+    let mut seed = raw.wrapping_mul(0x9E37_79B1) ^ 0x5A3C_9E37;
+    if seed == 0 {
+        seed = 0x1357_9BDF;
+    }
+    let mut x = seed ^ (slot as u32).wrapping_mul(0x9E37_79B9);
+    x ^= x >> 16;
+    x = x.wrapping_mul(0x7FEB_352D);
+    x ^= x >> 15;
+    x = x.wrapping_mul(0x846C_A68B);
+    x ^= x >> 16;
+    if (x & 1) == 0 {
+        return None;
+    }
+    Some(((x >> 8) as usize) % SUBCHANNELS_HZ.len())
 }
 
 fn parse_grid(s: &str) -> Result<(u16, String), String> {
@@ -866,6 +937,7 @@ fn append_qso_log(path: &str, entry: &QsoLogEntry) {
 fn handle_decoded(state: &Arc<Mutex<SharedState>>, slot: u64, frames: &[Decoded]) {
     let mut st = state.lock().unwrap();
     let my_call = st.cfg.call;
+    let my_suffix = st.cfg.suffix;
     let my_subch = st.cfg.subch;
     let dial_hz = st.cfg.dial_hz;
     let utc_sec = slot * 10;
@@ -873,7 +945,13 @@ fn handle_decoded(state: &Arc<Mutex<SharedState>>, slot: u64, frames: &[Decoded]
     for d in frames {
         st.frames_rx += 1;
         let sender_call = frame_sender(d.frame);
-        let sender_str = sender_call.map(format_call).unwrap_or_else(|| "EXT".to_string());
+        let cq_suffix = match d.frame {
+            Frame::Cq { reserved, .. } => (reserved & 0x0F) as u8,
+            _ => 0,
+        };
+        let sender_str = sender_call
+            .map(|c| format_call_with_suffix(c, cq_suffix))
+            .unwrap_or_else(|| "EXT".to_string());
         let (kind, grid_str, detail) = match d.frame {
             Frame::Cq { grid4, tx_pwr, .. } => {
                 let g = format_grid(grid4);
@@ -914,12 +992,15 @@ fn handle_decoded(state: &Arc<Mutex<SharedState>>, slot: u64, frames: &[Decoded]
         ));
 
         if let Some(sc) = sender_call {
+            if sc == my_call && cq_suffix == my_suffix {
+                continue;
+            }
             let already_worked = if st.worked_calls.contains(&sender_str) {
                 WorkedBadge::Worked
             } else {
                 WorkedBadge::None
             };
-            if let Some(existing) = st.heard.iter_mut().find(|h| h.call == sc) {
+            if let Some(existing) = st.heard.iter_mut().find(|h| h.call_str == sender_str) {
                 existing.snr_db = d.snr_db;
                 existing.tone_hz = d.audio_hz;
                 existing.last_slot = slot;
@@ -2171,13 +2252,19 @@ fn slot_worker(state: Arc<Mutex<SharedState>>) {
         // Peek whether the upcoming slot will TX so we pre-trigger 350 ms early for TX synth,
         // while RX starts right at the 0 ms slot boundary to capture the full +0.40s..+9.20s burst.
         let next_slot = (now_ms + rem_ms + 50) / 10_000;
+        let next_utc_sec = next_slot * 10;
         let will_tx = last_tx_slot.is_none_or(|prev| next_slot >= prev + 2) && {
             let st = state.lock().unwrap();
             let q_ready = st
                 .tx_queue
                 .front()
                 .is_some_and(|j| j.parity.is_none_or(|p| next_slot % 2 == p));
-            q_ready || (st.tx_queue.is_empty() && st.auto_cq && (next_slot % 2 == st.cq_parity))
+            let rdv_ready = st.rendezvous
+                && rdv_active_band(next_utc_sec).is_some()
+                && rdv_plan_cq(st.cfg.call, st.cfg.suffix, next_slot).is_some();
+            q_ready
+                || (st.tx_queue.is_empty() && rdv_ready)
+                || (st.tx_queue.is_empty() && st.auto_cq && (next_slot % 2 == st.cq_parity))
         };
         let lead_ms = if will_tx { 350 } else { 0 };
         if in_slot > 250 && rem_ms > lead_ms {
@@ -2222,6 +2309,19 @@ fn slot_worker(state: Arc<Mutex<SharedState>>) {
             if !st.running {
                 break;
             }
+            // Rendezvous hourly UTC band-hopping (10m :00, 12m :15, 15m :30, 17m :45).
+            let rdv_now = if st.rendezvous { rdv_active_band(utc_sec) } else { None };
+            if let Some((lbl, rdv_dial)) = rdv_now {
+                if st.cfg.dial_hz != rdv_dial {
+                    st.cfg.dial_hz = rdv_dial;
+                    st.push_event(format!(
+                        "[{}] RDV hop -> {} ({:.3} MHz)",
+                        format_utc_hms(utc_sec),
+                        lbl,
+                        rdv_dial as f64 / 1e6
+                    ));
+                }
+            }
             let job = if !tx_allowed {
                 None
             } else if st
@@ -2233,12 +2333,27 @@ fn slot_worker(state: Arc<Mutex<SharedState>>) {
             } else if !st.tx_queue.is_empty() {
                 // Waiting for the opposite parity slot so we don't collide with the peer's TX slot.
                 None
+            } else if rdv_now.is_some() {
+                rdv_plan_cq(st.cfg.call, st.cfg.suffix, slot).map(|subch| {
+                    let frame = Frame::Cq {
+                        sender: st.cfg.call,
+                        grid4: st.cfg.grid4,
+                        tx_pwr: 10,
+                        reserved: (st.cfg.suffix & 0x0F) as u16,
+                    };
+                    TxJob {
+                        frame,
+                        subch,
+                        summary: format!("RDV CQ {} {}", st.cfg.call_str, st.cfg.grid_str),
+                        parity: Some(0),
+                    }
+                })
             } else if st.auto_cq && (slot % 2 == st.cq_parity) {
                 let frame = Frame::Cq {
                     sender: st.cfg.call,
                     grid4: st.cfg.grid4,
                     tx_pwr: 10,
-                    reserved: 0,
+                    reserved: (st.cfg.suffix & 0x0F) as u16,
                 };
                 Some(TxJob {
                     frame,
@@ -2476,7 +2591,9 @@ fn render_tui(state: &Arc<Mutex<SharedState>>, tui: &TuiState) {
     } else {
         "\x1b[1;37;41m LIVE-TX \x1b[0;1;37;44m"
     };
-    let cq_badge = if st.auto_cq {
+    let cq_badge = if st.rendezvous {
+        "\x1b[1;30;46m RDV \x1b[0;1;37;44m"
+    } else if st.auto_cq {
         "\x1b[1;30;42m AUTO-CQ \x1b[0;1;37;44m"
     } else {
         ""
@@ -2935,10 +3052,11 @@ fn adjust_setting(state: &Arc<Mutex<SharedState>>, tui: &mut TuiState, delta: i3
 fn commit_edit(state: &Arc<Mutex<SharedState>>, tui: &mut TuiState, text: String) {
     let mut st = state.lock().unwrap();
     match tui.set_sel {
-        0 => match parse_call(&text) {
-            Ok(c) => {
+        0 => match parse_call_with_suffix(&text) {
+            Ok((c, suf, disp)) => {
                 st.cfg.call = c;
-                st.cfg.call_str = format_call(c);
+                st.cfg.suffix = suf;
+                st.cfg.call_str = disp;
                 tui.set_toast(format!("Callsign set to {}", st.cfg.call_str));
             }
             Err(e) => tui.set_toast(e),
@@ -3050,6 +3168,7 @@ fn main() -> ExitCode {
     let mut tx_vga_db: u8 = 16;
     let mut amp = false;
     let mut dry_tx = false;
+    let mut rendezvous = false;
     let mut tx_once = false;
     let mut rx_once = false;
     let mut tx_reply: Option<(String, i8, bool)> = None;
@@ -3083,6 +3202,7 @@ fn main() -> ExitCode {
             }
             "--amp" => amp = true,
             "--dry-tx" => dry_tx = true,
+            "--rendezvous" => rendezvous = true,
             "--tx-once" => tx_once = true,
             "--rx-once" => rx_once = true,
             "--tx-reply" if i + 3 < args.len() => {
@@ -3177,7 +3297,7 @@ fn main() -> ExitCode {
         return run_loopback_selftest();
     }
 
-    let call = match parse_call(&call_str) {
+    let (call, suffix, call_disp) = match parse_call_with_suffix(&call_str) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("{e}");
@@ -3203,7 +3323,8 @@ fn main() -> ExitCode {
 
     let cfg = NodeConfig {
         call,
-        call_str: format_call(call),
+        suffix,
+        call_str: call_disp,
         grid4,
         grid_str: grid_clean,
         dial_hz,
@@ -3225,6 +3346,7 @@ fn main() -> ExitCode {
         running: true,
         auto_cq: false,
         auto_qso: true,
+        rendezvous,
         cq_parity: 0,
         tx_queue: VecDeque::new(),
         heard: Vec::new(),
@@ -3289,7 +3411,7 @@ fn main() -> ExitCode {
             sender: cfg.call,
             grid4: cfg.grid4,
             tx_pwr: 10,
-            reserved: 0,
+            reserved: (cfg.suffix & 0x0F) as u16,
         };
         let job = TxJob {
             frame,
@@ -3505,7 +3627,7 @@ fn main() -> ExitCode {
                                     sender: st.cfg.call,
                                     grid4: st.cfg.grid4,
                                     tx_pwr: 10,
-                                    reserved: 0,
+                                    reserved: (st.cfg.suffix & 0x0F) as u16,
                                 };
                                 let subch = st.cfg.subch;
                                 let summary = format!("CQ {} {}", st.cfg.call_str, st.cfg.grid_str);
@@ -3516,6 +3638,16 @@ fn main() -> ExitCode {
                                     parity: None,
                                 });
                                 tui.set_toast(format!("Queued CQ for next TX slot: {summary}"));
+                            }
+                        }
+                        Key::Char('v') => {
+                            let mut st = state.lock().unwrap();
+                            st.rendezvous = !st.rendezvous;
+                            if st.rendezvous {
+                                st.auto_cq = false;
+                                tui.set_toast("Rendezvous ON (hourly 10m/12m/15m/17m + 50/50 turns)");
+                            } else {
+                                tui.set_toast("Rendezvous OFF");
                             }
                         }
                         Key::Char('a') => {
