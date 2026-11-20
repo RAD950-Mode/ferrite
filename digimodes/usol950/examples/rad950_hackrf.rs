@@ -167,6 +167,9 @@ struct NodeConfig {
     dry_tx: bool,
     serial: Option<String>,
     log_path: String,
+    spot_enabled: bool,
+    spot_url: String,
+    spot_key: String,
 }
 
 fn ppm_offset_hz(dial_hz: u64, ppm: f64) -> i64 {
@@ -267,6 +270,8 @@ struct SharedState {
     slots_rx: u64,
     slots_tx: u64,
     frames_rx: u64,
+    spots_sent: u64,
+    spots_err: u64,
     cal_request: Option<CalMode>,
     cal_running: bool,
     cal_status: String,
@@ -358,6 +363,9 @@ fn usage() {
     eprintln!("  --dry-tx                  Dry TX safety mode (synthesize without keying HackRF)");
     eprintln!("  --rendezvous              Enable hourly UTC Rendezvous band-hopping & 50/50 turn cadence");
     eprintln!("  --auto-answer <MODE>      Attended Hunter auto-answer: off, new-grid, new-band, or any");
+    eprintln!("  --spot                    Enable live spotting to POST /api/spots (requires --spot-key or RAD950_SPOT_KEY)");
+    eprintln!("  --spot-url <URL>          Spots API URL (default: https://rad950.com/api/spots or RAD950_SPOT_URL)");
+    eprintln!("  --spot-key <KEY>          Personal r950_... Bearer skimmer API key (or RAD950_SPOT_KEY)");
     eprintln!("  --tx-once                 Transmit a single CQ immediately and exit (for bench/OTA tests)");
     eprintln!("  --log <PATH>              QSO log file path (default: rad950_hackrf.log)");
     eprintln!("  --slot-offset-ms <MS>     Shift 10 s slot clock by signed ms (for indoor non-GPS bench sync)");
@@ -983,6 +991,90 @@ fn append_qso_log(path: &str, entry: &QsoLogEntry) {
     }
 }
 
+fn json_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            c if (c as u32) < 0x20 => {}
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+fn mask_spot_key(k: &str) -> String {
+    let t = k.trim();
+    if t.is_empty() {
+        return "(not set)".to_string();
+    }
+    if t.len() <= 10 {
+        return "••••••••".to_string();
+    }
+    format!("{}••••{}", &t[..5], &t[t.len() - 4..])
+}
+
+/// Non-blocking batch upload to `POST /api/spots` (`rad950-web/src/spots.ts`) via `curl`,
+/// using `Authorization: Bearer <skimmer_key>`. Runs on a short-lived background thread so
+/// network latency never stalls the 10-second RF slot loop.
+fn post_spots_async(
+    state: Arc<Mutex<SharedState>>,
+    url: String,
+    api_key: String,
+    payload: String,
+    count: usize,
+) {
+    thread::spawn(move || {
+        let auth = format!("Authorization: Bearer {}", api_key.trim());
+        let res = Command::new("curl")
+            .args([
+                "-sS",
+                "--max-time",
+                "6",
+                "-w",
+                "\n%{http_code}",
+                "-X",
+                "POST",
+                "-H",
+                "Content-Type: application/json",
+                "-H",
+                &auth,
+                "-d",
+                &payload,
+                url.trim(),
+            ])
+            .stdin(Stdio::null())
+            .output();
+        let ts = format_utc_hms(utc_now_ms() / 1000);
+        let mut st = state.lock().unwrap();
+        match res {
+            Ok(out) => {
+                let body = String::from_utf8_lossy(&out.stdout);
+                let code = body.lines().last().unwrap_or("").trim();
+                if out.status.success() && code.starts_with('2') {
+                    st.spots_sent += count as u64;
+                    st.push_event(format!("[{ts}] SPOT uploaded {count} spot(s) (HTTP {code})"));
+                } else {
+                    st.spots_err += 1;
+                    let err_msg = if !out.stderr.is_empty() {
+                        String::from_utf8_lossy(&out.stderr).trim().to_string()
+                    } else {
+                        body.lines().next().unwrap_or("request failed").trim().to_string()
+                    };
+                    st.push_event(format!("[{ts}] SPOT failed (HTTP {code}): {}", trunc(&err_msg, 64)));
+                }
+            }
+            Err(e) => {
+                st.spots_err += 1;
+                st.push_event(format!("[{ts}] SPOT curl error: {e}"));
+            }
+        }
+    });
+}
+
 fn handle_decoded(state: &Arc<Mutex<SharedState>>, slot: u64, frames: &[Decoded]) {
     let mut st = state.lock().unwrap();
     let my_call = st.cfg.call;
@@ -1212,6 +1304,79 @@ fn handle_decoded(state: &Arc<Mutex<SharedState>>, slot: u64, frames: &[Decoded]
                 format_utc_hms(utc_sec),
                 if target_parity == 0 { "even" } else { "odd" }
             ));
+        }
+    }
+
+    // Live Spotting (`POST /api/spots`, rad950-web/src/spots.ts): batch all non-self-base-call
+    // CQ / RX / R+RX decodes from this slot and upload asynchronously via Bearer key.
+    if st.cfg.spot_enabled && !st.cfg.spot_key.trim().is_empty() {
+        let spotter_call = st.cfg.call_str.clone();
+        let spotter_grid = if st.cfg.grid_str.len() == 4 && st.cfg.grid_str != "----" {
+            Some(st.cfg.grid_str.clone())
+        } else {
+            None
+        };
+        let band = band_name(dial_hz);
+        let mut items = Vec::new();
+        for d in frames {
+            let (tx_call, tx_grid, tx_pwr_code, frame_type) = match d.frame {
+                Frame::Cq {
+                    sender,
+                    grid4,
+                    tx_pwr,
+                    reserved,
+                } => {
+                    if sender == my_call {
+                        continue;
+                    }
+                    let suf = (reserved & 0x0F) as u8;
+                    let g = format_grid(grid4);
+                    let g_opt = if g.len() == 4 && g != "----" { Some(g) } else { None };
+                    let pwr_opt = if tx_pwr > 0 { Some(tx_pwr) } else { None };
+                    (format_call_with_suffix(sender, suf), g_opt, pwr_opt, "CQ")
+                }
+                Frame::Rx { sender, ack, .. } => {
+                    if sender == my_call {
+                        continue;
+                    }
+                    let known_grid = st
+                        .heard
+                        .iter()
+                        .find(|h| h.call == sender && h.grid_str.len() == 4 && h.grid_str != "----")
+                        .map(|h| h.grid_str.clone());
+                    (format_call(sender), known_grid, None, if ack { "R+RX" } else { "RX" })
+                }
+                Frame::ExtFrag { .. } => continue,
+            };
+            let freq_hz = dial_hz + d.audio_hz as u64;
+            let mut obj = format!(
+                "{{\"spotter_call\":\"{}\"",
+                json_escape(&spotter_call)
+            );
+            if let Some(ref sg) = spotter_grid {
+                obj.push_str(&format!(",\"spotter_grid\":\"{}\"", json_escape(sg)));
+            }
+            obj.push_str(&format!(",\"tx_call\":\"{}\"", json_escape(&tx_call)));
+            if let Some(ref tg) = tx_grid {
+                obj.push_str(&format!(",\"tx_grid\":\"{}\"", json_escape(tg)));
+            }
+            obj.push_str(&format!(
+                ",\"utc_sec\":{},\"freq_hz\":{},\"band\":\"{}\",\"snr_db\":{},\"frame_type\":\"{}\"",
+                utc_sec, freq_hz, band, d.snr_db, frame_type
+            ));
+            if let Some(pwr) = tx_pwr_code {
+                obj.push_str(&format!(",\"tx_pwr_code\":{pwr}"));
+            }
+            obj.push('}');
+            items.push(obj);
+        }
+        if !items.is_empty() {
+            let count = items.len();
+            let payload = format!("{{\"spots\":[{}]}}", items.join(","));
+            let url = st.cfg.spot_url.clone();
+            let key = st.cfg.spot_key.clone();
+            drop(st);
+            post_spots_async(Arc::clone(state), url, key, payload, count);
         }
     }
 }
@@ -2682,7 +2847,7 @@ impl TuiState {
     }
 }
 
-const SETTINGS_COUNT: usize = 13;
+const SETTINGS_COUNT: usize = 16;
 
 fn render_tui(state: &Arc<Mutex<SharedState>>, tui: &TuiState) {
     let (cols, rows) = term_size();
@@ -2712,6 +2877,15 @@ fn render_tui(state: &Arc<Mutex<SharedState>>, tui: &TuiState) {
     } else {
         String::new()
     };
+    let spot_badge = if st.cfg.spot_enabled {
+        if st.cfg.spot_key.trim().is_empty() {
+            "\x1b[1;30;43m SPOT:NOKEY \x1b[0;1;37;44m"
+        } else {
+            "\x1b[1;30;42m SPOT \x1b[0;1;37;44m"
+        }
+    } else {
+        ""
+    };
     let header = format!(
         " RAD950 HackRF  |  {} [{}]  |  {:.3} MHz ({})  |  Subch {} ({} Hz)  |  {} ",
         st.cfg.call_str,
@@ -2722,7 +2896,7 @@ fn render_tui(state: &Arc<Mutex<SharedState>>, tui: &TuiState) {
         SUBCHANNELS_HZ[st.cfg.subch],
         format_utc_hms(now_ms / 1000)
     );
-    buf.push_str(&format!("\x1b[1;37;44m{header}{tx_badge}{cq_badge}{hunt_badge}\x1b[K\x1b[0m\r\n"));
+    buf.push_str(&format!("\x1b[1;37;44m{header}{tx_badge}{cq_badge}{hunt_badge}{spot_badge}\x1b[K\x1b[0m\r\n"));
 
     // 2. Slot progress bar + Audio Peak
     let (phase_col, phase_lbl) = match st.phase {
@@ -2761,8 +2935,17 @@ fn render_tui(state: &Arc<Mutex<SharedState>>, tui: &TuiState) {
             format!("\x1b[2m {name} \x1b[0m")
         }
     };
+    let spot_stat = if st.cfg.spot_enabled || st.spots_sent > 0 || st.spots_err > 0 {
+        if st.spots_err > 0 {
+            format!(" Spot:{}(!{})", st.spots_sent, st.spots_err)
+        } else {
+            format!(" Spot:{}", st.spots_sent)
+        }
+    } else {
+        String::new()
+    };
     buf.push_str(&format!(
-        " {} {} {} {}   \x1b[2m{} | RX:{} TX:{} Dec:{} QSO:{}\x1b[0m\x1b[K\r\n",
+        " {} {} {} {}   \x1b[2m{} | RX:{} TX:{} Dec:{} QSO:{}{spot_stat}\x1b[0m\x1b[K\r\n",
         tab(View::Operate, "1:Operate"),
         tab(View::Settings, "2:Settings"),
         tab(View::Log, "3:QSO Log"),
@@ -2968,6 +3151,25 @@ fn render_tui(state: &Arc<Mutex<SharedState>>, tui: &TuiState) {
                     if st.cq_parity == 0 { "Even slots".into() } else { "Odd slots".into() },
                     "←/→ toggle even/odd 10s slot",
                 ),
+                (
+                    "Live Spotting",
+                    if st.cfg.spot_enabled {
+                        format!("ON (sent {}, err {})", st.spots_sent, st.spots_err)
+                    } else {
+                        "OFF".into()
+                    },
+                    "←/→ or Enter to toggle POST /api/spots",
+                ),
+                (
+                    "Spots API URL",
+                    trunc(&st.cfg.spot_url, 24),
+                    "Enter to edit endpoint URL",
+                ),
+                (
+                    "Spots API Key",
+                    mask_spot_key(&st.cfg.spot_key),
+                    "Enter to paste r950_... Bearer key",
+                ),
             ];
 
             for i in 0..body_rows.saturating_sub(1) {
@@ -3159,6 +3361,16 @@ fn adjust_setting(state: &Arc<Mutex<SharedState>>, tui: &mut TuiState, delta: i3
         }
         11 => st.auto_qso = !st.auto_qso,
         12 => st.cq_parity = 1 - st.cq_parity,
+        13 => {
+            st.cfg.spot_enabled = !st.cfg.spot_enabled;
+            if st.cfg.spot_enabled && st.cfg.spot_key.trim().is_empty() {
+                tui.set_toast("Live Spotting ON — set Spots API Key (row 16) to upload");
+            } else if st.cfg.spot_enabled {
+                tui.set_toast(format!("Live Spotting ON -> {}", st.cfg.spot_url));
+            } else {
+                tui.set_toast("Live Spotting OFF");
+            }
+        }
         _ => {}
     }
 }
@@ -3198,6 +3410,23 @@ fn commit_edit(state: &Arc<Mutex<SharedState>>, tui: &mut TuiState, text: String
             }
             _ => tui.set_toast("Invalid ppm (enter -200.0 .. +200.0)"),
         },
+        14 => {
+            let trimmed = text.trim().to_string();
+            if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+                st.cfg.spot_url = trimmed;
+                tui.set_toast(format!("Spots API URL set to {}", st.cfg.spot_url));
+            } else {
+                tui.set_toast("Invalid URL (must start with https:// or http://)");
+            }
+        }
+        15 => {
+            st.cfg.spot_key = text.trim().to_string();
+            if st.cfg.spot_key.is_empty() {
+                tui.set_toast("Spots API Key cleared");
+            } else {
+                tui.set_toast(format!("Spots API Key set ({})", mask_spot_key(&st.cfg.spot_key)));
+            }
+        }
         _ => {}
     }
 }
@@ -3284,6 +3513,12 @@ fn main() -> ExitCode {
     let mut dry_tx = false;
     let mut rendezvous = false;
     let mut auto_answer = AutoAnswer::Off;
+    let mut spot_enabled = false;
+    let mut spot_url = env::var("RAD950_SPOT_URL")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "https://rad950.com/api/spots".to_string());
+    let mut spot_key = env::var("RAD950_SPOT_KEY").unwrap_or_default();
     let mut tx_once = false;
     let mut rx_once = false;
     let mut tx_reply: Option<(String, i8, bool)> = None;
@@ -3327,6 +3562,15 @@ fn main() -> ExitCode {
                         return ExitCode::from(2);
                     }
                 }
+            }
+            "--spot" => spot_enabled = true,
+            "--spot-url" if i + 1 < args.len() => {
+                i += 1;
+                spot_url = args[i].clone();
+            }
+            "--spot-key" if i + 1 < args.len() => {
+                i += 1;
+                spot_key = args[i].clone();
             }
             "--tx-once" => tx_once = true,
             "--rx-once" => rx_once = true,
@@ -3462,6 +3706,9 @@ fn main() -> ExitCode {
         dry_tx,
         serial,
         log_path,
+        spot_enabled,
+        spot_url,
+        spot_key,
     };
 
     let (worked_calls, worked_grids_all, worked_grids_band) = load_existing_log(&cfg.log_path);
@@ -3489,6 +3736,8 @@ fn main() -> ExitCode {
         slots_rx: 0,
         slots_tx: 0,
         frames_rx: 0,
+        spots_sent: 0,
+        spots_err: 0,
         cal_request: None,
         cal_running: false,
         cal_status: "Idle — press [r] Auto, [e] LTE GPS, [t] ATSC TV, [w] WWV/CHU, [m] AM BCB, or [f] Custom Hz".to_string(),
@@ -3673,8 +3922,13 @@ fn main() -> ExitCode {
                         ed.pop();
                         tui.editing = Some(ed);
                     }
-                    Key::Char(c) if ed.len() < 12 => {
-                        ed.push(c.to_ascii_uppercase());
+                    Key::Char(c) => {
+                        let case_sensitive =
+                            tui.view == View::Settings && matches!(tui.set_sel, 14 | 15);
+                        let max_len = if case_sensitive { 96 } else { 12 };
+                        if ed.len() < max_len {
+                            ed.push(if case_sensitive { c } else { c.to_ascii_uppercase() });
+                        }
                         tui.editing = Some(ed);
                     }
                     Key::CtrlC => {
@@ -3835,6 +4089,8 @@ fn main() -> ExitCode {
                                 1 => tui.editing = Some(st.cfg.grid_str.clone()),
                                 3 => tui.editing = Some(st.cfg.dial_hz.to_string()),
                                 4 => tui.editing = Some(format!("{:.1}", st.cfg.ppm)),
+                                14 => tui.editing = Some(st.cfg.spot_url.clone()),
+                                15 => tui.editing = Some(st.cfg.spot_key.clone()),
                                 _ => {
                                     drop(st);
                                     adjust_setting(&state, &mut tui, 1);
