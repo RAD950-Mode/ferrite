@@ -60,6 +60,7 @@ enum View {
     Operate,
     Settings,
     Log,
+    Calibrate,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -68,6 +69,27 @@ enum SlotPhase {
     Rx,
     Tx,
     DryTx,
+    Calibrating,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CalMode {
+    Auto,
+    WwvOnly,
+    AmBcb,
+    Custom(u64),
+}
+
+#[derive(Clone)]
+struct CalHit {
+    label: String,
+    nominal_hz: u64,
+    offset_hz: f64,
+    ppm: f64,
+    snr_db: f64,
+    atomic: bool,
+    birdie: bool,
+    peak_pct: f32,
 }
 
 #[derive(Clone)]
@@ -181,6 +203,11 @@ struct SharedState {
     slots_rx: u64,
     slots_tx: u64,
     frames_rx: u64,
+    cal_request: Option<CalMode>,
+    cal_running: bool,
+    cal_status: String,
+    cal_hits: Vec<CalHit>,
+    cal_recommended: Option<(f64, String)>,
 }
 
 impl SharedState {
@@ -268,6 +295,10 @@ fn usage() {
     eprintln!("  --tx-once                 Transmit a single CQ immediately and exit (for bench/OTA tests)");
     eprintln!("  --log <PATH>              QSO log file path (default: rad950_hackrf.log)");
     eprintln!("  --slot-offset-ms <MS>     Shift 10 s slot clock by signed ms (for indoor non-GPS bench sync)");
+    eprintln!("  --calibrate               Auto self-calibrate ppm via WWV/CHU + AM broadcast carriers and exit");
+    eprintln!("  --cal-wwv                 Probe WWV/CHU atomic HF carriers only and exit");
+    eprintln!("  --cal-am                  Scan AM broadcast band (540-1700 kHz, 10 kHz grid) and exit");
+    eprintln!("  --cal-freq <HZ>           Probe a single known carrier frequency in Hz and exit");
     eprintln!("  --loopback                Run offline TX->2.4MS/s cs8->RX DDC->Decoder self-test");
     eprintln!("  -h, --help                Show this help");
 }
@@ -972,11 +1003,531 @@ fn handle_decoded(state: &Arc<Mutex<SharedState>>, slot: u64, frames: &[Decoded]
     }
 }
 
+/// Atomic HF time-standard reference carriers (WWV/WWVH + CHU).
+const WWV_REFS: &[(&str, u64)] = &[
+    ("WWV 10.000 MHz", 10_000_000),
+    ("WWV 15.000 MHz", 15_000_000),
+    ("WWV  5.000 MHz", 5_000_000),
+    ("WWV 20.000 MHz", 20_000_000),
+    ("CHU  7.850 MHz", 7_850_000),
+    ("CHU 14.670 MHz", 14_670_000),
+];
+
+/// In-place radix-2 Cooley-Tukey complex FFT (`re.len() == im.len()`, power of two).
+fn fft_complex(re: &mut [f64], im: &mut [f64]) {
+    let n = re.len();
+    let mut j = 0usize;
+    for i in 1..n {
+        let mut bit = n >> 1;
+        while j & bit != 0 {
+            j ^= bit;
+            bit >>= 1;
+        }
+        j ^= bit;
+        if i < j {
+            re.swap(i, j);
+            im.swap(i, j);
+        }
+    }
+    let mut len = 2usize;
+    while len <= n {
+        let ang = -2.0 * std::f64::consts::PI / (len as f64);
+        let wlen_r = ang.cos();
+        let wlen_i = ang.sin();
+        let half = len >> 1;
+        let mut i = 0usize;
+        while i < n {
+            let (mut wr, mut wi) = (1.0f64, 0.0f64);
+            for k in 0..half {
+                let u_r = re[i + k];
+                let u_i = im[i + k];
+                let v_r = re[i + k + half] * wr - im[i + k + half] * wi;
+                let v_i = re[i + k + half] * wi + im[i + k + half] * wr;
+                re[i + k] = u_r + v_r;
+                im[i + k] = u_i + v_i;
+                re[i + k + half] = u_r - v_r;
+                im[i + k + half] = u_i - v_i;
+                let nwr = wr * wlen_r - wi * wlen_i;
+                wi = wr * wlen_i + wi * wlen_r;
+                wr = nwr;
+            }
+            i += len;
+        }
+        len <<= 1;
+    }
+}
+
+/// Capture `n_samples` raw `cs8` IQ samples from HackRF One at `center_hz` (`2.4 MS/s`).
+fn capture_hackrf_cs8(
+    serial: Option<&str>,
+    center_hz: u64,
+    n_samples: u64,
+    lna_db: u8,
+    vga_db: u8,
+    amp: bool,
+) -> Result<Vec<u8>, String> {
+    let mut cmd = Command::new("hackrf_transfer");
+    cmd.args([
+        "-r",
+        "-",
+        "-f",
+        &center_hz.to_string(),
+        "-s",
+        &HACKRF_FS.to_string(),
+        "-n",
+        &n_samples.to_string(),
+        "-a",
+        if amp { "1" } else { "0" },
+        "-p",
+        "0",
+        "-l",
+        &lna_db.to_string(),
+        "-g",
+        &vga_db.to_string(),
+    ]);
+    if let Some(ser) = serial {
+        cmd.args(["-d", ser]);
+    }
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("failed to spawn hackrf_transfer: {e}"))?;
+    let mut stdout = child.stdout.take().ok_or("no stdout from hackrf_transfer")?;
+
+    let want_bytes = (n_samples as usize) * 2;
+    let mut raw = Vec::with_capacity(want_bytes);
+    let mut buf = [0u8; 65_536];
+    loop {
+        match stdout.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                let take = n.min(want_bytes.saturating_sub(raw.len()));
+                raw.extend_from_slice(&buf[..take]);
+                if raw.len() >= want_bytes {
+                    break;
+                }
+            }
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(format!("hackrf_transfer read error: {e}")),
+        }
+    }
+    let out = child.wait_with_output();
+    if raw.len() < 8192 * 400 * 2 {
+        let err = out
+            .map(|o| String::from_utf8_lossy(&o.stderr).trim().to_string())
+            .unwrap_or_default();
+        return Err(format!("short HackRF capture ({} bytes): {err}", raw.len()));
+    }
+    Ok(raw)
+}
+
+/// Demodulate a target carrier at `target_hz` from a `2.4 MS/s` `cs8` capture centered at `center_hz`,
+/// returning `(offset_hz, snr_db, sideband_snr_db, peak_pct)`.
+///
+/// Sign convention: `offset_hz = measured_hz - target_hz` (positive when HackRF LO is low, matching `cfg.ppm`).
+fn measure_carrier_iq(
+    cs8: &[u8],
+    center_hz: u64,
+    target_hz: u64,
+    max_ppm: f64,
+) -> Option<(f64, f64, f64, f32)> {
+    const DECIM: usize = 400; // 2.4 MS/s -> 6,000 Hz complex baseband (±3 kHz)
+    const FFT_N: usize = 8192; // 6000 / 8192 = 0.7324 Hz/bin (~1.365 s)
+    let need_samples = DECIM * FFT_N;
+    if cs8.len() < need_samples * 2 {
+        return None;
+    }
+
+    let shift_hz = target_hz as f64 - center_hz as f64;
+    let dphi = -2.0 * std::f64::consts::PI * shift_hz / (HACKRF_FS as f64);
+    let step_r = dphi.cos();
+    let step_i = dphi.sin();
+
+    let mut re = vec![0.0f64; FFT_N];
+    let mut im = vec![0.0f64; FFT_N];
+    let (mut lo_r, mut lo_i) = (1.0f64, 0.0f64);
+    let mut max_abs = 0i32;
+
+    for out_k in 0..FFT_N {
+        let base = out_k * DECIM * 2;
+        let (mut acc_r, mut acc_i) = (0.0f64, 0.0f64);
+        for m in 0..DECIM {
+            let si = cs8[base + 2 * m] as i8;
+            let sq = cs8[base + 2 * m + 1] as i8;
+            max_abs = max_abs.max((si as i32).abs()).max((sq as i32).abs());
+            let xi = si as f64;
+            let xq = sq as f64;
+            acc_r += xi * lo_r - xq * lo_i;
+            acc_i += xi * lo_i + xq * lo_r;
+            let nr = lo_r * step_r - lo_i * step_i;
+            lo_i = lo_r * step_i + lo_i * step_r;
+            lo_r = nr;
+        }
+        // Renormalize oscillator every block to prevent floating-point drift.
+        let mag = (lo_r * lo_r + lo_i * lo_i).sqrt();
+        if mag > 0.0 {
+            lo_r /= mag;
+            lo_i /= mag;
+        }
+        let w = 0.5 * (1.0 - (2.0 * std::f64::consts::PI * out_k as f64 / (FFT_N as f64)).cos());
+        re[out_k] = acc_r * w;
+        im[out_k] = acc_i * w;
+    }
+
+    fft_complex(&mut re, &mut im);
+
+    let fs_bb = HACKRF_FS as f64 / DECIM as f64; // 6000.0 Hz
+    let bin_hz = fs_bb / FFT_N as f64;
+    let search_hz = (target_hz as f64 * max_ppm / 1_000_000.0).clamp(150.0, 2600.0);
+    let search_bins = (search_hz / bin_hz).ceil() as isize;
+
+    let mut pwr = vec![0.0f64; FFT_N];
+    for k in 0..FFT_N {
+        pwr[k] = re[k] * re[k] + im[k] * im[k];
+    }
+
+    let mut best_signed = 0isize;
+    let mut best_p = -1.0f64;
+    for s in -search_bins..=search_bins {
+        let idx = s.rem_euclid(FFT_N as isize) as usize;
+        if pwr[idx] > best_p {
+            best_p = pwr[idx];
+            best_signed = s;
+        }
+    }
+
+    // Parabolic interpolation in log-power around the peak bin for sub-0.05 Hz accuracy.
+    let idx_m = (best_signed - 1).rem_euclid(FFT_N as isize) as usize;
+    let idx_0 = best_signed.rem_euclid(FFT_N as isize) as usize;
+    let idx_p = (best_signed + 1).rem_euclid(FFT_N as isize) as usize;
+    let ym = pwr[idx_m].max(1e-12).ln();
+    let y0 = pwr[idx_0].max(1e-12).ln();
+    let yp = pwr[idx_p].max(1e-12).ln();
+    let denom = ym - 2.0 * y0 + yp;
+    let delta = if denom.abs() > 1e-12 {
+        (0.5 * (ym - yp) / denom).clamp(-0.5, 0.5)
+    } else {
+        0.0
+    };
+    let offset_hz = (best_signed as f64 + delta) * bin_hz;
+
+    // Median noise floor across search window excluding ±40 Hz around peak.
+    let excl_bins = (40.0 / bin_hz).ceil() as isize;
+    let mut noise_bins = Vec::new();
+    for s in -search_bins..=search_bins {
+        if (s - best_signed).abs() > excl_bins {
+            let idx = s.rem_euclid(FFT_N as isize) as usize;
+            noise_bins.push(pwr[idx]);
+        }
+    }
+    if noise_bins.is_empty() {
+        return None;
+    }
+    noise_bins.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let median_noise = noise_bins[noise_bins.len() / 2].max(1e-12);
+    let snr_db = 10.0 * (best_p / median_noise).log10();
+
+    // Check AM/WWV audio sideband energy (±100 Hz BCD, ±500/600 Hz tones, ±1000 Hz ticks)
+    // to distinguish real off-air WWV from unmodulated internal HackRF 5/10/20 MHz clock birdies.
+    let mut sb_peak = 0.0f64;
+    for &(f_lo, f_hi) in &[(90.0f64, 115.0), (485.0, 615.0), (985.0, 1015.0)] {
+        let b_lo = (f_lo / bin_hz).floor() as isize;
+        let b_hi = (f_hi / bin_hz).ceil() as isize;
+        for sign in [-1isize, 1] {
+            for db in b_lo..=b_hi {
+                let idx = (best_signed + sign * db).rem_euclid(FFT_N as isize) as usize;
+                sb_peak = sb_peak.max(pwr[idx]);
+            }
+        }
+    }
+    let sideband_snr_db = 10.0 * (sb_peak / median_noise).log10();
+    let peak_pct = (max_abs as f32 / 127.0) * 100.0;
+    Some((offset_hz, snr_db, sideband_snr_db, peak_pct))
+}
+
+fn probe_single_carrier(
+    cfg: &NodeConfig,
+    label: &str,
+    target_hz: u64,
+    atomic: bool,
+) -> Result<CalHit, String> {
+    let center_hz = target_hz.saturating_sub(RF_OFFSET_HZ as u64).max(1_000_000);
+    let n_samples: u64 = 400 * 8192 + 48_000; // ~1.39 s
+    let cs8 = capture_hackrf_cs8(cfg.serial.as_deref(), center_hz, n_samples, 32, 32, cfg.amp)?;
+    let (offset_hz, snr_db, sb_snr_db, peak_pct) =
+        measure_carrier_iq(&cs8, center_hz, target_hz, 120.0).ok_or("carrier measurement failed")?;
+    let ppm = (offset_hz / target_hz as f64) * 1_000_000.0;
+    // HackRF internal 10/20 MHz clock harmonics land on 5 MHz multiples near ~0 ppm as pure unmodulated CW
+    // (sidebands > 32 dB below carrier), whereas real off-air WWV carries 100/500/600/1000 Hz AM modulation.
+    let is_5mhz_mult = target_hz.is_multiple_of(5_000_000);
+    let birdie = atomic && is_5mhz_mult && snr_db > 28.0 && ppm.abs() < 1.5 && (snr_db - sb_snr_db) > 32.0;
+    Ok(CalHit {
+        label: label.to_string(),
+        nominal_hz: target_hz,
+        offset_hz,
+        ppm,
+        snr_db,
+        atomic,
+        birdie,
+        peak_pct,
+    })
+}
+
+/// Single 1.4 s wideband capture across the entire AM broadcast band (540–1700 kHz, 10 kHz US grid),
+/// centered 5 kHz off-grid (`1,355 kHz`) so no channel lands on HackRF DC.
+fn scan_am_bcb(cfg: &NodeConfig) -> Result<Vec<CalHit>, String> {
+    let center_hz: u64 = 1_355_000;
+    let n_samples: u64 = 400 * 8192 + 48_000; // ~1.39 s
+    // Start with modest gain to avoid 8-bit ADC clipping on strong local AM stations; step down if needed.
+    let mut cs8 = capture_hackrf_cs8(cfg.serial.as_deref(), center_hz, n_samples, 8, 16, false)?;
+    let max_abs = cs8.iter().map(|&b| (b as i8 as i32).abs()).max().unwrap_or(0);
+    if max_abs >= 115 {
+        cs8 = capture_hackrf_cs8(cfg.serial.as_deref(), center_hz, n_samples, 0, 8, false)?;
+    }
+
+    // Coarse 4096-point Welch PSD across 2.4 MHz (586 Hz/bin) to rank all 10 kHz AM channels quickly.
+    const W_N: usize = 4096;
+    let mut psd = vec![0.0f64; W_N];
+    let frames = (cs8.len() / (W_N * 2)).min(32);
+    let mut re = vec![0.0f64; W_N];
+    let mut im = vec![0.0f64; W_N];
+    for f in 0..frames {
+        let base = f * W_N * 2;
+        for k in 0..W_N {
+            let w = 0.5 * (1.0 - (2.0 * std::f64::consts::PI * k as f64 / W_N as f64).cos());
+            re[k] = (cs8[base + 2 * k] as i8 as f64) * w;
+            im[k] = (cs8[base + 2 * k + 1] as i8 as f64) * w;
+        }
+        fft_complex(&mut re, &mut im);
+        for k in 0..W_N {
+            psd[k] += re[k] * re[k] + im[k] * im[k];
+        }
+    }
+
+    let bin_hz = HACKRF_FS as f64 / W_N as f64;
+    let mut candidates: Vec<(u64, f64)> = Vec::new();
+    let mut f_khz = 540u64;
+    while f_khz <= 1700 {
+        let f_hz = f_khz * 1000;
+        // Skip channels near DC (1355 kHz) and exact 200 kHz clock multiples.
+        if f_hz.abs_diff(center_hz) >= 15_000 && !f_khz.is_multiple_of(200) {
+            let rel = f_hz as f64 - center_hz as f64;
+            let b0 = (rel / bin_hz).round() as isize;
+            let mut peak = 0.0f64;
+            for db in -1..=1 {
+                let idx = (b0 + db).rem_euclid(W_N as isize) as usize;
+                peak = peak.max(psd[idx]);
+            }
+            let mut side = 0.0f64;
+            for db in [-5isize, -4, 4, 5] {
+                let idx = (b0 + db).rem_euclid(W_N as isize) as usize;
+                side += psd[idx];
+            }
+            let ratio = peak / (side / 4.0).max(1e-12);
+            candidates.push((f_hz, ratio));
+        }
+        f_khz += 10;
+    }
+    candidates.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+    let mut hits = Vec::new();
+    for &(f_hz, _) in candidates.iter().take(12) {
+        if let Some((offset_hz, snr_db, _sb_snr, peak_pct)) = measure_carrier_iq(&cs8, center_hz, f_hz, 120.0) {
+            let ppm = (offset_hz / f_hz as f64) * 1_000_000.0;
+            hits.push(CalHit {
+                label: format!("AM {:>4} kHz", f_hz / 1000),
+                nominal_hz: f_hz,
+                offset_hz,
+                ppm,
+                snr_db,
+                atomic: false,
+                birdie: false,
+                peak_pct,
+            });
+        }
+    }
+    hits.sort_by(|a, b| b.snr_db.partial_cmp(&a.snr_db).unwrap_or(std::cmp::Ordering::Equal));
+    Ok(hits)
+}
+
+fn summarize_calibration(hits: &[CalHit]) -> Option<(f64, String)> {
+    // Priority 1: atomic HF standards (WWV/WWVH/CHU) with SNR >= 14 dB and not flagged as internal clock birdies.
+    let mut atomic_good: Vec<&CalHit> = hits
+        .iter()
+        .filter(|h| h.atomic && !h.birdie && h.snr_db >= 14.0)
+        .collect();
+    atomic_good.sort_by(|a, b| b.snr_db.partial_cmp(&a.snr_db).unwrap_or(std::cmp::Ordering::Equal));
+    if let Some(best) = atomic_good.first() {
+        let cluster: Vec<&CalHit> = atomic_good
+            .iter()
+            .copied()
+            .filter(|h| (h.ppm - best.ppm).abs() <= 1.5)
+            .collect();
+        let wsum: f64 = cluster.iter().map(|h| h.snr_db.max(1.0)).sum();
+        let avg_ppm = cluster.iter().map(|h| h.ppm * h.snr_db.max(1.0)).sum::<f64>() / wsum;
+        let desc = if cluster.len() > 1 {
+            format!("{} + {} atomic refs (best {:.1} dB)", best.label, cluster.len() - 1, best.snr_db)
+        } else {
+            format!("{} (atomic, {:.1} dB)", best.label, best.snr_db)
+        };
+        return Some((avg_ppm, desc));
+    }
+
+    // Priority 2: single custom reference if present and SNR >= 14 dB.
+    if let Some(custom) = hits.iter().find(|h| h.label.starts_with("Custom") && h.snr_db >= 14.0) {
+        return Some((
+            custom.ppm,
+            format!("{} ({:.1} dB)", custom.label, custom.snr_db),
+        ));
+    }
+
+    // Priority 3: median across strong AM BCB carriers (SNR >= 18 dB) so any slightly off-freq station cancels out.
+    let mut am_good: Vec<&CalHit> = hits
+        .iter()
+        .filter(|h| !h.atomic && h.snr_db >= 18.0)
+        .take(7)
+        .collect();
+    if am_good.is_empty() {
+        return None;
+    }
+    am_good.sort_by(|a, b| a.ppm.partial_cmp(&b.ppm).unwrap_or(std::cmp::Ordering::Equal));
+    let med_ppm = am_good[am_good.len() / 2].ppm;
+    let agreeing = am_good.iter().filter(|h| (h.ppm - med_ppm).abs() <= 2.5).count();
+    let best_snr = am_good.iter().map(|h| h.snr_db).fold(0.0f64, f64::max);
+    Some((
+        med_ppm,
+        format!(
+            "AM BCB median ({agreeing}/{} stations within ±2.5 ppm, peak {:.1} dB)",
+            am_good.len(),
+            best_snr
+        ),
+    ))
+}
+
+fn run_calibration(mode: CalMode, state: &Arc<Mutex<SharedState>>) {
+    let cfg = {
+        let mut st = state.lock().unwrap();
+        st.cal_running = true;
+        st.cal_hits.clear();
+        st.cal_recommended = None;
+        st.phase = SlotPhase::Calibrating;
+        st.phase_note = "Frequency self-calibration...".to_string();
+        st.cal_status = "Starting calibration...".to_string();
+        st.cfg.clone()
+    };
+
+    let mut all_hits: Vec<CalHit> = Vec::new();
+
+    match mode {
+        CalMode::Auto | CalMode::WwvOnly => {
+            for &(label, freq_hz) in WWV_REFS {
+                if !state.lock().unwrap().running {
+                    break;
+                }
+                {
+                    let mut st = state.lock().unwrap();
+                    st.cal_status = format!("Probing {label}...");
+                    st.phase_note = st.cal_status.clone();
+                }
+                match probe_single_carrier(&cfg, label, freq_hz, true) {
+                    Ok(hit) => {
+                        all_hits.push(hit.clone());
+                        let mut st = state.lock().unwrap();
+                        st.cal_hits.push(hit);
+                    }
+                    Err(e) => {
+                        state.lock().unwrap().cal_status = format!("{label} error: {e}");
+                    }
+                }
+            }
+            if mode == CalMode::Auto && state.lock().unwrap().running {
+                {
+                    let mut st = state.lock().unwrap();
+                    st.cal_status = "Scanning AM broadcast band (540–1700 kHz, 10 kHz grid)...".to_string();
+                    st.phase_note = st.cal_status.clone();
+                }
+                match scan_am_bcb(&cfg) {
+                    Ok(am_hits) => {
+                        all_hits.extend(am_hits.iter().cloned());
+                        state.lock().unwrap().cal_hits.extend(am_hits);
+                    }
+                    Err(e) => {
+                        state.lock().unwrap().cal_status = format!("AM BCB scan error: {e}");
+                    }
+                }
+            }
+        }
+        CalMode::AmBcb => {
+            {
+                let mut st = state.lock().unwrap();
+                st.cal_status = "Scanning AM broadcast band (540–1700 kHz, 10 kHz grid)...".to_string();
+                st.phase_note = st.cal_status.clone();
+            }
+            match scan_am_bcb(&cfg) {
+                Ok(am_hits) => {
+                    all_hits.extend(am_hits.iter().cloned());
+                    state.lock().unwrap().cal_hits.extend(am_hits);
+                }
+                Err(e) => {
+                    state.lock().unwrap().cal_status = format!("AM BCB scan error: {e}");
+                }
+            }
+        }
+        CalMode::Custom(freq_hz) => {
+            let label = format!("Custom {:.6} MHz", freq_hz as f64 / 1e6);
+            {
+                let mut st = state.lock().unwrap();
+                st.cal_status = format!("Probing {label}...");
+                st.phase_note = st.cal_status.clone();
+            }
+            match probe_single_carrier(&cfg, &label, freq_hz, false) {
+                Ok(hit) => {
+                    all_hits.push(hit.clone());
+                    state.lock().unwrap().cal_hits.push(hit);
+                }
+                Err(e) => {
+                    state.lock().unwrap().cal_status = format!("Custom probe error: {e}");
+                }
+            }
+        }
+    }
+
+    // Sort results: strong hits first (atomic prioritized if >= 14 dB).
+    all_hits.sort_by(|a, b| b.snr_db.partial_cmp(&a.snr_db).unwrap_or(std::cmp::Ordering::Equal));
+    let rec = summarize_calibration(&all_hits);
+
+    let mut st = state.lock().unwrap();
+    st.cal_hits = all_hits;
+    st.cal_recommended = rec.clone();
+    st.cal_running = false;
+    st.phase = SlotPhase::Waiting;
+    match rec {
+        Some((ppm, why)) => {
+            st.cal_status = format!("Done — recommended {:+.2} ppm via {why} (press Enter to apply)", ppm);
+            st.push_event(format!(
+                "[{}] CAL recommended {:+.2} ppm ({why})",
+                format_utc_hms(utc_now_ms() / 1000),
+                ppm
+            ));
+        }
+        None => {
+            st.cal_status = "No strong reference carrier found (check antenna or try Custom freq [f])".to_string();
+        }
+    }
+}
+
 fn slot_worker(state: Arc<Mutex<SharedState>>) {
     let mut last_tx_slot: Option<u64> = None;
     loop {
         if !state.lock().unwrap().running {
             break;
+        }
+        if let Some(mode) = state.lock().unwrap().cal_request.take() {
+            run_calibration(mode, &state);
+            continue;
         }
 
         let now_ms = utc_now_ms();
@@ -998,12 +1549,23 @@ fn slot_worker(state: Arc<Mutex<SharedState>>) {
             }
             let mut left = rem_ms - lead_ms;
             while left > 0 {
-                if !state.lock().unwrap().running {
+                let (running, has_cal) = {
+                    let st = state.lock().unwrap();
+                    (st.running, st.cal_request.is_some())
+                };
+                if !running {
                     return;
+                }
+                if has_cal {
+                    break;
                 }
                 let d = left.min(100);
                 thread::sleep(Duration::from_millis(d));
                 left -= d;
+            }
+            if let Some(mode) = state.lock().unwrap().cal_request.take() {
+                run_calibration(mode, &state);
+                continue;
             }
         }
 
@@ -1286,6 +1848,7 @@ fn render_tui(state: &Arc<Mutex<SharedState>>, tui: &TuiState) {
         SlotPhase::Rx => ("\x1b[32m", "RX    "),
         SlotPhase::Tx => ("\x1b[1;31m", "TX    "),
         SlotPhase::DryTx => ("\x1b[1;33m", "DRY-TX"),
+        SlotPhase::Calibrating => ("\x1b[1;35m", "CAL   "),
     };
     let bar_w = 26usize;
     let filled = ((slot_elapsed_ms as usize * bar_w) / 10_000).min(bar_w);
@@ -1317,11 +1880,12 @@ fn render_tui(state: &Arc<Mutex<SharedState>>, tui: &TuiState) {
         }
     };
     buf.push_str(&format!(
-        " {} {} {}   \x1b[2m{} | RX:{} TX:{} Dec:{} QSO:{}\x1b[0m\x1b[K\r\n",
+        " {} {} {} {}   \x1b[2m{} | RX:{} TX:{} Dec:{} QSO:{}\x1b[0m\x1b[K\r\n",
         tab(View::Operate, "1:Operate"),
         tab(View::Settings, "2:Settings"),
         tab(View::Log, "3:QSO Log"),
-        trunc(&st.hackrf_banner, cols.saturating_sub(58)),
+        tab(View::Calibrate, "4:Calibrate"),
+        trunc(&st.hackrf_banner, cols.saturating_sub(72)),
         st.slots_rx,
         st.slots_tx,
         st.frames_rx,
@@ -1580,6 +2144,69 @@ fn render_tui(state: &Arc<Mutex<SharedState>>, tui: &TuiState) {
                 }
             }
         }
+        View::Calibrate => {
+            buf.push_str(&format!(
+                "\x1b[1;36m FREQUENCY SELF-CALIBRATION — current: {:+.2} ppm ({:+} Hz on {:.3} MHz)\x1b[0m\x1b[K\r\n",
+                st.cfg.ppm,
+                ppm_offset_hz(st.cfg.dial_hz, st.cfg.ppm),
+                st.cfg.dial_hz as f64 / 1_000_000.0
+            ));
+            let status_col = if st.cal_running { "\x1b[1;35m" } else { "\x1b[1;33m" };
+            buf.push_str(&format!(
+                " Status: {status_col}{}\x1b[0m\x1b[K\r\n",
+                trunc(&st.cal_status, cols.saturating_sub(10))
+            ));
+            if let Some((rec_ppm, ref why)) = st.cal_recommended {
+                buf.push_str(&format!(
+                    " \x1b[1;32mRecommended: {:+.2} ppm\x1b[0m  ({})\x1b[K\r\n",
+                    rec_ppm,
+                    trunc(why, cols.saturating_sub(32))
+                ));
+            } else {
+                buf.push_str(" \x1b[2mPress [r] Auto (WWV/CHU + AM BCB), [w] WWV/CHU only, [m] AM BCB scan, or [f] Custom Hz\x1b[0m\x1b[K\r\n");
+            }
+            if let Some(ref ed) = tui.editing {
+                buf.push_str(&format!(
+                    " \x1b[1;33mCustom Reference Freq (Hz): {ed}_\x1b[0m  (Enter to probe, Esc to cancel)\x1b[K\r\n"
+                ));
+            } else {
+                buf.push_str(" \x1b[2mSource             Nominal       Offset       SNR      Implied ppm   ADC Peak\x1b[0m\x1b[K\r\n");
+            }
+            let max_show = body_rows.saturating_sub(4);
+            if st.cal_hits.is_empty() {
+                buf.push_str("   \x1b[2m(no reference measurements yet)\x1b[0m\x1b[K\r\n");
+                for _ in 1..max_show {
+                    buf.push_str("\x1b[K\r\n");
+                }
+            } else {
+                for i in 0..max_show {
+                    if let Some(h) = st.cal_hits.get(i) {
+                        let col = if h.birdie {
+                            "\x1b[2;33m"
+                        } else if h.atomic && h.snr_db >= 14.0 {
+                            "\x1b[1;32m"
+                        } else if !h.atomic && h.snr_db >= 18.0 {
+                            "\x1b[36m"
+                        } else {
+                            "\x1b[2m"
+                        };
+                        let note = if h.birdie { " [birdie?]" } else { "" };
+                        let row = format!(
+                            " {:<16}  {:>10.3} kHz  {:+7.2} Hz  {:5.1} dB  {:+8.2} ppm   {:4.0}%{note}",
+                            h.label,
+                            h.nominal_hz as f64 / 1000.0,
+                            h.offset_hz,
+                            h.snr_db,
+                            h.ppm,
+                            h.peak_pct
+                        );
+                        buf.push_str(&format!("{col}{}\x1b[0m\x1b[K\r\n", trunc(&row, cols)));
+                    } else {
+                        buf.push_str("\x1b[K\r\n");
+                    }
+                }
+            }
+        }
     }
 
     // Footer status/toast + key hints
@@ -1594,9 +2221,10 @@ fn render_tui(state: &Arc<Mutex<SharedState>>, tui: &TuiState) {
         buf.push_str("\x1b[K\r\n");
     }
     let hints = match tui.view {
-        View::Operate => " [c] CQ  [a] Auto-CQ  [Enter] Answer  [b] Band  [d] Dry-TX  [s] Settings  [l] Log  [q] Quit",
+        View::Operate => " [c] CQ  [a] Auto-CQ  [Enter] Answer  [b] Band  [d] Dry-TX  [s] Settings  [l] Log  [k] Cal  [q] Quit",
         View::Settings => " [↑/↓] Select  [←/→] Change  [Enter] Edit/Toggle  [Esc/1] Operate  [q] Quit",
-        View::Log => " [1/Esc] Operate  [2/s] Settings  [q] Quit",
+        View::Log => " [1/Esc] Operate  [2/s] Settings  [4/k] Cal  [q] Quit",
+        View::Calibrate => " [r] Auto WWV+AM  [w] WWV/CHU  [m] AM BCB  [f] Custom Hz  [Enter] Apply ppm  [1/Esc] Operate  [q] Quit",
     };
     buf.push_str(&format!("\x1b[7m{}\x1b[K\x1b[0m", trunc(hints, cols)));
 
@@ -1777,6 +2405,7 @@ fn main() -> ExitCode {
     let mut serial: Option<String> = None;
     let mut log_path = "rad950_hackrf.log".to_string();
     let mut loopback = false;
+    let mut cli_cal: Option<CalMode> = None;
 
     let mut i = 1;
     while i < args.len() {
@@ -1786,6 +2415,19 @@ fn main() -> ExitCode {
                 return ExitCode::SUCCESS;
             }
             "--loopback" => loopback = true,
+            "--calibrate" => cli_cal = Some(CalMode::Auto),
+            "--cal-wwv" => cli_cal = Some(CalMode::WwvOnly),
+            "--cal-am" => cli_cal = Some(CalMode::AmBcb),
+            "--cal-freq" if i + 1 < args.len() => {
+                i += 1;
+                match args[i].parse::<u64>() {
+                    Ok(f) if (500_000..=6_000_000_000).contains(&f) => cli_cal = Some(CalMode::Custom(f)),
+                    _ => {
+                        eprintln!("invalid --cal-freq (enter Hz, e.g. 10000000 or 1040000)");
+                        return ExitCode::from(2);
+                    }
+                }
+            }
             "--amp" => amp = true,
             "--dry-tx" => dry_tx = true,
             "--tx-once" => tx_once = true,
@@ -1946,7 +2588,48 @@ fn main() -> ExitCode {
         slots_rx: 0,
         slots_tx: 0,
         frames_rx: 0,
+        cal_request: None,
+        cal_running: false,
+        cal_status: "Idle — press [r] Auto (WWV/CHU + AM BCB), [w] WWV/CHU, [m] AM BCB, or [f] Custom Hz".to_string(),
+        cal_hits: Vec::new(),
+        cal_recommended: None,
     }));
+
+    if let Some(mode) = cli_cal {
+        println!("=== RAD950 HackRF Frequency Self-Calibration ===");
+        run_calibration(mode, &state);
+        let st = state.lock().unwrap();
+        println!(
+            "  {:<16}  {:>10}  {:>10}  {:>8}  {:>11}  {:>6}",
+            "Source", "Nominal", "Offset", "SNR", "Implied ppm", "Peak"
+        );
+        for h in &st.cal_hits {
+            let note = if h.birdie { " [birdie?]" } else { "" };
+            println!(
+                "  {:<16}  {:>7.3} MHz  {:+7.2} Hz  {:5.1} dB  {:+8.2} ppm  {:4.0}%{note}",
+                h.label,
+                h.nominal_hz as f64 / 1e6,
+                h.offset_hz,
+                h.snr_db,
+                h.ppm,
+                h.peak_pct
+            );
+        }
+        match st.cal_recommended {
+            Some((rec_ppm, ref why)) => {
+                println!("\nRecommended: --ppm {:+.2}  ({})", rec_ppm, why);
+                println!(
+                    "  At {:.3} MHz this shifts HackRF LO by {:+} Hz.",
+                    cfg.dial_hz as f64 / 1e6,
+                    ppm_offset_hz(cfg.dial_hz, rec_ppm)
+                );
+            }
+            None => {
+                println!("\nNo strong reference carrier detected. Try --cal-freq <HZ> with a known local carrier or check antenna.");
+            }
+        }
+        return ExitCode::SUCCESS;
+    }
 
     if tx_once {
         let frame = Frame::Cq {
@@ -2067,7 +2750,21 @@ fn main() -> ExitCode {
             // Inline text editing inside Settings
             if let Some(mut ed) = tui.editing.take() {
                 match key {
-                    Key::Enter => commit_edit(&state, &mut tui, ed),
+                    Key::Enter => {
+                        if tui.view == View::Calibrate {
+                            match ed.trim().parse::<u64>() {
+                                Ok(f) if (500_000..=6_000_000_000).contains(&f) => {
+                                    let mut st = state.lock().unwrap();
+                                    st.cal_request = Some(CalMode::Custom(f));
+                                    st.cal_status = format!("Queued custom probe at {:.6} MHz...", f as f64 / 1e6);
+                                    tui.set_toast(format!("Probing custom carrier {:.6} MHz", f as f64 / 1e6));
+                                }
+                                _ => tui.set_toast("Invalid frequency (enter Hz, e.g. 10000000 or 1040000)"),
+                            }
+                        } else {
+                            commit_edit(&state, &mut tui, ed);
+                        }
+                    }
                     Key::Esc => tui.set_toast("Edit cancelled"),
                     Key::Backspace => {
                         ed.pop();
@@ -2095,12 +2792,14 @@ fn main() -> ExitCode {
                     tui.view = match tui.view {
                         View::Operate => View::Settings,
                         View::Settings => View::Log,
-                        View::Log => View::Operate,
+                        View::Log => View::Calibrate,
+                        View::Calibrate => View::Operate,
                     };
                 }
                 Key::Char('1') => tui.view = View::Operate,
                 Key::Char('2') | Key::Char('s') => tui.view = View::Settings,
                 Key::Char('3') | Key::Char('l') => tui.view = View::Log,
+                Key::Char('4') | Key::Char('k') => tui.view = View::Calibrate,
                 Key::Esc => tui.view = View::Operate,
                 _ => match tui.view {
                     View::Operate => match key {
@@ -2217,6 +2916,69 @@ fn main() -> ExitCode {
                         _ => {}
                     },
                     View::Log => {}
+                    View::Calibrate => match key {
+                        Key::Char('r') => {
+                            let mut st = state.lock().unwrap();
+                            if st.cal_running {
+                                tui.set_toast("Calibration already running...");
+                            } else {
+                                st.cal_request = Some(CalMode::Auto);
+                                st.cal_status = "Queued Auto calibration (WWV/CHU + AM BCB)...".to_string();
+                                tui.set_toast("Starting Auto calibration (WWV/CHU + AM BCB)...");
+                            }
+                        }
+                        Key::Char('w') => {
+                            let mut st = state.lock().unwrap();
+                            if st.cal_running {
+                                tui.set_toast("Calibration already running...");
+                            } else {
+                                st.cal_request = Some(CalMode::WwvOnly);
+                                st.cal_status = "Queued WWV/CHU atomic carrier probe...".to_string();
+                                tui.set_toast("Starting WWV/CHU probe...");
+                            }
+                        }
+                        Key::Char('m') => {
+                            let mut st = state.lock().unwrap();
+                            if st.cal_running {
+                                tui.set_toast("Calibration already running...");
+                            } else {
+                                st.cal_request = Some(CalMode::AmBcb);
+                                st.cal_status = "Queued AM broadcast band scan (540–1700 kHz)...".to_string();
+                                tui.set_toast("Starting AM broadcast band scan...");
+                            }
+                        }
+                        Key::Char('f') => {
+                            if state.lock().unwrap().cal_running {
+                                tui.set_toast("Wait for current calibration to finish");
+                            } else {
+                                tui.editing = Some("10000000".to_string());
+                            }
+                        }
+                        Key::Enter => {
+                            let mut st = state.lock().unwrap();
+                            if let Some((rec_ppm, ref why)) = st.cal_recommended.clone() {
+                                let applied = (rec_ppm * 100.0).round() / 100.0;
+                                st.cfg.ppm = applied;
+                                let hz = ppm_offset_hz(st.cfg.dial_hz, applied);
+                                let dial_mhz = st.cfg.dial_hz as f64 / 1e6;
+                                st.push_event(format!(
+                                    "[{}] Applied CAL {:+.2} ppm ({:+} Hz) from {why}",
+                                    format_utc_hms(utc_now_ms() / 1000),
+                                    applied,
+                                    hz
+                                ));
+                                tui.set_toast(format!(
+                                    "Applied {:+.2} ppm ({:+} Hz on {:.3} MHz)",
+                                    applied,
+                                    hz,
+                                    dial_mhz
+                                ));
+                            } else {
+                                tui.set_toast("No recommended ppm yet — press [r] Auto or [m] AM BCB");
+                            }
+                        }
+                        _ => {}
+                    },
                 },
             }
         }
