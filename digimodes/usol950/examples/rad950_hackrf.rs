@@ -755,9 +755,15 @@ fn receive_slot(cfg: &NodeConfig, state: &Arc<Mutex<SharedState>>) -> Result<(Ve
     let mut first_wf = true;
 
     loop {
-        if !state.lock().unwrap().running {
+        let abort = {
+            let st = state.lock().unwrap();
+            !st.running || st.cal_request.is_some()
+        };
+        if abort {
+            drop(stdout);
             let _ = child.kill();
-            break;
+            let _ = child.wait();
+            return Ok((Vec::new(), 0.0));
         }
         let mut start = 0usize;
         if let Some(b) = leftover.take() {
@@ -1100,6 +1106,7 @@ fn capture_hackrf_cs8(
     let want_bytes = (n_samples as usize) * 2;
     let mut raw = Vec::with_capacity(want_bytes);
     let mut buf = [0u8; 65_536];
+    let mut read_err: Option<String> = None;
     loop {
         match stdout.read(&mut buf) {
             Ok(0) => break,
@@ -1111,15 +1118,37 @@ fn capture_hackrf_cs8(
                 }
             }
             Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-            Err(e) => return Err(format!("hackrf_transfer read error: {e}")),
+            Err(e) => {
+                read_err = Some(format!("hackrf_transfer read error: {e}"));
+                break;
+            }
         }
     }
-    let out = child.wait_with_output();
+    // Always close stdout BEFORE waiting so hackrf_transfer can never deadlock on a full stdout pipe.
+    drop(stdout);
+    let deadline = std::time::Instant::now() + Duration::from_millis(800);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if std::time::Instant::now() < deadline => {
+                thread::sleep(Duration::from_millis(20));
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break;
+            }
+        }
+    }
+    if let Some(e) = read_err {
+        return Err(e);
+    }
     if raw.len() < 8192 * 400 * 2 {
-        let err = out
-            .map(|o| String::from_utf8_lossy(&o.stderr).trim().to_string())
-            .unwrap_or_default();
-        return Err(format!("short HackRF capture ({} bytes): {err}", raw.len()));
+        let mut err_str = String::new();
+        if let Some(mut se) = child.stderr.take() {
+            let _ = se.read_to_string(&mut err_str);
+        }
+        return Err(format!("short HackRF capture ({} bytes): {}", raw.len(), err_str.trim()));
     }
     Ok(raw)
 }
@@ -1648,6 +1677,9 @@ fn slot_worker(state: Arc<Mutex<SharedState>>) {
             match receive_slot(&cfg, &state) {
                 Ok((frames, peak_pct)) => {
                     let mut st = state.lock().unwrap();
+                    if st.cal_request.is_some() || !st.running {
+                        continue;
+                    }
                     st.slots_rx += 1;
                     st.peak_pct = peak_pct;
                     if frames.is_empty() {
