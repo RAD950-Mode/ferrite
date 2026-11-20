@@ -243,7 +243,7 @@ impl Engine {
         }
         self.cfg.mode = OpMode::Pounce;
         if p.owed_reply != Some(true) {
-            p.owed_reply = Some(false);
+            p.owed_reply = Some(p.rx_r0_at.is_some());
         }
         self.lock_until = Some(slot + EXPIRY_SLOTS);
         true

@@ -1134,8 +1134,9 @@ impl Sol950Host {
                 self.set_notice(b"Save failed");
             }
         }
-        // In attended Auto-Answer (Hunter) mode, release the completed peer so we can hunt the next needed CQ.
-        if self.auto_answer != AutoAnswer::Off && self.target_peer == Some(rec.peer) {
+        // In attended Auto-Answer (Hunter) or Rendezvous Call & Listen mode, release the completed peer
+        // so we return to Monitor and can hunt or answer the next station.
+        if (self.auto_answer != AutoAnswer::Off || self.rdv.call_listen_armed) && self.target_peer == Some(rec.peer) {
             self.target_peer = None;
             self.engine.stop_session();
         }
@@ -1152,6 +1153,22 @@ impl Sol950Host {
         if n > 0 {
             if let Some(rec) = logs[0] {
                 self.persist_qso(rec);
+            }
+        }
+        // When someone answers our Rendezvous CQ (or calls us directly while Hunter is armed) with RX(ACK=0),
+        // promote out of Monitor to send R+RX (ACK=1) and complete the QSO.
+        if (self.rdv.call_listen_armed || self.auto_answer != AutoAnswer::Off)
+            && self.profile.coop_rx != CoopRxMode::Capture
+            && matches!(self.engine.mode(), OpMode::Monitor)
+            && self.target_peer.is_none()
+        {
+            if let Frame::Rx { sender, recipient, ack: false, .. } = d.frame {
+                let my_call = self.engine.config().my_call;
+                if recipient == my_call && sender != my_call && self.engine.answer_peer(sender, slot) {
+                    self.saved_ack = false;
+                    self.target_peer = Some(sender);
+                    return;
+                }
             }
         }
         // Attended Auto-Answer (Hunter / Pounce): when armed and idle, auto-answer needed CQs.
@@ -1313,6 +1330,147 @@ impl App {
             Some(10)
         } else {
             Some(9_500 - slot_ms)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_host(call: &[u8], grid: [u8; 4], dial_idx: u8) -> Sol950Host {
+        let mut h = Sol950Host::new();
+        h.profile.set_base_call(call);
+        h.profile.manual_grid = grid;
+        h.profile.use_gps_grid = false;
+        h.profile.dial_idx = dial_idx;
+        h.sync_engine_config();
+        h
+    }
+
+    /// Run `slots` 10-second UTC slots across `hosts`, delivering every completed TX burst
+    /// to all other hosts currently tuned to the same dial frequency.
+    fn run_ether(hosts: &mut [Sol950Host], start_slot: u32, slots: u32, trace: bool) {
+        for s in start_slot..(start_slot + slots) {
+            let utc_sec = s * 10;
+            // Start of 10s slot: advance clock and collect any scheduled TX bursts.
+            let mut tx_bursts: [Option<(usize, Freq10, u16, Frame)>; 4] = [None; 4];
+            for (idx, h) in hosts.iter_mut().enumerate() {
+                h.update_clock(utc_sec, 0, 10, ClockSource::Gps, None);
+                if let Some((_rf, _pwr, frame)) = h.pending_tx.take() {
+                    h.tx_in_flight = true;
+                    if trace {
+                        std::eprintln!("  slot {s} host[{idx}] dial={} TX {:?}", h.profile.dial(), frame);
+                    }
+                    tx_bursts[idx] = Some((idx, h.profile.dial(), h.tx_subch_hz, frame));
+                }
+            }
+            // End of 10s slot: TX stations finish TX, RX stations decode all bursts on their dial.
+            for (rx_idx, h) in hosts.iter_mut().enumerate() {
+                if h.tx_in_flight {
+                    h.on_tx_done(true);
+                } else {
+                    let rx_dial = h.profile.dial();
+                    for b in tx_bursts.iter().flatten() {
+                        let (tx_idx, tx_dial, subch_hz, frame) = *b;
+                        if tx_idx != rx_idx && tx_dial == rx_dial {
+                            h.on_rx_frame(Decoded {
+                                frame,
+                                audio_hz: subch_hz,
+                                snr_db: -6,
+                                time_offset_ms: 0,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn three_station_hunter_modes_and_rendezvous() {
+        // Scenario 1: Same grid (EN61), 2 Auto-CQ callers (W2BBB, N3CCC) + 1 Hunter in AnyNeeded (K1AAA).
+        // Expected: K1AAA logs 2 QSOs (W2BBB + N3CCC), zero dupes.
+        {
+            let mut hosts = [
+                make_host(b"K1AAA", *b"EN61", 0),
+                make_host(b"W2BBB", *b"EN61", 0),
+                make_host(b"N3CCC", *b"EN61", 0),
+            ];
+            hosts[0].auto_answer = AutoAnswer::AnyNeeded;
+            hosts[1].engine.start_cq(0);
+            hosts[2].engine.start_cq(0);
+            run_ether(&mut hosts, 100, 30, false);
+            std::eprintln!("Scenario 1 (AnyNeeded, 10m): counts = [{}, {}, {}]", hosts[0].store.count(), hosts[1].store.count(), hosts[2].store.count());
+            assert_eq!(hosts[0].store.count(), 2, "AnyNeeded should work both new calls in EN61");
+            assert_eq!(hosts[1].store.count(), 1, "W2BBB should log K1AAA once");
+            assert_eq!(hosts[2].store.count(), 1, "N3CCC should log K1AAA once");
+        }
+
+        // Scenario 2: Same grid (EN61), Hunter in NewBandGrid across 10m then 12m.
+        // Expected: 1 QSO on 10m (EN61 now worked on 10m), then +1 QSO on 12m (EN61 new on 12m) = 2 total.
+        {
+            let mut hosts = [
+                make_host(b"K1AAA", *b"EN61", 0),
+                make_host(b"W2BBB", *b"EN61", 0),
+                make_host(b"N3CCC", *b"EN61", 0),
+            ];
+            hosts[0].auto_answer = AutoAnswer::NewBandGrid;
+            hosts[1].engine.start_cq(0);
+            hosts[2].engine.start_cq(0);
+            run_ether(&mut hosts, 100, 20, false);
+            std::eprintln!("Scenario 2a (NewBandGrid, 10m): counts = [{}, {}, {}]", hosts[0].store.count(), hosts[1].store.count(), hosts[2].store.count());
+            assert_eq!(hosts[0].store.count(), 1, "NewBandGrid should work only 1 EN61 station on 10m");
+            // Hop all 3 stations to 12m (SOL950_DIALS[4] = 24.919 MHz).
+            for h in &mut hosts {
+                h.profile.dial_idx = 4;
+                h.sync_engine_config();
+            }
+            run_ether(&mut hosts, 120, 20, false);
+            std::eprintln!("Scenario 2b (NewBandGrid, 12m): counts = [{}, {}, {}]", hosts[0].store.count(), hosts[1].store.count(), hosts[2].store.count());
+            assert_eq!(hosts[0].store.count(), 2, "NewBandGrid should work 1 EN61 station on 12m");
+        }
+
+        // Scenario 3: Same grid (EN61), Hunter in NewGrid across 10m then 12m.
+        // Expected: 1 QSO on 10m, then 0 more on 12m (EN61 already worked all-time) = 1 total.
+        {
+            let mut hosts = [
+                make_host(b"K1AAA", *b"EN61", 0),
+                make_host(b"W2BBB", *b"EN61", 0),
+                make_host(b"N3CCC", *b"EN61", 0),
+            ];
+            hosts[0].auto_answer = AutoAnswer::NewGrid;
+            hosts[1].engine.start_cq(0);
+            hosts[2].engine.start_cq(0);
+            run_ether(&mut hosts, 100, 20, false);
+            assert_eq!(hosts[0].store.count(), 1, "NewGrid should work 1 EN61 station on 10m");
+            for h in &mut hosts {
+                h.profile.dial_idx = 4;
+                h.sync_engine_config();
+            }
+            run_ether(&mut hosts, 120, 20, false);
+            std::eprintln!("Scenario 3 (NewGrid, 10m->12m): counts = [{}, {}, {}]", hosts[0].store.count(), hosts[1].store.count(), hosts[2].store.count());
+            assert_eq!(hosts[0].store.count(), 1, "NewGrid should NOT re-work EN61 on 12m");
+        }
+
+        // Scenario 4: 3 distinct grids (EN61, FN31, EM79), all 3 in Rendezvous + Hunter AnyNeeded during 10m window (:00-:04).
+        {
+            let mut hosts = [
+                make_host(b"K1AAA", *b"EN61", 0),
+                make_host(b"W2BBB", *b"FN31", 0),
+                make_host(b"N3CCC", *b"EM79", 0),
+            ];
+            for h in &mut hosts {
+                h.auto_answer = AutoAnswer::AnyNeeded;
+                h.rdv.follow_schedule = true;
+                h.rdv.call_listen_armed = true;
+                h.sync_engine_config();
+            }
+            // Start at exact top of hour (slot 360 = 3600s = 01:00:00Z, 10m Rendezvous window = 30 slots).
+            run_ether(&mut hosts, 360, 30, false);
+            let counts = [hosts[0].store.count(), hosts[1].store.count(), hosts[2].store.count()];
+            std::eprintln!("Scenario 4 (3x Rendezvous + HUNT:ALL, 30 slots): logged counts = {:?}", counts);
+            assert_eq!(counts, [2, 2, 2], "All 3 distinct stations should complete all 3 unique pairs (2 QSOs each)");
         }
     }
 }
