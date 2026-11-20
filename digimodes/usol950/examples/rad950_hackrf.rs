@@ -56,6 +56,53 @@ const BANDS: &[(&str, u64)] = &[
 ];
 
 #[derive(Clone, Copy, PartialEq, Eq)]
+enum AutoAnswer {
+    Off,
+    NewGrid,
+    NewBandGrid,
+    AnyNeeded,
+}
+
+impl AutoAnswer {
+    fn next(self) -> Self {
+        match self {
+            Self::Off => Self::NewGrid,
+            Self::NewGrid => Self::NewBandGrid,
+            Self::NewBandGrid => Self::AnyNeeded,
+            Self::AnyNeeded => Self::Off,
+        }
+    }
+
+    fn badge(self) -> &'static str {
+        match self {
+            Self::Off => "",
+            Self::NewGrid => " HUNT:NEW ",
+            Self::NewBandGrid => " HUNT:BND ",
+            Self::AnyNeeded => " HUNT:ALL ",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Off => "Off",
+            Self::NewGrid => "New Grid only",
+            Self::NewBandGrid => "New Grid or Band+Grid",
+            Self::AnyNeeded => "Any Needed (new call/grid)",
+        }
+    }
+
+    fn parse(s: &str) -> Result<Self, String> {
+        match s.to_ascii_lowercase().as_str() {
+            "off" | "none" => Ok(Self::Off),
+            "new" | "new-grid" | "grid" => Ok(Self::NewGrid),
+            "band" | "new-band" | "new-band-grid" => Ok(Self::NewBandGrid),
+            "any" | "all" | "needed" => Ok(Self::AnyNeeded),
+            _ => Err(format!("invalid --auto-answer '{s}' (use off, new-grid, new-band, or any)")),
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum View {
     Operate,
     Settings,
@@ -202,6 +249,7 @@ struct SharedState {
     running: bool,
     auto_cq: bool,
     auto_qso: bool,
+    auto_answer: AutoAnswer,
     rendezvous: bool,
     cq_parity: u64,
     tx_queue: VecDeque<TxJob>,
@@ -309,6 +357,7 @@ fn usage() {
     eprintln!("  --serial <HEX>            HackRF serial number suffix (if multiple connected)");
     eprintln!("  --dry-tx                  Dry TX safety mode (synthesize without keying HackRF)");
     eprintln!("  --rendezvous              Enable hourly UTC Rendezvous band-hopping & 50/50 turn cadence");
+    eprintln!("  --auto-answer <MODE>      Attended Hunter auto-answer: off, new-grid, new-band, or any");
     eprintln!("  --tx-once                 Transmit a single CQ immediately and exit (for bench/OTA tests)");
     eprintln!("  --log <PATH>              QSO log file path (default: rad950_hackrf.log)");
     eprintln!("  --slot-offset-ms <MS>     Shift 10 s slot clock by signed ms (for indoor non-GPS bench sync)");
@@ -1103,6 +1152,66 @@ fn handle_decoded(state: &Arc<Mutex<SharedState>>, slot: u64, frames: &[Decoded]
                     }
                 }
             }
+        }
+    }
+
+    // Attended Auto-Answer (Hunter / Pounce): pick the highest-priority needed CQ in this slot
+    // (New Grid > New Band+Grid > New Call, then strongest SNR) and queue an opposite-parity reply.
+    if st.auto_answer != AutoAnswer::Off && st.tx_queue.is_empty() {
+        let cur_band = band_name(dial_hz).to_string();
+        let mut best: Option<(u8, i8, Callsign, String, &'static str)> = None;
+        for d in frames {
+            if let Frame::Cq { sender, grid4, .. } = d.frame {
+                if sender == my_call {
+                    continue;
+                }
+                let sender_str = format_call(sender);
+                let g = format_grid(grid4);
+                let valid_grid = g.len() == 4 && g != "----";
+                let is_new_all = valid_grid && !st.worked_grids_all.contains(&g);
+                let is_new_band = valid_grid && !is_new_all && !st.worked_grids_band.contains(&(cur_band.clone(), g.clone()));
+                let is_new_call = !st.worked_calls.contains(&sender_str);
+                let (prio, reason) = if is_new_all {
+                    (3u8, "NEW GRID")
+                } else if is_new_band {
+                    (2u8, "NEW BAND+GRID")
+                } else if is_new_call {
+                    (1u8, "NEW CALL")
+                } else {
+                    (0u8, "")
+                };
+                let allowed = match st.auto_answer {
+                    AutoAnswer::Off => false,
+                    AutoAnswer::NewGrid => prio >= 3,
+                    AutoAnswer::NewBandGrid => prio >= 2,
+                    AutoAnswer::AnyNeeded => prio >= 1,
+                };
+                if allowed && best.as_ref().is_none_or(|b| (prio, d.snr_db) > (b.0, b.1)) {
+                    best = Some((prio, d.snr_db, sender, sender_str, reason));
+                }
+            }
+        }
+        if let Some((_, snr_db, target, target_str, reason)) = best {
+            let reply = Frame::Rx {
+                sender: my_call,
+                recipient: target,
+                snr_db,
+                ack: false,
+                reserved: false,
+            };
+            let target_parity = (slot + 1) % 2;
+            let summary = format!("{target_str} de {} RX {:+}dB", st.cfg.call_str, snr_db);
+            st.tx_queue.push_front(TxJob {
+                frame: reply,
+                subch: my_subch,
+                summary: summary.clone(),
+                parity: Some(target_parity),
+            });
+            st.push_event(format!(
+                "[{}] HUNT auto-answer {target_str} ({reason}, {} slot): {summary}",
+                format_utc_hms(utc_sec),
+                if target_parity == 0 { "even" } else { "odd" }
+            ));
         }
     }
 }
@@ -2598,6 +2707,11 @@ fn render_tui(state: &Arc<Mutex<SharedState>>, tui: &TuiState) {
     } else {
         ""
     };
+    let hunt_badge = if st.auto_answer != AutoAnswer::Off {
+        format!("\x1b[1;30;45m{}\x1b[0;1;37;44m", st.auto_answer.badge())
+    } else {
+        String::new()
+    };
     let header = format!(
         " RAD950 HackRF  |  {} [{}]  |  {:.3} MHz ({})  |  Subch {} ({} Hz)  |  {} ",
         st.cfg.call_str,
@@ -2608,7 +2722,7 @@ fn render_tui(state: &Arc<Mutex<SharedState>>, tui: &TuiState) {
         SUBCHANNELS_HZ[st.cfg.subch],
         format_utc_hms(now_ms / 1000)
     );
-    buf.push_str(&format!("\x1b[1;37;44m{header}{tx_badge}{cq_badge}\x1b[K\x1b[0m\r\n"));
+    buf.push_str(&format!("\x1b[1;37;44m{header}{tx_badge}{cq_badge}{hunt_badge}\x1b[K\x1b[0m\r\n"));
 
     // 2. Slot progress bar + Audio Peak
     let (phase_col, phase_lbl) = match st.phase {
@@ -2989,7 +3103,7 @@ fn render_tui(state: &Arc<Mutex<SharedState>>, tui: &TuiState) {
         buf.push_str("\x1b[K\r\n");
     }
     let hints = match tui.view {
-        View::Operate => " [c] CQ  [a] Auto-CQ  [Enter] Answer  [b] Band  [d] Dry-TX  [s] Settings  [l] Log  [k] Cal  [q] Quit",
+        View::Operate => " [c] CQ  [a] Auto-CQ  [h] Hunt  [v] Rdv  [Enter] Answer  [b] Band  [d] Dry-TX  [s] Set  [l] Log  [k] Cal  [q] Quit",
         View::Settings => " [↑/↓] Select  [←/→] Change  [Enter] Edit/Toggle  [Esc/1] Operate  [q] Quit",
         View::Log => " [1/Esc] Operate  [2/s] Settings  [4/k] Cal  [q] Quit",
         View::Calibrate => " [r] Auto  [e] LTE GPS  [t] ATSC TV  [w] WWV/CHU  [m] AM BCB  [f] Custom Hz  [Enter] Apply  [1/Esc] Operate",
@@ -3169,6 +3283,7 @@ fn main() -> ExitCode {
     let mut amp = false;
     let mut dry_tx = false;
     let mut rendezvous = false;
+    let mut auto_answer = AutoAnswer::Off;
     let mut tx_once = false;
     let mut rx_once = false;
     let mut tx_reply: Option<(String, i8, bool)> = None;
@@ -3203,6 +3318,16 @@ fn main() -> ExitCode {
             "--amp" => amp = true,
             "--dry-tx" => dry_tx = true,
             "--rendezvous" => rendezvous = true,
+            "--auto-answer" if i + 1 < args.len() => {
+                i += 1;
+                match AutoAnswer::parse(&args[i]) {
+                    Ok(m) => auto_answer = m,
+                    Err(e) => {
+                        eprintln!("{e}");
+                        return ExitCode::from(2);
+                    }
+                }
+            }
             "--tx-once" => tx_once = true,
             "--rx-once" => rx_once = true,
             "--tx-reply" if i + 3 < args.len() => {
@@ -3346,6 +3471,7 @@ fn main() -> ExitCode {
         running: true,
         auto_cq: false,
         auto_qso: true,
+        auto_answer,
         rendezvous,
         cq_parity: 0,
         tx_queue: VecDeque::new(),
@@ -3649,6 +3775,14 @@ fn main() -> ExitCode {
                             } else {
                                 tui.set_toast("Rendezvous OFF");
                             }
+                        }
+                        Key::Char('h') => {
+                            let mut st = state.lock().unwrap();
+                            st.auto_answer = st.auto_answer.next();
+                            if st.auto_answer != AutoAnswer::Off {
+                                st.auto_cq = false;
+                            }
+                            tui.set_toast(format!("Hunter Auto-Answer: {}", st.auto_answer.label()));
                         }
                         Key::Char('a') => {
                             let mut st = state.lock().unwrap();

@@ -9,8 +9,8 @@ use crate::chan::ChannelStore;
 use crate::keys::{KeyEvent, Press};
 use crate::rad950_chat::{ChatDelivery, ChatDraft, ChatPhase};
 use crate::sol950::{
-    band_label, field_letters, ClockSource, CoopLink, CoopRxMode, GridSource, SavedContact, Sol950Store, SOL950_DIALS,
-    WF_COLS, WF_ROWS,
+    band_label, field_letters, AutoAnswer, ClockSource, CoopLink, CoopRxMode, GridSource, SavedContact, Sol950Store,
+    SOL950_DIALS, WF_COLS, WF_ROWS,
 };
 use crate::{App, Screen};
 use ferrite_core::freq::Freq10;
@@ -533,6 +533,7 @@ impl Sol950Scr {
                     h.engine.stop_session();
                     h.pending_tx = None;
                     h.target_peer = None;
+                    h.auto_answer = AutoAnswer::Off;
                 }
                 app.out.push(RadioCmd::Sol950Abort);
             }
@@ -554,6 +555,17 @@ impl Sol950Scr {
             Key::Digit(5) => {
                 app.screen = Screen::Sol950(Sol950Scr { page: PAGE_RENDEZVOUS, sel: 0, top: 0, field: 0, sub: 0 });
                 return;
+            }
+            Key::Digit(6) => {
+                if app.sol950_host().is_some_and(|h| h.profile.coop_rx == CoopRxMode::Capture) {
+                    app.show_toast(b"Coop Capture", b"RX only mode", false);
+                    return;
+                }
+                if let Some(h) = app.sol950_host_mut() {
+                    h.auto_answer = h.auto_answer.next();
+                    let lbl = h.auto_answer.label();
+                    app.show_toast(b"Auto-Answer", lbl, false);
+                }
             }
             Key::Star => {
                 app.screen = Screen::Sol950(Sol950Scr::SETUP);
@@ -724,6 +736,7 @@ impl Sol950Scr {
         let mut utc_ok = false;
         let mut clock_src = ClockSource::None;
         let mut has_pnt = false;
+        let mut auto_answer = AutoAnswer::Off;
         let mut mode_tag = 0u32;
         let mut coop_rx = CoopRxMode::Off;
         let mut coop_link = CoopLink::Usb;
@@ -738,6 +751,7 @@ impl Sol950Scr {
             utc_ok = h.utc_ready();
             clock_src = h.clock_src;
             has_pnt = h.has_pnt();
+            auto_answer = h.auto_answer;
             coop_rx = h.profile.coop_rx;
             coop_link = h.profile.coop_link;
             tx_now |= h.tx_in_flight;
@@ -758,6 +772,7 @@ impl Sol950Scr {
             .n(utc_ok as u32)
             .n(clock_src as u32)
             .n(has_pnt as u32)
+            .n(auto_answer as u32)
             .n(rx_ready as u32)
             .n(tx_now as u32)
             .n(rssi as u32)
@@ -841,6 +856,8 @@ impl Sol950Scr {
                             CoopLink::Bluetooth => b"COOP BT",
                         };
                         lcd.text4(W - 64, y0 + 35, badge, &UI_12, BLUE, BG);
+                    } else if auto_answer != AutoAnswer::Off {
+                        lcd.text4(W - 68, y0 + 35, auto_answer.badge(), &UI_12, CYAN, BG);
                     }
                     lcd.fill(0, y0 + 42, W, 1, RULE);
                 }

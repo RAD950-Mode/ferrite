@@ -711,6 +711,58 @@ impl Sol950Profile {
     }
 }
 
+/// Session-only attended Auto-Answer ("Hunter / Pounce") filter for decoded CQs.
+/// Never persisted across reboot; cleared by `0` (Stop).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum AutoAnswer {
+    /// Manual `OK` to answer (default).
+    Off,
+    /// Auto-answer only all-time unworked 4-char grids (`NEW`).
+    NewGrid,
+    /// Auto-answer `NEW` or `BND` (grid not yet worked on this band).
+    NewBandGrid,
+    /// Auto-answer any unworked callsign on this band (or `NEW` / `BND`).
+    AnyNeeded,
+}
+
+impl AutoAnswer {
+    pub const fn next(self) -> Self {
+        match self {
+            Self::Off => Self::NewGrid,
+            Self::NewGrid => Self::NewBandGrid,
+            Self::NewBandGrid => Self::AnyNeeded,
+            Self::AnyNeeded => Self::Off,
+        }
+    }
+
+    pub const fn badge(self) -> &'static [u8] {
+        match self {
+            Self::Off => b"",
+            Self::NewGrid => b"HUNT:NEW",
+            Self::NewBandGrid => b"HUNT:BND",
+            Self::AnyNeeded => b"HUNT:ALL",
+        }
+    }
+
+    pub const fn label(self) -> &'static [u8] {
+        match self {
+            Self::Off => b"Off",
+            Self::NewGrid => b"New Grid",
+            Self::NewBandGrid => b"New Band+Grid",
+            Self::AnyNeeded => b"Any Needed",
+        }
+    }
+
+    pub fn matches(self, st: PeerCallStatus) -> bool {
+        match self {
+            Self::Off => false,
+            Self::NewGrid => st.award == GridAward::NewGrid,
+            Self::NewBandGrid => matches!(st.award, GridAward::NewGrid | GridAward::NewBandGrid),
+            Self::AnyNeeded => !st.worked || st.award != GridAward::None,
+        }
+    }
+}
+
 /// Discipline source for `Sol950Host`'s 10 s UTC slot clock.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum ClockSource {
@@ -767,6 +819,8 @@ pub struct Sol950Host {
     pub last_qso_award: GridAward,
     /// Peer currently targeted by Answer (for Active screen display).
     pub target_peer: Option<Callsign>,
+    /// Session-only attended Auto-Answer ("Hunter") filter (never persisted across reboot).
+    pub auto_answer: AutoAnswer,
     /// Optional 4-char grid filter when opening Log from Worked Grids drill-down.
     pub log_grid_filter: Option<[u8; 4]>,
     /// True when Setup changed the profile and the firmware should write `SOL950_CFG`.
@@ -839,6 +893,7 @@ impl Sol950Host {
             last_qso: None,
             last_qso_award: GridAward::None,
             target_peer: None,
+            auto_answer: AutoAnswer::Off,
             log_grid_filter: None,
             profile_dirty: false,
             pending_save: None,
@@ -1079,6 +1134,11 @@ impl Sol950Host {
                 self.set_notice(b"Save failed");
             }
         }
+        // In attended Auto-Answer (Hunter) mode, release the completed peer so we can hunt the next needed CQ.
+        if self.auto_answer != AutoAnswer::Off && self.target_peer == Some(rec.peer) {
+            self.target_peer = None;
+            self.engine.stop_session();
+        }
     }
 
     pub fn on_rx_frame(&mut self, d: Decoded) {
@@ -1092,6 +1152,26 @@ impl Sol950Host {
         if n > 0 {
             if let Some(rec) = logs[0] {
                 self.persist_qso(rec);
+            }
+        }
+        // Attended Auto-Answer (Hunter / Pounce): when armed and idle, auto-answer needed CQs.
+        if self.auto_answer != AutoAnswer::Off
+            && self.profile.coop_rx != CoopRxMode::Capture
+            && matches!(self.engine.mode(), OpMode::Monitor)
+            && self.target_peer.is_none()
+        {
+            if let Frame::Cq { sender, grid4, .. } = d.frame {
+                let my_call = self.engine.config().my_call;
+                if sender != my_call {
+                    let mut cb = [0u8; 6];
+                    let cn = sender.decode(&mut cb);
+                    let peer_grid = ferrite_core::sol950::usol950::frame::decode_grid4(grid4).unwrap_or(*b"----");
+                    let st = self.store.classify_peer(&cb[..cn], peer_grid, w, false);
+                    if self.auto_answer.matches(st) && self.engine.answer_peer(sender, slot) {
+                        self.saved_ack = false;
+                        self.target_peer = Some(sender);
+                    }
+                }
             }
         }
     }
