@@ -1112,11 +1112,12 @@ impl Sol950Host {
                 }
                 return;
             }
+            let clear_mask = !self.engine.occupied_subch_mask();
             let plan = self.engine.begin_slot(slot, utc_ok);
             let has_active_qso =
                 matches!(plan, SlotPlan::Tx { .. }) || !matches!(self.engine.mode(), OpMode::Monitor);
             let (new_dial, rdv_cq_hz) =
-                self.rdv.on_slot_start(utc_sec, slot, has_active_qso, self.profile.dial_idx, 0xFF);
+                self.rdv.on_slot_start(utc_sec, slot, has_active_qso, self.profile.dial_idx, clear_mask);
             if let Some(di) = new_dial {
                 self.profile.dial_idx = di;
                 self.sync_engine_config();

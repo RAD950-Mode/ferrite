@@ -168,7 +168,19 @@ impl RdvState {
             return RdvTurnPlan::Listen;
         }
         let r = mix32(self.seed ^ slot.wrapping_mul(0x9E37_79B1));
-        if (r & 1) == 0 {
+        // Adaptive congestion backoff on crowded bands:
+        // - < 4 busy subchannels: 50% CQ draw (r & 1 == 1)
+        // - 4..=5 busy subchannels: 25% CQ draw (r & 3 == 1)
+        // - >= 6 busy subchannels: 12.5% CQ draw (r & 7 == 1)
+        let busy_cnt = 8 - clear_subch_mask.count_ones();
+        let mask_p: u32 = if busy_cnt >= 6 {
+            7
+        } else if busy_cnt >= 4 {
+            3
+        } else {
+            1
+        };
+        if (r & mask_p) != 1 {
             return RdvTurnPlan::Listen;
         }
         // Prefer an observed clear subchannel; fall back to all 8 if all appear busy.

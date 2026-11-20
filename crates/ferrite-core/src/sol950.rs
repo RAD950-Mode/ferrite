@@ -220,6 +220,11 @@ impl Engine {
         &self.cfg
     }
 
+    /// Bitmask of the 8 subchannels (`bit i` = `SUBCHANNELS_HZ[i]`) heard occupied in the previous RX slot.
+    pub fn occupied_subch_mask(&self) -> u8 {
+        self.occupied_subch_mask
+    }
+
     pub fn mode(&self) -> OpMode {
         self.cfg.mode
     }
