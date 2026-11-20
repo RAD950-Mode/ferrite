@@ -7,7 +7,7 @@
 //!   cargo run --release -p urad950 --example rad950_hackrf -- --call NQ6N --grid FN31 --band 10m --dry-tx
 //!   cargo run --release -p urad950 --example rad950_hackrf -- --loopback
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::env;
 use std::f64::consts::TAU;
 use std::fs::{self, OpenOptions};
@@ -246,6 +246,8 @@ struct TxJob {
     /// Optional required slot parity (`0` = even, `1` = odd) so replies always fire on the
     /// opposite parity from the slot we heard the peer transmit in (preventing Auto-CQ collisions).
     parity: Option<u64>,
+    /// Deferred causal QSO log entry: written only when this `R+RX(ACK=1)` finishes transmitting cleanly.
+    pending_qso_log: Option<(Callsign, QsoLogEntry)>,
 }
 
 struct SharedState {
@@ -256,6 +258,9 @@ struct SharedState {
     auto_answer: AutoAnswer,
     rendezvous: bool,
     cq_parity: u64,
+    occupied_subch_mask: u8,
+    sent_rx0_slots: HashMap<Callsign, u64>,
+    qso_cooldowns: HashMap<Callsign, (u64, u8)>, // (until_slot, retries)
     tx_queue: VecDeque<TxJob>,
     heard: Vec<HeardEntry>,
     qso_log: Vec<QsoLogEntry>,
@@ -452,8 +457,56 @@ fn rdv_active_band(utc_sec: u64) -> Option<(&'static str, u64)> {
     None
 }
 
-/// Fast avalanche hash matching `rad950_rdv::mix32` for independent 50/50 even-slot Rendezvous CQs.
-fn rdv_plan_cq(call: Callsign, suffix: u8, slot: u64) -> Option<usize> {
+const QSO_EXPIRY_SLOTS: u64 = 30;
+const QSO_COOLDOWN_SLOTS: u64 = 30;
+const QSO_MAX_COOL_RETRIES: u8 = 2;
+
+#[inline]
+fn mix32(mut x: u32) -> u32 {
+    x ^= x >> 16;
+    x = x.wrapping_mul(0x7FEB_352D);
+    x ^= x >> 15;
+    x = x.wrapping_mul(0x846C_A68B);
+    x ^ (x >> 16)
+}
+
+fn nearest_subchannel_index(audio_hz: u16) -> usize {
+    let mut best_i = 0usize;
+    let mut best_d = (audio_hz as i32 - SUBCHANNELS_HZ[0] as i32).abs();
+    for (i, &hz) in SUBCHANNELS_HZ.iter().enumerate().skip(1) {
+        let d = (audio_hz as i32 - hz as i32).abs();
+        if d < best_d {
+            best_d = d;
+            best_i = i;
+        }
+    }
+    best_i
+}
+
+/// Pick an unoccupied subchannel from `!occupied_subch_mask`, preferring `preferred` if clear.
+fn pick_clear_subch(preferred: usize, occupied_subch_mask: u8, seed: u32) -> usize {
+    let pref = preferred.min(SUBCHANNELS_HZ.len() - 1);
+    if (occupied_subch_mask & (1u8 << pref)) == 0 {
+        return pref;
+    }
+    let mut clear = [0usize; 8];
+    let mut n_clear = 0usize;
+    for i in 0..SUBCHANNELS_HZ.len() {
+        if (occupied_subch_mask & (1u8 << i)) == 0 {
+            clear[n_clear] = i;
+            n_clear += 1;
+        }
+    }
+    if n_clear == 0 {
+        pref
+    } else {
+        clear[(seed as usize) % n_clear]
+    }
+}
+
+/// Fast avalanche hash matching RAD950 spec v1 §5.1.2 for adaptive Rendezvous CQs
+/// (`50% / 25% / 12.5%` congestion backoff + live `!occupied_subch_mask` avoidance).
+fn rdv_plan_cq(call: Callsign, suffix: u8, slot: u64, occupied_subch_mask: u8) -> Option<usize> {
     if !slot.is_multiple_of(2) {
         return None;
     }
@@ -462,16 +515,32 @@ fn rdv_plan_cq(call: Callsign, suffix: u8, slot: u64) -> Option<usize> {
     if seed == 0 {
         seed = 0x1357_9BDF;
     }
-    let mut x = seed ^ (slot as u32).wrapping_mul(0x9E37_79B9);
-    x ^= x >> 16;
-    x = x.wrapping_mul(0x7FEB_352D);
-    x ^= x >> 15;
-    x = x.wrapping_mul(0x846C_A68B);
-    x ^= x >> 16;
-    if (x & 1) == 0 {
+    let r = mix32(seed ^ (slot as u32).wrapping_mul(0x9E37_79B1));
+    let busy_cnt = occupied_subch_mask.count_ones();
+    let mask_p = if busy_cnt < 4 {
+        1u32
+    } else if busy_cnt <= 5 {
+        3u32
+    } else {
+        7u32
+    };
+    if (r & mask_p) != 1 {
         return None;
     }
-    Some(((x >> 8) as usize) % SUBCHANNELS_HZ.len())
+    let sub_r = mix32(r ^ 0x85EB_CA6B);
+    let mut clear = [0usize; 8];
+    let mut n_clear = 0usize;
+    for i in 0..SUBCHANNELS_HZ.len() {
+        if (occupied_subch_mask & (1u8 << i)) == 0 {
+            clear[n_clear] = i;
+            n_clear += 1;
+        }
+    }
+    if n_clear == 0 {
+        Some((sub_r as usize) % SUBCHANNELS_HZ.len())
+    } else {
+        Some(clear[(sub_r as usize) % n_clear])
+    }
 }
 
 fn parse_grid(s: &str) -> Result<(u16, String), String> {
@@ -1203,6 +1272,14 @@ fn handle_decoded(state: &Arc<Mutex<SharedState>>, slot: u64, frames: &[Decoded]
     let my_call = st.cfg.call;
     let my_suffix = st.cfg.suffix;
     let my_subch = st.cfg.subch;
+    let mut busy_mask = 0u8;
+    for d in frames {
+        let idx = nearest_subchannel_index(d.audio_hz);
+        busy_mask |= 1u8 << idx;
+    }
+    st.occupied_subch_mask = busy_mask;
+    st.sent_rx0_slots.retain(|_, &mut s| slot <= s.saturating_add(QSO_EXPIRY_SLOTS));
+    st.qso_cooldowns.retain(|_, &mut (until, _)| slot <= until);
     let dial_hz = st.cfg.dial_hz;
     let utc_sec = slot * 10;
 
@@ -1312,58 +1389,93 @@ fn handle_decoded(state: &Arc<Mutex<SharedState>>, slot: u64, frames: &[Decoded]
                     .unwrap_or_else(|| "----".to_string());
 
                 if !ack {
-                    let reply = Frame::Rx {
-                        sender: my_call,
-                        recipient: sender,
-                        snr_db: d.snr_db,
-                        ack: true,
-                        reserved: false,
-                    };
-                    let summary = format!("{sender_str} de {} R+RX {:+}dB", st.cfg.call_str, d.snr_db);
-                    st.tx_queue.push_front(TxJob {
-                        frame: reply,
-                        subch: my_subch,
-                        summary,
-                        parity: Some((slot + 1) % 2),
-                    });
-                    let qso = QsoLogEntry {
-                        utc_sec,
-                        dial_hz,
-                        peer: sender_str.clone(),
-                        grid: peer_grid,
-                        rx_snr: d.snr_db,
-                        tx_snr: their_rpt_for_us,
-                    };
-                    let badge = st.record_qso(qso);
-                    st.push_event(format!(
-                        "[{}] QSO logged {} (rx={:+}dB tx={:+}dB) -> R+RX queued",
-                        format_utc_hms(utc_sec),
-                        sender_str,
-                        d.snr_db,
-                        their_rpt_for_us
-                    ));
-                    if let Some(h) = st.heard.iter_mut().find(|h| h.call == sender) {
-                        h.worked = badge;
+                    // If already in cooldown for this peer, resend R+RX up to QSO_MAX_COOL_RETRIES
+                    // without writing a duplicate log entry.
+                    let mut is_cool_retry = false;
+                    let mut allow_reply = true;
+                    if let Some((until, retries)) = st.qso_cooldowns.get_mut(&sender) {
+                        if slot <= *until {
+                            is_cool_retry = true;
+                            if *retries < QSO_MAX_COOL_RETRIES {
+                                *retries += 1;
+                            } else {
+                                allow_reply = false;
+                            }
+                        }
+                    }
+                    if allow_reply {
+                        let reply = Frame::Rx {
+                            sender: my_call,
+                            recipient: sender,
+                            snr_db: d.snr_db,
+                            ack: true,
+                            reserved: false,
+                        };
+                        let summary = format!("{sender_str} de {} R+RX {:+}dB", st.cfg.call_str, d.snr_db);
+                        let subch = pick_clear_subch(my_subch, busy_mask, mix32(slot as u32 ^ sender.raw()));
+                        let pending_qso_log = if is_cool_retry {
+                            None
+                        } else {
+                            Some((
+                                sender,
+                                QsoLogEntry {
+                                    utc_sec,
+                                    dial_hz,
+                                    peer: sender_str.clone(),
+                                    grid: peer_grid,
+                                    rx_snr: d.snr_db,
+                                    tx_snr: their_rpt_for_us,
+                                },
+                            ))
+                        };
+                        st.tx_queue.push_front(TxJob {
+                            frame: reply,
+                            subch,
+                            summary,
+                            parity: Some((slot + 1) % 2),
+                            pending_qso_log,
+                        });
+                        st.push_event(format!(
+                            "[{}] {} -> R+RX queued (subch {} = {} Hz)",
+                            format_utc_hms(utc_sec),
+                            if is_cool_retry { format!("Cooldown retry {sender_str}") } else { format!("RX from {sender_str}") },
+                            subch,
+                            SUBCHANNELS_HZ[subch]
+                        ));
                     }
                 } else {
-                    let qso = QsoLogEntry {
-                        utc_sec,
-                        dial_hz,
-                        peer: sender_str.clone(),
-                        grid: peer_grid,
-                        rx_snr: d.snr_db,
-                        tx_snr: their_rpt_for_us,
-                    };
-                    let badge = st.record_qso(qso);
-                    st.push_event(format!(
-                        "[{}] QSO complete & logged {} (rx={:+}dB tx={:+}dB)",
-                        format_utc_hms(utc_sec),
-                        sender_str,
-                        d.snr_db,
-                        their_rpt_for_us
-                    ));
-                    if let Some(h) = st.heard.iter_mut().find(|h| h.call == sender) {
-                        h.worked = badge;
+                    // Causal ACK=1 check: only log if we completed an RX(ACK=0) to this peer within QSO_EXPIRY_SLOTS.
+                    let causal_ok = st
+                        .sent_rx0_slots
+                        .get(&sender)
+                        .is_some_and(|&s| slot <= s.saturating_add(QSO_EXPIRY_SLOTS));
+                    if causal_ok {
+                        st.sent_rx0_slots.remove(&sender);
+                        st.qso_cooldowns.insert(sender, (slot + QSO_COOLDOWN_SLOTS, QSO_MAX_COOL_RETRIES));
+                        let qso = QsoLogEntry {
+                            utc_sec,
+                            dial_hz,
+                            peer: sender_str.clone(),
+                            grid: peer_grid,
+                            rx_snr: d.snr_db,
+                            tx_snr: their_rpt_for_us,
+                        };
+                        let badge = st.record_qso(qso);
+                        st.push_event(format!(
+                            "[{}] QSO complete & logged {} (rx={:+}dB tx={:+}dB)",
+                            format_utc_hms(utc_sec),
+                            sender_str,
+                            d.snr_db,
+                            their_rpt_for_us
+                        ));
+                        if let Some(h) = st.heard.iter_mut().find(|h| h.call == sender) {
+                            h.worked = badge;
+                        }
+                    } else {
+                        st.push_event(format!(
+                            "[{}] Ignored unsolicited R+RX(ACK=1) from {sender_str}",
+                            format_utc_hms(utc_sec)
+                        ));
                     }
                 }
             }
@@ -1416,11 +1528,13 @@ fn handle_decoded(state: &Arc<Mutex<SharedState>>, slot: u64, frames: &[Decoded]
             };
             let target_parity = (slot + 1) % 2;
             let summary = format!("{target_str} de {} RX {:+}dB", st.cfg.call_str, snr_db);
+            let subch = pick_clear_subch(my_subch, busy_mask, mix32(slot as u32 ^ target.raw()));
             st.tx_queue.push_front(TxJob {
                 frame: reply,
-                subch: my_subch,
+                subch,
                 summary: summary.clone(),
                 parity: Some(target_parity),
+                pending_qso_log: None,
             });
             st.push_event(format!(
                 "[{}] HUNT auto-answer {target_str} ({reason}, {} slot): {summary}",
@@ -2771,9 +2885,10 @@ fn slot_worker(state: Arc<Mutex<SharedState>>) {
                         };
                         Some(TxJob {
                             frame,
-                            subch: st.cfg.subch,
+                            subch: pick_clear_subch(st.cfg.subch, st.occupied_subch_mask, mix32(minute as u32)),
                             summary: format!("60s CQ {} {}", st.cfg.call_str, st.cfg.grid_str),
                             parity: Some(st.cq_parity),
+                            pending_qso_log: None,
                         })
                     } else {
                         None
@@ -2868,7 +2983,7 @@ fn slot_worker(state: Arc<Mutex<SharedState>>) {
                 .is_some_and(|j| j.parity.is_none_or(|p| next_slot % 2 == p));
             let rdv_ready = st.rendezvous
                 && rdv_active_band(next_utc_sec).is_some()
-                && rdv_plan_cq(st.cfg.call, st.cfg.suffix, next_slot).is_some();
+                && rdv_plan_cq(st.cfg.call, st.cfg.suffix, next_slot, st.occupied_subch_mask).is_some();
             q_ready
                 || (st.tx_queue.is_empty() && rdv_ready)
                 || (st.tx_queue.is_empty() && st.auto_cq && (next_slot % 2 == st.cq_parity))
@@ -2917,10 +3032,12 @@ fn slot_worker(state: Arc<Mutex<SharedState>>) {
                 break;
             }
             // Rendezvous hourly UTC band-hopping (10m :00, 12m :15, 15m :30, 17m :45).
+            // Defer QSY while a directed reply is queued in tx_queue.
             let rdv_now = if st.rendezvous { rdv_active_band(utc_sec) } else { None };
             if let Some((lbl, rdv_dial)) = rdv_now {
-                if st.cfg.dial_hz != rdv_dial {
+                if st.cfg.dial_hz != rdv_dial && st.tx_queue.is_empty() {
                     st.cfg.dial_hz = rdv_dial;
+                    st.occupied_subch_mask = 0;
                     st.push_event(format!(
                         "[{}] RDV hop -> {} ({:.3} MHz)",
                         format_utc_hms(utc_sec),
@@ -2941,7 +3058,7 @@ fn slot_worker(state: Arc<Mutex<SharedState>>) {
                 // Waiting for the opposite parity slot so we don't collide with the peer's TX slot.
                 None
             } else if rdv_now.is_some() {
-                rdv_plan_cq(st.cfg.call, st.cfg.suffix, slot).map(|subch| {
+                rdv_plan_cq(st.cfg.call, st.cfg.suffix, slot, st.occupied_subch_mask).map(|subch| {
                     let frame = Frame::Cq {
                         sender: st.cfg.call,
                         grid4: st.cfg.grid4,
@@ -2953,6 +3070,7 @@ fn slot_worker(state: Arc<Mutex<SharedState>>) {
                         subch,
                         summary: format!("RDV CQ {} {}", st.cfg.call_str, st.cfg.grid_str),
                         parity: Some(0),
+                        pending_qso_log: None,
                     }
                 })
             } else if st.auto_cq && (slot % 2 == st.cq_parity) {
@@ -2962,11 +3080,13 @@ fn slot_worker(state: Arc<Mutex<SharedState>>) {
                     tx_pwr: 10,
                     reserved: (st.cfg.suffix & 0x0F) as u16,
                 };
+                let subch = pick_clear_subch(st.cfg.subch, st.occupied_subch_mask, mix32(slot as u32));
                 Some(TxJob {
                     frame,
-                    subch: st.cfg.subch,
+                    subch,
                     summary: format!("CQ {} {}", st.cfg.call_str, st.cfg.grid_str),
                     parity: Some(st.cq_parity),
+                    pending_qso_log: None,
                 })
             } else {
                 None
@@ -2994,7 +3114,28 @@ fn slot_worker(state: Arc<Mutex<SharedState>>) {
             }
             match transmit_slot(&cfg, &job, &state) {
                 Ok(()) => {
-                    state.lock().unwrap().slots_tx += 1;
+                    let mut st = state.lock().unwrap();
+                    st.slots_tx += 1;
+                    if let Frame::Rx { recipient, ack: false, .. } = job.frame {
+                        st.sent_rx0_slots.insert(recipient, slot);
+                    }
+                    if let Some((peer_call, qso)) = job.pending_qso_log {
+                        let peer_str = qso.peer.clone();
+                        let rx_snr = qso.rx_snr;
+                        let tx_snr = qso.tx_snr;
+                        let badge = st.record_qso(qso);
+                        st.qso_cooldowns.insert(peer_call, (slot + QSO_COOLDOWN_SLOTS, 0));
+                        st.push_event(format!(
+                            "[{}] QSO logged {} (R+RX sent, rx={:+}dB tx={:+}dB)",
+                            format_utc_hms(utc_sec),
+                            peer_str,
+                            rx_snr,
+                            tx_snr
+                        ));
+                        if let Some(h) = st.heard.iter_mut().find(|h| h.call == peer_call) {
+                            h.worked = badge;
+                        }
+                    }
                 }
                 Err(e) => {
                     state
@@ -3024,6 +3165,7 @@ fn slot_worker(state: Arc<Mutex<SharedState>>) {
                     st.slots_rx += 1;
                     st.peak_pct = peak_pct;
                     if frames.is_empty() {
+                        st.occupied_subch_mask = 0;
                         st.push_event(format!(
                             "[{}] RX {:.3}MHz  0 decodes (peak {:.0}%)",
                             format_utc_hms(utc_sec),
@@ -4114,6 +4256,9 @@ fn main() -> ExitCode {
         auto_answer,
         rendezvous,
         cq_parity: 0,
+        occupied_subch_mask: 0,
+        sent_rx0_slots: HashMap::new(),
+        qso_cooldowns: HashMap::new(),
         tx_queue: VecDeque::new(),
         heard: Vec::new(),
         qso_log: Vec::new(),
@@ -4186,6 +4331,7 @@ fn main() -> ExitCode {
             subch: cfg.subch,
             summary: format!("CQ {} {}", cfg.call_str, cfg.grid_str),
             parity: None,
+            pending_qso_log: None,
         };
         println!(
             "TX-ONCE: {} on {:.3} MHz (cal {:+.1} ppm, subch {} = {} Hz, tx_gain={} dB, dry={})",
@@ -4227,6 +4373,7 @@ fn main() -> ExitCode {
             subch: cfg.subch,
             summary: format!("{} de {} {tag} {:+}dB", to_str, cfg.call_str, snr_db),
             parity: None,
+            pending_qso_log: None,
         };
         println!(
             "TX-REPLY: {} on {:.3} MHz (cal {:+.1} ppm, subch {} = {} Hz)",
@@ -4377,11 +4524,13 @@ fn main() -> ExitCode {
                                     h.call_str, st.cfg.call_str, h.snr_db
                                 );
                                 st.auto_cq = false;
+                                let chosen_subch = pick_clear_subch(subch, st.occupied_subch_mask, mix32(h.call.raw()));
                                 st.tx_queue.push_front(TxJob {
                                     frame,
-                                    subch,
+                                    subch: chosen_subch,
                                     summary: summary.clone(),
                                     parity: Some(target_parity),
+                                    pending_qso_log: None,
                                 });
                                 tui.set_toast(format!(
                                     "Queued answer ({} slot): {summary}",
@@ -4404,11 +4553,13 @@ fn main() -> ExitCode {
                                 };
                                 let subch = st.cfg.subch;
                                 let summary = format!("CQ {} {}", st.cfg.call_str, st.cfg.grid_str);
+                                let chosen_subch = pick_clear_subch(subch, st.occupied_subch_mask, mix32(st.slots_rx as u32));
                                 st.tx_queue.push_back(TxJob {
                                     frame,
-                                    subch,
+                                    subch: chosen_subch,
                                     summary: summary.clone(),
                                     parity: None,
+                                    pending_qso_log: None,
                                 });
                                 tui.set_toast(format!("Queued CQ for next TX slot: {summary}"));
                             }
