@@ -226,7 +226,12 @@ A carrier capture proves the fixture. For the **SOL950 TX waveform** measurement
     - `:15:40Z`: `NQ6N-2` TX `1275 Hz` → `NQ6N-1` decoded `CQ NQ6N-2 EN61` (`+2 dB`, `1277 Hz`).
     - `:16:00Z`: `NQ6N-1` TX `2175 Hz` → `NQ6N-2` decoded `CQ NQ6N-1 EN61` (`+8 dB`, `2168 Hz`).
     - RT-950 Pro (`NQ6N`) decoded **`NQ6N-1 EN61 NEW -15dB`** live on `24.919 MHz` (confirming `-1` suffix display and 12m RX after automatic band hop).
-    - Neither HackRF decoded a 12m TX from `NQ6N` during the 85 s window (to be checked in the multi-band RT-950 Pro TX verification below).
+- **4-band live RT-950 Pro TX verification (`10m / 12m / 15m / 17m`, Low power, `dry=0`, HackRF #1 `--ppm -0.2`, 2026-11-20 05:40Z):**
+  - Confirmed live RF radiation and `usol950` decodes on **all four** RAD950 Rendezvous bands, with BK4829 TX frequency accuracy within **±0.5 ppm** of true ATSC/GPS RF frequency on every band:
+    - **10m (`28.078 MHz`):** `CQ NQ6N` decoded at `1951 Hz` (nom `1950 Hz`, `+1 Hz` / `+0.04 ppm`), SNR `-11 dB`.
+    - **12m (`24.919 MHz`):** `CQ NQ6N` decoded at `609 Hz` (nom `600 Hz`, `+9 Hz` / `+0.36 ppm`), SNR `-11 dB`.
+    - **15m (`21.078 MHz`):** `CQ NQ6N` decoded at `1061 Hz` (nom `1050 Hz`, `+11 Hz` / `+0.52 ppm`), SNR `+4 dB`.
+    - **17m (`18.104 MHz`):** `CQ NQ6N` decoded at `1494 Hz` (nom `1500 Hz`, `-6 Hz` / `-0.33 ppm`), SNR `-3 dB`.
 - **On-MCU stability:** Resolved stack headroom (`ui::task` `12,096 B -> 6,560 B`, `dsp::feed` `5,536 B -> <1,600 B`, `Decoder::switch` `4,800 B -> <100 B`), Low Power Mode 24 MHz DSP starvation, World Map `lcd.rows()` band clipping, and PTT exit behavior; verified 231+ consecutive live 10-second RX slots with zero crashes.
 
 ## Conducted RAD950 transmitter measurements with the Siglent SSA3021X
