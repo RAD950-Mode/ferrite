@@ -8,7 +8,10 @@ use super::{Cx, Hints, View};
 use crate::chan::ChannelStore;
 use crate::keys::{KeyEvent, Press};
 use crate::rad950_chat::{ChatDelivery, ChatDraft, ChatPhase};
-use crate::sol950::{band_label, field_letters, CoopLink, CoopRxMode, GridSource, SavedContact, Sol950Store, SOL950_DIALS, WF_COLS, WF_ROWS};
+use crate::sol950::{
+    band_label, field_letters, ClockSource, CoopLink, CoopRxMode, GridSource, SavedContact, Sol950Store, SOL950_DIALS,
+    WF_COLS, WF_ROWS,
+};
 use crate::{App, Screen};
 use ferrite_core::freq::Freq10;
 use ferrite_core::keys::Key;
@@ -718,6 +721,8 @@ impl Sol950Scr {
         let mut grid_src = GridSource::Unset;
         let mut dial = SOL950_DIALS[0];
         let mut utc_ok = false;
+        let mut clock_src = ClockSource::None;
+        let mut has_pnt = false;
         let mut mode_tag = 0u32;
         let mut coop_rx = CoopRxMode::Off;
         let mut coop_link = CoopLink::Usb;
@@ -730,6 +735,8 @@ impl Sol950Scr {
             (grid_bytes, grid_src) = h.profile.effective_grid(h.gps_grid);
             dial = h.profile.dial();
             utc_ok = h.utc_ready();
+            clock_src = h.clock_src;
+            has_pnt = h.has_pnt();
             coop_rx = h.profile.coop_rx;
             coop_link = h.profile.coop_link;
             tx_now |= h.tx_in_flight;
@@ -748,6 +755,8 @@ impl Sol950Scr {
             .n(grid_src as u32)
             .n(dial)
             .n(utc_ok as u32)
+            .n(clock_src as u32)
+            .n(has_pnt as u32)
             .n(rx_ready as u32)
             .n(tx_now as u32)
             .n(rssi as u32)
@@ -816,9 +825,14 @@ impl Sol950Scr {
                     } else {
                         " INIT"
                     };
-                    let utc_s = if utc_ok { " UTC OK" } else { " NO UTC" };
+                    let (utc_s, gps_ok) = match (utc_ok, clock_src, has_pnt) {
+                        (true, ClockSource::Gps, true) => (" GPS PNT", true),
+                        (true, ClockSource::Gps, false) => (" GPS CLK", true),
+                        (true, ClockSource::Bench, _) => (" BENCH CLK", false),
+                        _ => (" NO GPS", false),
+                    };
                     let _ = uwrite!(line2, "{}{}", st, utc_s);
-                    let col = if tx_now { AMBER } else if utc_ok && rx_ready { GREEN } else { AMBER };
+                    let col = if tx_now { AMBER } else if gps_ok && rx_ready { GREEN } else { AMBER };
                     lcd.text4(8, y0 + 35, line2.as_bytes(), &UI_12, col, BG);
                     if coop_rx == CoopRxMode::Capture {
                         let badge: &[u8] = match coop_link {

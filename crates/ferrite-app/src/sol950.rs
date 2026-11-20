@@ -711,6 +711,17 @@ impl Sol950Profile {
     }
 }
 
+/// Discipline source for `Sol950Host`'s 10 s UTC slot clock.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum ClockSource {
+    /// No synchronized UTC time available.
+    None,
+    /// `bench`-feature indoor monotonic fallback (not GPS-disciplined, no PNT).
+    Bench,
+    /// Live onboard GPS-disciplined UTC clock.
+    Gps,
+}
+
 /// Platform-owned SOL950 runtime state attached to [`App`] via [`App::sol950_attach`].
 pub struct Sol950Host {
     pub engine: Engine,
@@ -720,6 +731,8 @@ pub struct Sol950Host {
     pub utc_ms_in_sec: u16,
     /// Estimated UTC timing uncertainty in ms (`u16::MAX` when unsynchronized).
     pub utc_uncert_ms: u16,
+    /// Discipline source for the current UTC slot clock (GPS vs bench fallback vs none).
+    pub clock_src: ClockSource,
     /// Latest onboard GPS 4-char grid (never from fixed position `0 6 9`).
     pub gps_grid: Option<[u8; 4]>,
     pub last_slot: u32,
@@ -805,6 +818,7 @@ impl Sol950Host {
             utc_sec: 0,
             utc_ms_in_sec: 0,
             utc_uncert_ms: u16::MAX,
+            clock_src: ClockSource::None,
             gps_grid: None,
             last_slot: u32::MAX,
             rx_slot_start: 0,
@@ -882,12 +896,25 @@ impl Sol950Host {
         self.chat.active_chat_dial().unwrap_or_else(|| self.profile.dial())
     }
 
+    /// True when the radio has full GPS PNT (live GPS-disciplined UTC clock + onboard GPS grid).
+    pub fn has_pnt(&self) -> bool {
+        self.clock_src == ClockSource::Gps && self.utc_ready() && self.gps_grid.is_some()
+    }
+
     /// Update GPS UTC time and onboard grid; trigger `DspCmd::Sol950Finish` at `+9.3 s` and `Engine::begin_slot`
     /// at each 10 s UTC boundary.
-    pub fn update_clock(&mut self, utc_sec: u32, ms_in_sec: u16, uncert_ms: u16, gps_grid: Option<[u8; 4]>) {
+    pub fn update_clock(
+        &mut self,
+        utc_sec: u32,
+        ms_in_sec: u16,
+        uncert_ms: u16,
+        clock_src: ClockSource,
+        gps_grid: Option<[u8; 4]>,
+    ) {
         self.utc_sec = utc_sec;
         self.utc_ms_in_sec = ms_in_sec;
         self.utc_uncert_ms = uncert_ms;
+        self.clock_src = clock_src;
         self.chat.calling_dial_hz10 = self.profile.dial();
         if gps_grid != self.gps_grid {
             self.gps_grid = gps_grid;

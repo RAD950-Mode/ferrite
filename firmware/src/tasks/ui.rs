@@ -1685,8 +1685,9 @@ async fn sol950_step(
     }
 
     // Update sub-second UTC & onboard GPS grid + Distress position from `store.extra.gps.onboard_fix()` + NMEA `$` burst tick.
+    use ferrite_app::sol950::ClockSource;
     let g = &store.extra.gps;
-    let (utc_sec, ms_in_sec, uncert_ms, gps_grid) = if let Some(fix) = g.onboard_fix() {
+    let (utc_sec, ms_in_sec, uncert_ms, clock_src, gps_grid) = if let Some(fix) = g.onboard_fix() {
         let grid = Some(ferrite_app::gpsdata::pos_to_grid4(fix.lat, fix.lon));
         if let Some(h) = app.sol950_host_mut() {
             h.chat.distress.update_gps_pos(fix.lat, fix.lon, true);
@@ -1700,12 +1701,12 @@ async fn sol950_step(
                 let secs = elapsed_ms / 1000;
                 let ms = (elapsed_ms % 1000) as u16;
                 let unc = if secs < 5 { 50 } else { 50u16.saturating_add((secs as u16).saturating_mul(2)) };
-                (fix.unix.wrapping_add(secs), ms, unc, grid)
+                (fix.unix.wrapping_add(secs), ms, unc, ClockSource::Gps, grid)
             } else {
-                (fix.unix, 0, 500, grid)
+                (fix.unix, 0, 500, ClockSource::Gps, grid)
             }
         } else {
-            (0, 0, u16::MAX, grid)
+            (0, 0, u16::MAX, ClockSource::None, grid)
         }
     } else {
         // Bench builds only: provide a monotonic UTC fallback indoors when no GPS fix is present,
@@ -1715,15 +1716,15 @@ async fn sol950_step(
             let ms_total = Instant::now().as_millis();
             let secs = (ms_total / 1000) as u32;
             let ms = (ms_total % 1000) as u16;
-            (1_763_500_000u32.wrapping_add(secs), ms, 50, None)
+            (1_763_500_000u32.wrapping_add(secs), ms, 50, ClockSource::Bench, None)
         }
         #[cfg(not(feature = "bench"))]
         {
-            (0, 0, u16::MAX, None)
+            (0, 0, u16::MAX, ClockSource::None, None)
         }
     };
     if let Some(h) = app.sol950_host_mut() {
-        h.update_clock(utc_sec, ms_in_sec, uncert_ms, gps_grid);
+        h.update_clock(utc_sec, ms_in_sec, uncert_ms, clock_src, gps_grid);
         #[cfg(feature = "bench")]
         {
             for (dst, src) in h.diag.iter_mut().zip(&crate::tasks::dsp::SOL950_DIAG) {
