@@ -770,6 +770,8 @@ pub enum ClockSource {
     None,
     /// `bench`-feature indoor monotonic fallback (not GPS-disciplined, no PNT).
     Bench,
+    /// Disciplined by a prior onboard GPS fix, currently coasting on the `HEXT` crystal within `MAX_TX_UNCERT_MS`.
+    GpsHoldover,
     /// Live onboard GPS-disciplined UTC clock.
     Gps,
 }

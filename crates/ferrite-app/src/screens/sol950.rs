@@ -844,6 +844,7 @@ impl Sol950Scr {
                     let (utc_s, gps_ok) = match (utc_ok, clock_src, has_pnt) {
                         (true, ClockSource::Gps, true) => (" GPS PNT", true),
                         (true, ClockSource::Gps, false) => (" GPS CLK", true),
+                        (true, ClockSource::GpsHoldover, _) => (" GPS HOLD", true),
                         (true, ClockSource::Bench, _) => (" BENCH CLK", false),
                         _ => (" NO GPS", false),
                     };
