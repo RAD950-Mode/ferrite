@@ -217,6 +217,16 @@ A carrier capture proves the fixture. For the **SOL950 TX waveform** measurement
   - **Matching logged entries:**
     - **`NQ6NB` (`/tmp/sol950-lab/qso_nq6nb.log`):** `04:56:20Z  28.078 MHz  NQ6N        grid=----  rx=-8dB  tx=-10dB`
     - **`NQ6N` (RT-950 Pro `RAD950 Log`, SPI flash):** `Saved contacts: 2` · `NQ6NB EM79  -8/-8dB` · `NQ6NA FN31  -9/-3dB`
+- **3-radio live OTA Rendezvous band-hopping test (`NQ6N`, `NQ6N-1`, `NQ6N-2`, 2026-11-20 05:35Z):**
+  - **Callsign suffix & Rendezvous support (`ec83c543`):** Added 4-bit `-1..-15` numeric suffix encoding in `Frame::Cq.reserved & 0x0F` (so multiple stations under one callsign identify as `NQ6N`, `NQ6N-1`, `NQ6N-2` without dropping each other as self-echo) and hourly UTC Rendezvous schedule following (`--rendezvous` / `[v]`, `:00` 10m / `:15` 12m / `:30` 15m / `:45` 17m, 50/50 even-slot turn draw) in `rad950_hackrf.rs`.
+  - **Synchronized band hop (`10m 28.078 MHz -> 12m 24.919 MHz`):** Armed `Follow schedule = ON` and `Call & listen = ARMED` on RT-950 Pro (`NQ6N`, `ec83c54`, `dry=0`) and launched `NQ6N-1` (HackRF #0) + `NQ6N-2` (HackRF #1) in `--rendezvous` mode synced to the radio's clock (`--slot-offset-ms -1194133`). At `:15:00Z`, all three radios hopped automatically from `28.078 MHz` to `24.919 MHz` (RT-950 Pro `Operate` switched `28.078 RX BENCH CLK` → `24.919 RX BENCH CLK`).
+  - **Independent 50/50 turns & decodes on 12m (`24.919 MHz`):**
+    - `:15:00Z`: `NQ6N-2` TX `1725 Hz` → `NQ6N-1` decoded `CQ NQ6N-2 EN61` (`+14 dB`, `1723 Hz`).
+    - `:15:20Z`: `NQ6N-1` TX `600 Hz` → `NQ6N-2` decoded `CQ NQ6N-1 EN61` (`+14 dB`, `598 Hz`).
+    - `:15:40Z`: `NQ6N-2` TX `1275 Hz` → `NQ6N-1` decoded `CQ NQ6N-2 EN61` (`+2 dB`, `1277 Hz`).
+    - `:16:00Z`: `NQ6N-1` TX `2175 Hz` → `NQ6N-2` decoded `CQ NQ6N-1 EN61` (`+8 dB`, `2168 Hz`).
+    - RT-950 Pro (`NQ6N`) decoded **`NQ6N-1 EN61 NEW -15dB`** live on `24.919 MHz` (confirming `-1` suffix display and 12m RX after automatic band hop).
+    - Neither HackRF decoded a 12m TX from `NQ6N` during the 85 s window (to be checked in the multi-band RT-950 Pro TX verification below).
 - **On-MCU stability:** Resolved stack headroom (`ui::task` `12,096 B -> 6,560 B`, `dsp::feed` `5,536 B -> <1,600 B`, `Decoder::switch` `4,800 B -> <100 B`), Low Power Mode 24 MHz DSP starvation, World Map `lcd.rows()` band clipping, and PTT exit behavior; verified 231+ consecutive live 10-second RX slots with zero crashes.
 
 ## Conducted RAD950 transmitter measurements with the Siglent SSA3021X
