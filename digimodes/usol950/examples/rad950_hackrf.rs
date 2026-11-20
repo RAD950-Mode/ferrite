@@ -1554,7 +1554,8 @@ fn slot_worker(state: Arc<Mutex<SharedState>>) {
         if !state.lock().unwrap().running {
             break;
         }
-        if let Some(mode) = state.lock().unwrap().cal_request.take() {
+        let cal_mode = state.lock().unwrap().cal_request.take();
+        if let Some(mode) = cal_mode {
             run_calibration(mode, &state);
             continue;
         }
@@ -1592,7 +1593,8 @@ fn slot_worker(state: Arc<Mutex<SharedState>>) {
                 thread::sleep(Duration::from_millis(d));
                 left -= d;
             }
-            if let Some(mode) = state.lock().unwrap().cal_request.take() {
+            let cal_mode = state.lock().unwrap().cal_request.take();
+            if let Some(mode) = cal_mode {
                 run_calibration(mode, &state);
                 continue;
             }
