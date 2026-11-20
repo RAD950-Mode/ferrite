@@ -567,6 +567,15 @@ impl Sol950Scr {
                     app.show_toast(b"Auto-Answer", lbl, false);
                 }
             }
+            Key::Digit(7) => {
+                if let Some(h) = app.sol950_host_mut() {
+                    h.profile.mode60 = !h.profile.mode60;
+                    h.engine.stop_session();
+                    h.target_peer = None;
+                    let m60 = h.profile.mode60;
+                    app.show_toast(b"RAD950 Cycle", if m60 { b"60s Weak-Sig" } else { b"10s Standard" }, false);
+                }
+            }
             Key::Star => {
                 app.screen = Screen::Sol950(Sol950Scr::SETUP);
                 return;
@@ -859,6 +868,8 @@ impl Sol950Scr {
                         lcd.text4(W - 64, y0 + 35, badge, &UI_12, BLUE, BG);
                     } else if auto_answer != AutoAnswer::Off {
                         lcd.text4(W - 68, y0 + 35, auto_answer.badge(), &UI_12, CYAN, BG);
+                    } else if app.sol950_mode60() {
+                        lcd.text4(W - 56, y0 + 35, b"60s WS", &UI_12, CYAN, BG);
                     }
                     lcd.fill(0, y0 + 42, W, 1, RULE);
                 }

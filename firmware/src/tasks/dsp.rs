@@ -460,7 +460,7 @@ pub async fn task() {
                 capturing = want;
             }
             Either4::First(DspCmd::Sol950Finish { utc_slot, dial_hz, coop_capture }) => {
-                if running == DecoderKind::Sol950 {
+                if matches!(running, DecoderKind::Sol950 | DecoderKind::Sol950_60) {
                     let captured = capturing;
                     if capturing {
                         audio::capture_stop();
@@ -506,7 +506,7 @@ pub async fn task() {
                 }
             }
             Either4::First(DspCmd::Sol950Reset) => {
-                if running == DecoderKind::Sol950 {
+                if matches!(running, DecoderKind::Sol950 | DecoderKind::Sol950_60) {
                     if capturing {
                         audio::capture_stop();
                     }
@@ -516,6 +516,11 @@ pub async fn task() {
                         dec = decim(listen);
                         audio::capture_start();
                     }
+                }
+            }
+            Either4::First(DspCmd::Sol950Subslot) => {
+                if running == DecoderKind::Sol950_60 {
+                    slot.sol950_start_subslot();
                 }
             }
             Either4::First(DspCmd::Beep { .. }) => {} // beeps are the BK4829's (SND-11)

@@ -315,6 +315,9 @@ pub enum DspCmd {
     /// SOL950 post-TX slot reset: stop capture, reset the `usol950::Receiver` without running LDPC decode
     /// (discarding muted TX-slot audio), and resume capture cleanly at the next 10 s RX slot boundary.
     Sol950Reset,
+    /// `RAD950-60` sub-slot boundary (`:10, :20, :30, :40`): reset per-10 s sample counter inside `Receiver60`
+    /// while preserving the accumulated 5-sub-burst folded spectrogram.
+    Sol950Subslot,
 }
 
 /// PWR-26.9: how long the AFSK capture runs on after the APRS slot's squelch closes (the frame's last flags).
@@ -330,6 +333,7 @@ pub enum DecoderKind {
     Pocsag,
     Dsc,
     Sol950,
+    Sol950_60,
 }
 
 /// Who announced it.

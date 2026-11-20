@@ -23,7 +23,7 @@ static SLOT_OFFSET_MS: AtomicI64 = AtomicI64::new(0);
 
 use usol950::frame::{decode_grid4, encode_grid4};
 use usol950::{
-    encode_tones, Callsign, Decoded, Frame, Receiver, DEFAULT_SPACING_HZ, GRID_UNKNOWN,
+    encode_tones, Callsign, Decoded, Frame, Receiver, Receiver60, DEFAULT_SPACING_HZ, GRID_UNKNOWN,
     MAX_DECODED, N_SYMBOLS, SUBCHANNELS_HZ,
 };
 
@@ -170,6 +170,7 @@ struct NodeConfig {
     spot_enabled: bool,
     spot_url: String,
     spot_key: String,
+    mode60: bool,
 }
 
 fn ppm_offset_hz(dial_hz: u64, ppm: f64) -> i64 {
@@ -363,6 +364,7 @@ fn usage() {
     eprintln!("  --dry-tx                  Dry TX safety mode (synthesize without keying HackRF)");
     eprintln!("  --rendezvous              Enable hourly UTC Rendezvous band-hopping & 50/50 turn cadence");
     eprintln!("  --auto-answer <MODE>      Attended Hunter auto-answer: off, new-grid, new-band, or any");
+    eprintln!("  --mode60                  RAD950-60 1-minute weak-signal mode (5x 10s v1 bursts + 10s cooldown)");
     eprintln!("  --spot                    Enable live spotting to POST /api/spots (requires --spot-key or RAD950_SPOT_KEY)");
     eprintln!("  --spot-url <URL>          Spots API URL (default: https://rad950.com/api/spots or RAD950_SPOT_URL)");
     eprintln!("  --spot-key <KEY>          Personal r950_... Bearer skimmer API key (or RAD950_SPOT_KEY)");
@@ -974,6 +976,127 @@ fn receive_slot(cfg: &NodeConfig, state: &Arc<Mutex<SharedState>>) -> Result<(Ve
     let count = rx.finish_slot(&mut decoded);
     let peak_pct = (peak_abs as f32 / 32767.0) * 100.0;
     Ok((decoded[..count].to_vec(), peak_pct))
+}
+
+/// Capture one 10-second sub-slot into a streaming `Receiver60` (used for `:00..:40` of a 60 s weak-signal minute).
+fn receive_subslot_rx60(
+    cfg: &NodeConfig,
+    state: &Arc<Mutex<SharedState>>,
+    rx60: &mut Receiver60,
+) -> Result<f32, String> {
+    let center_hz = tuned_center_hz(cfg);
+    let n_samples = (HACKRF_FS as u64) * RX_SLOT_MS / 1000;
+    let mut cmd = Command::new("hackrf_transfer");
+    cmd.args([
+        "-r",
+        "-",
+        "-f",
+        &center_hz.to_string(),
+        "-s",
+        &HACKRF_FS.to_string(),
+        "-n",
+        &n_samples.to_string(),
+        "-a",
+        if cfg.amp && cfg.lna_db >= 32 { "1" } else { "0" },
+        "-p",
+        "0",
+        "-l",
+        &cfg.lna_db.to_string(),
+        "-g",
+        &cfg.vga_db.to_string(),
+    ]);
+    if let Some(ref ser) = cfg.serial {
+        cmd.args(["-d", ser]);
+    }
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("failed to spawn hackrf_transfer RX60: {e}"))?;
+    let mut stdout = child.stdout.take().ok_or("no stdout from hackrf_transfer")?;
+    let mut ddc = UsbDdc::new();
+    let mut iq_buf = vec![0u8; 48_000];
+    let mut pcm_buf = Vec::with_capacity(512);
+    let mut leftover: Option<u8> = None;
+    let mut peak_abs: i16 = 0;
+    let mut chunk_peak: i16 = 0;
+    let mut chunks = 0u32;
+    let mut first_wf = true;
+
+    loop {
+        let abort = {
+            let st = state.lock().unwrap();
+            !st.running || st.cal_request.is_some() || !st.cfg.mode60
+        };
+        if abort {
+            drop(stdout);
+            let _ = child.kill();
+            let _ = child.wait();
+            return Ok(0.0);
+        }
+        let mut start = 0usize;
+        if let Some(b) = leftover.take() {
+            iq_buf[0] = b;
+            start = 1;
+        }
+        let n = stdout
+            .read(&mut iq_buf[start..])
+            .map_err(|e| format!("read from hackrf_transfer RX60 failed: {e}"))?;
+        if n == 0 {
+            break;
+        }
+        let total = start + n;
+        let even = total & !1;
+        if total != even {
+            leftover = Some(iq_buf[even]);
+        }
+        pcm_buf.clear();
+        ddc.process_cs8(&iq_buf[..even], &mut pcm_buf);
+        for &s in &pcm_buf {
+            let a = s.saturating_abs();
+            if a > peak_abs {
+                peak_abs = a;
+            }
+            if a > chunk_peak {
+                chunk_peak = a;
+            }
+        }
+        rx60.push_samples(&pcm_buf);
+        chunks += 1;
+        if chunks.is_multiple_of(8) {
+            let wf_opt = rx60.take_waterfall_col();
+            let pct = (chunk_peak as f32 / 32767.0) * 100.0;
+            chunk_peak = 0;
+            let mut st = state.lock().unwrap();
+            st.peak_pct = pct;
+            if let Some(packed) = wf_opt {
+                let mut bins = [0u8; 24];
+                for b in 0..12 {
+                    bins[b * 2] = packed[b] & 0x0F;
+                    bins[b * 2 + 1] = (packed[b] >> 4) & 0x0F;
+                }
+                st.push_wf(WfCol {
+                    bins,
+                    is_tx: false,
+                    slot_mark: first_wf,
+                });
+                first_wf = false;
+            }
+        }
+    }
+
+    let out = child
+        .wait_with_output()
+        .map_err(|e| format!("hackrf_transfer RX60 wait failed: {e}"))?;
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr);
+        if !err.contains("User cancel") && !err.contains("exiting") && state.lock().unwrap().running {
+            return Err(format!("hackrf_transfer RX60 exited {}: {}", out.status, err.trim()));
+        }
+    }
+    Ok((peak_abs as f32 / 32767.0) * 100.0)
 }
 
 fn append_qso_log(path: &str, entry: &QsoLogEntry) {
@@ -2510,6 +2633,12 @@ fn run_calibration(mode: CalMode, state: &Arc<Mutex<SharedState>>) {
 
 fn slot_worker(state: Arc<Mutex<SharedState>>) {
     let mut last_tx_slot: Option<u64> = None;
+    let mut last_tx_min: Option<u64> = None;
+    let mut rx60 = Receiver60::new();
+    let mut rx60_min: Option<u64> = None;
+    let mut rx60_subslots: u8 = 0;
+    let mut tx60_min: Option<(u64, TxJob)> = None;
+
     loop {
         if !state.lock().unwrap().running {
             break;
@@ -2517,6 +2646,210 @@ fn slot_worker(state: Arc<Mutex<SharedState>>) {
         let cal_mode = state.lock().unwrap().cal_request.take();
         if let Some(mode) = cal_mode {
             run_calibration(mode, &state);
+            continue;
+        }
+
+        let is_mode60 = state.lock().unwrap().cfg.mode60;
+        if is_mode60 {
+            let now_ms = utc_now_ms();
+            let in_slot = now_ms % 10_000;
+            let rem_ms = 10_000 - in_slot;
+            let next_slot = (now_ms + rem_ms + 50) / 10_000;
+            let next_min = next_slot / 6;
+            let next_sub = next_slot % 6;
+
+            // Check if we'll TX on next_sub (0..5) of next_min.
+            let will_tx = next_sub < 5
+                && (tx60_min.as_ref().is_some_and(|(m, _)| *m == next_min)
+                    || (next_sub == 0
+                        && last_tx_min.is_none_or(|prev| next_min >= prev + 2)
+                        && {
+                            let st = state.lock().unwrap();
+                            let q_ready = st
+                                .tx_queue
+                                .front()
+                                .is_some_and(|j| j.parity.is_none_or(|p| next_min % 2 == p));
+                            q_ready || (st.tx_queue.is_empty() && st.auto_cq && (next_min % 2 == st.cq_parity))
+                        }));
+
+            let lead_ms = if will_tx { 350 } else { 0 };
+            if in_slot > 250 && rem_ms > lead_ms {
+                {
+                    let mut st = state.lock().unwrap();
+                    st.phase = SlotPhase::Waiting;
+                    st.phase_note = format!("60s mode: syncing to :{:02}s...", (next_sub * 10));
+                }
+                let mut left = rem_ms - lead_ms;
+                while left > 0 {
+                    let (running, has_cal, still60) = {
+                        let st = state.lock().unwrap();
+                        (st.running, st.cal_request.is_some(), st.cfg.mode60)
+                    };
+                    if !running {
+                        return;
+                    }
+                    if has_cal || !still60 {
+                        break;
+                    }
+                    let d = left.min(100);
+                    thread::sleep(Duration::from_millis(d));
+                    left -= d;
+                }
+                continue;
+            }
+
+            let slot_ms = utc_now_ms() + 500;
+            let slot = slot_ms / 10_000;
+            let minute = slot / 6;
+            let sub = slot % 6;
+            let utc_sec = slot * 10;
+
+            // Sub-slot 5 (:50..:59) is PA cooldown + decode turnaround!
+            if sub == 5 {
+                if rx60_min == Some(minute) && rx60_subslots > 0 {
+                    let mut decoded = [Decoded::EMPTY; MAX_DECODED];
+                    let n = rx60.finish_minute(&mut decoded);
+                    let frames = decoded[..n].to_vec();
+                    let mut st = state.lock().unwrap();
+                    st.slots_rx += 1;
+                    if frames.is_empty() {
+                        let dial_mhz = st.cfg.dial_hz as f64 / 1e6;
+                        st.push_event(format!(
+                            "[{}] RX60 {:.3}MHz ({} sub-slots) 0 decodes",
+                            format_utc_hms(utc_sec),
+                            dial_mhz,
+                            rx60_subslots
+                        ));
+                        drop(st);
+                    } else {
+                        drop(st);
+                        handle_decoded(&state, minute, &frames);
+                    }
+                    rx60_min = None;
+                    rx60_subslots = 0;
+                }
+                {
+                    let mut st = state.lock().unwrap();
+                    st.phase = SlotPhase::Waiting;
+                    st.phase_note = "60s mode: :50-:59 cooldown / decode guard".to_string();
+                }
+                thread::sleep(Duration::from_millis(400));
+                continue;
+            }
+
+            // Decide TX vs RX at sub-slot 0 (or continue active TX minute across sub 0..=4).
+            let (cfg, tx_job) = {
+                let mut st = state.lock().unwrap();
+                if !st.running {
+                    break;
+                }
+                let job = if let Some((m, ref j)) = tx60_min {
+                    if m == minute {
+                        Some(j.clone())
+                    } else {
+                        tx60_min = None;
+                        None
+                    }
+                } else {
+                    None
+                };
+                let job = if job.is_some() {
+                    job
+                } else if sub == 0 && last_tx_min.is_none_or(|prev| minute >= prev + 2) {
+                    let j = if st
+                        .tx_queue
+                        .front()
+                        .is_some_and(|j| j.parity.is_none_or(|p| minute % 2 == p))
+                    {
+                        st.tx_queue.pop_front()
+                    } else if st.tx_queue.is_empty() && st.auto_cq && (minute % 2 == st.cq_parity) {
+                        let frame = Frame::Cq {
+                            sender: st.cfg.call,
+                            grid4: st.cfg.grid4,
+                            tx_pwr: 10,
+                            reserved: (st.cfg.suffix & 0x0F) as u16,
+                        };
+                        Some(TxJob {
+                            frame,
+                            subch: st.cfg.subch,
+                            summary: format!("60s CQ {} {}", st.cfg.call_str, st.cfg.grid_str),
+                            parity: Some(st.cq_parity),
+                        })
+                    } else {
+                        None
+                    };
+                    if let Some(ref jj) = j {
+                        tx60_min = Some((minute, jj.clone()));
+                        last_tx_min = Some(minute);
+                    }
+                    j
+                } else {
+                    None
+                };
+                (st.cfg.clone(), job)
+            };
+
+            if let Some(job) = tx_job {
+                {
+                    let mut st = state.lock().unwrap();
+                    st.phase = if cfg.dry_tx { SlotPhase::DryTx } else { SlotPhase::Tx };
+                    st.phase_note = format!("60s TX ({}/5) {}", sub + 1, job.summary);
+                    if sub == 0 {
+                        st.push_event(format!(
+                            "[{}] {}60 {:.3}MHz {}Hz  {}",
+                            format_utc_hms(utc_sec),
+                            if cfg.dry_tx { "DRY-TX" } else { "TX    " },
+                            cfg.dial_hz as f64 / 1e6,
+                            SUBCHANNELS_HZ[job.subch],
+                            job.summary
+                        ));
+                    }
+                }
+                match transmit_slot(&cfg, &job, &state) {
+                    Ok(()) => {
+                        if sub == 4 {
+                            state.lock().unwrap().slots_tx += 1;
+                        }
+                    }
+                    Err(e) => {
+                        state
+                            .lock()
+                            .unwrap()
+                            .push_event(format!("[{}] TX60 ERROR: {e}", format_utc_hms(utc_sec)));
+                    }
+                }
+            } else {
+                if rx60_min != Some(minute) {
+                    rx60.reset();
+                    rx60_min = Some(minute);
+                    rx60_subslots = 0;
+                } else {
+                    rx60.start_subslot();
+                }
+                {
+                    let mut st = state.lock().unwrap();
+                    st.phase = SlotPhase::Rx;
+                    st.phase_note = format!(
+                        "60s RX ({}/5) {:.3} MHz ({})",
+                        sub + 1,
+                        cfg.dial_hz as f64 / 1e6,
+                        band_name(cfg.dial_hz)
+                    );
+                }
+                match receive_subslot_rx60(&cfg, &state, &mut rx60) {
+                    Ok(peak_pct) => {
+                        rx60_subslots = rx60_subslots.saturating_add(1);
+                        state.lock().unwrap().peak_pct = peak_pct;
+                    }
+                    Err(e) => {
+                        state
+                            .lock()
+                            .unwrap()
+                            .push_event(format!("[{}] RX60 ERROR: {e}", format_utc_hms(utc_sec)));
+                        thread::sleep(Duration::from_millis(800));
+                    }
+                }
+            }
             continue;
         }
 
@@ -2847,7 +3180,7 @@ impl TuiState {
     }
 }
 
-const SETTINGS_COUNT: usize = 16;
+const SETTINGS_COUNT: usize = 17;
 
 fn render_tui(state: &Arc<Mutex<SharedState>>, tui: &TuiState) {
     let (cols, rows) = term_size();
@@ -2886,6 +3219,11 @@ fn render_tui(state: &Arc<Mutex<SharedState>>, tui: &TuiState) {
     } else {
         ""
     };
+    let mode60_badge = if st.cfg.mode60 {
+        "\x1b[1;30;46m 60s \x1b[0;1;37;44m"
+    } else {
+        ""
+    };
     let header = format!(
         " RAD950 HackRF  |  {} [{}]  |  {:.3} MHz ({})  |  Subch {} ({} Hz)  |  {} ",
         st.cfg.call_str,
@@ -2896,7 +3234,7 @@ fn render_tui(state: &Arc<Mutex<SharedState>>, tui: &TuiState) {
         SUBCHANNELS_HZ[st.cfg.subch],
         format_utc_hms(now_ms / 1000)
     );
-    buf.push_str(&format!("\x1b[1;37;44m{header}{tx_badge}{cq_badge}{hunt_badge}{spot_badge}\x1b[K\x1b[0m\r\n"));
+    buf.push_str(&format!("\x1b[1;37;44m{header}{tx_badge}{mode60_badge}{cq_badge}{hunt_badge}{spot_badge}\x1b[K\x1b[0m\r\n"));
 
     // 2. Slot progress bar + Audio Peak
     let (phase_col, phase_lbl) = match st.phase {
@@ -3170,6 +3508,15 @@ fn render_tui(state: &Arc<Mutex<SharedState>>, tui: &TuiState) {
                     mask_spot_key(&st.cfg.spot_key),
                     "Enter to paste r950_... Bearer key",
                 ),
+                (
+                    "Cycle Mode",
+                    if st.cfg.mode60 {
+                        "60s Weak-Sig (5x10s)".into()
+                    } else {
+                        "10s Standard (v1)".into()
+                    },
+                    "←/→ or Enter to toggle 10s / 60s",
+                ),
             ];
 
             for i in 0..body_rows.saturating_sub(1) {
@@ -3371,6 +3718,14 @@ fn adjust_setting(state: &Arc<Mutex<SharedState>>, tui: &mut TuiState, delta: i3
                 tui.set_toast("Live Spotting OFF");
             }
         }
+        16 => {
+            st.cfg.mode60 = !st.cfg.mode60;
+            tui.set_toast(if st.cfg.mode60 {
+                "Cycle Mode -> 60s Weak-Sig (5x10s bursts + :50 cooldown)"
+            } else {
+                "Cycle Mode -> 10s Standard (v1)"
+            });
+        }
         _ => {}
     }
 }
@@ -3495,7 +3850,42 @@ fn run_loopback_selftest() -> ExitCode {
         );
     }
 
-    println!("=== Loopback self-test PASSED (2/2) ===");
+    // 3rd loopback: RAD950-60 (5x repeated 10s cs8 bursts -> USB DDC -> Receiver60)
+    {
+        let cq60 = Frame::Cq {
+            sender: nq6n,
+            grid4: fn31,
+            tx_pwr: 10,
+            reserved: 0,
+        };
+        let cs8 = synthesize_tx_cs8(cq60, 2);
+        let mut rx60 = Receiver60::new();
+        let mut pcm = Vec::with_capacity(512);
+        for sub in 0..5 {
+            if sub > 0 {
+                rx60.start_subslot();
+            }
+            let mut ddc = UsbDdc::new();
+            for chunk in cs8.chunks(48_000) {
+                pcm.clear();
+                ddc.process_cs8(chunk, &mut pcm);
+                rx60.push_samples(&pcm);
+            }
+        }
+        let mut out = [Decoded::EMPTY; MAX_DECODED];
+        let n = rx60.finish_minute(&mut out);
+        println!("  RAD950-60 5x CQ NQ6N FN31 (subch 2 = 1050 Hz): -> {n} decode(s)");
+        if n == 0 || out[0].frame.pack_u64() != cq60.pack_u64() {
+            eprintln!("  FAIL (RAD950-60): expected {:?}, got {:?}", cq60, &out[..n]);
+            return ExitCode::from(1);
+        }
+        println!(
+            "    PASS: decoded {:?} at {} Hz, SNR {:+} dB",
+            out[0].frame, out[0].audio_hz, out[0].snr_db
+        );
+    }
+
+    println!("=== Loopback self-test PASSED (3/3) ===");
     ExitCode::SUCCESS
 }
 
@@ -3513,6 +3903,7 @@ fn main() -> ExitCode {
     let mut dry_tx = false;
     let mut rendezvous = false;
     let mut auto_answer = AutoAnswer::Off;
+    let mut mode60 = false;
     let mut spot_enabled = false;
     let mut spot_url = env::var("RAD950_SPOT_URL")
         .ok()
@@ -3564,6 +3955,7 @@ fn main() -> ExitCode {
                 }
             }
             "--spot" => spot_enabled = true,
+            "--mode60" => mode60 = true,
             "--spot-url" if i + 1 < args.len() => {
                 i += 1;
                 spot_url = args[i].clone();
@@ -3709,6 +4101,7 @@ fn main() -> ExitCode {
         spot_enabled,
         spot_url,
         spot_key,
+        mode60,
     };
 
     let (worked_calls, worked_grids_all, worked_grids_band) = load_existing_log(&cfg.log_path);
@@ -4061,6 +4454,15 @@ fn main() -> ExitCode {
                                 BANDS[next].0,
                                 BANDS[next].1 as f64 / 1e6
                             ));
+                        }
+                        Key::Char('6') => {
+                            let mut st = state.lock().unwrap();
+                            st.cfg.mode60 = !st.cfg.mode60;
+                            tui.set_toast(if st.cfg.mode60 {
+                                "Cycle Mode -> 60s Weak-Sig (5x10s bursts + :50 cooldown)"
+                            } else {
+                                "Cycle Mode -> 10s Standard (v1)"
+                            });
                         }
                         Key::Char('d') => {
                             let mut st = state.lock().unwrap();

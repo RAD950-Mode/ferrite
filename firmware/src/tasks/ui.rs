@@ -1628,7 +1628,10 @@ async fn sol950_step(
     }
 
     let open = app.sol950_open();
-    if open != *dec_on {
+    let mode60 = app.sol950_mode60();
+    static LAST_MODE60: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+    let mode_changed = open && *dec_on && LAST_MODE60.load(Relaxed) != mode60;
+    if open != *dec_on || mode_changed {
         if open {
             // Raise MCU clock to full speed BEFORE waking the higher-priority DSP task, even if LPM is active.
             crate::hal::clock::AUDIO_RAISES.store(!app.settings().mcu_fixed, Relaxed);
@@ -1637,7 +1640,7 @@ async fn sol950_step(
             }
         }
         let cmd = if open {
-            DspCmd::Decoder(DecoderKind::Sol950)
+            DspCmd::Decoder(if mode60 { DecoderKind::Sol950_60 } else { DecoderKind::Sol950 })
         } else if app.aprs_on() {
             DspCmd::Decoder(DecoderKind::Afsk)
         } else {
@@ -1645,6 +1648,7 @@ async fn sol950_step(
         };
         if crate::chan::DSP.try_send(cmd).is_ok() {
             *dec_on = open;
+            LAST_MODE60.store(mode60, Relaxed);
         }
     }
     if !open {
@@ -1768,6 +1772,9 @@ async fn sol950_step(
 
     if app.sol950_take_reset() {
         let _ = crate::chan::DSP.try_send(DspCmd::Sol950Reset);
+    }
+    if app.sol950_take_subslot() {
+        let _ = crate::chan::DSP.try_send(DspCmd::Sol950Subslot);
     }
 
     if let Some((utc_slot, dial_hz, coop_capture)) = app.sol950_take_finish() {

@@ -588,6 +588,8 @@ pub struct Sol950Profile {
     pub coop_rx: CoopRxMode,
     /// Cooperative RX link transport (`Usb` or `Bluetooth`).
     pub coop_link: CoopLink,
+    /// `RAD950-60` 1-minute weak-signal cycle (`5 × 10 s` v1 bursts in `:00..:49`, `:50..:59` cooldown/decode).
+    pub mode60: bool,
 }
 
 impl Default for Sol950Profile {
@@ -611,6 +613,7 @@ impl Sol950Profile {
             tx_power: 0,
             coop_rx: CoopRxMode::Off,
             coop_link: CoopLink::Usb,
+            mode60: false,
         }
     }
 
@@ -811,6 +814,11 @@ pub struct Sol950Host {
     pub finish_due: bool,
     /// True when the platform should send `DspCmd::Sol950Reset` to clear muted TX-slot samples before RX.
     pub reset_due: bool,
+    /// True when the platform should send `DspCmd::Sol950Subslot` (`:10..:40` of a `RAD950-60` RX minute).
+    pub subslot_due: bool,
+    /// Active `RAD950-60` TX minute (`utc_sec / 60`) and repeated burst `(rf_freq, power, subch_hz, frame)`.
+    tx60_min: u32,
+    tx60_frame: Option<(Freq10, u8, u16, Frame)>,
     /// Set true only after durable storage confirms a completed contact was written.
     pub saved_ack: bool,
     /// Set true if durable flash log is full (non-overwriting).
@@ -890,6 +898,9 @@ impl Sol950Host {
             pending_tx: None,
             finish_due: false,
             reset_due: false,
+            subslot_due: false,
+            tx60_min: u32::MAX,
+            tx60_frame: None,
             saved_ack: false,
             log_full: false,
             last_qso: None,
@@ -998,6 +1009,67 @@ impl Sol950Host {
                 };
                 self.wf.push(col, slot_ms < 220, true);
             }
+        }
+        // `RAD950-60` 1-minute weak-signal mode: 5× repeated 10 s v1 bursts (`:00..:40`) + `:50..:59` cooldown/decode.
+        if self.profile.mode60 {
+            let minute = slot / 6;
+            let sub = slot % 6;
+            if sub == 4 && sec_in_slot == 9 && ms_in_sec >= 550 && self.finish_sent_slot != slot {
+                self.finish_sent_slot = slot;
+                if !self.tx_in_flight && self.tx60_min != minute {
+                    self.queue_finish();
+                }
+            }
+            if slot != self.last_slot {
+                self.last_slot = slot;
+                self.rx_slot_start = utc_sec - sec_in_slot;
+                self.rx_slot_dial_hz = self.active_dial().saturating_mul(10);
+                self.rx_slot_coop_capture = false;
+                let utc_ok = self.utc_ready() && self.profile.callsign().is_some();
+
+                if sub == 5 {
+                    // `:50..:59` PA cooldown + decode turnaround guard
+                    if self.tx60_min == minute {
+                        self.reset_due = true;
+                    }
+                    self.tx60_frame = None;
+                    return;
+                }
+                if sub == 0 {
+                    self.tx60_frame = None;
+                    let plan = self.engine.begin_slot(minute, utc_ok);
+                    if let SlotPlan::Tx { window, subchannel_hz, frame } = plan {
+                        if utc_ok && !self.tx_in_flight {
+                            let rf_freq = window.saturating_add(subchannel_hz as u32 / 10);
+                            self.tx_subch_hz = subchannel_hz;
+                            self.tx_tones = ferrite_core::sol950::usol950::encode_tones(frame);
+                            self.pending_tx = Some((rf_freq, self.profile.tx_power, frame));
+                            self.tx60_min = minute;
+                            self.tx60_frame = Some((rf_freq, self.profile.tx_power, subchannel_hz, frame));
+                            self.finish_sent_slot = slot;
+                            self.tx_slot = slot;
+                        } else {
+                            self.engine.on_tx_missed_deadline(minute);
+                        }
+                    } else {
+                        self.reset_due = true;
+                    }
+                } else if self.tx60_min == minute {
+                    // Sub-slots 1..=4 of an active TX minute: repeat exact same v1 burst
+                    if let Some((rf_freq, pwr, subch_hz, frame)) = self.tx60_frame {
+                        if utc_ok && !self.tx_in_flight {
+                            self.tx_subch_hz = subch_hz;
+                            self.pending_tx = Some((rf_freq, pwr, frame));
+                            self.finish_sent_slot = slot;
+                            self.tx_slot = slot;
+                        }
+                    }
+                } else {
+                    // Sub-slots 1..=4 of an RX minute: advance Receiver60 sub-slot counter while keeping folded spectrogram
+                    self.subslot_due = true;
+                }
+            }
+            return;
         }
         // Finish the RX slot decoder at `+9.55 s` (after the latest valid burst at `start_sym=9` ends at `+9.52 s`).
         // On the 120 MHz M4, 8-track x 3-branch LDPC `finish_slot()` takes ~420 ms, so `Receiver::reset()` +
@@ -1145,7 +1217,13 @@ impl Sol950Host {
     }
 
     pub fn on_rx_frame(&mut self, d: Decoded) {
-        let slot = if self.last_slot == u32::MAX { 0 } else { self.last_slot };
+        let slot = if self.last_slot == u32::MAX {
+            0
+        } else if self.profile.mode60 {
+            self.last_slot / 6
+        } else {
+            self.last_slot
+        };
         if self.chat.on_rx_frame(d.frame, slot) {
             return;
         }
@@ -1204,7 +1282,17 @@ impl Sol950Host {
             self.chat.on_tx_done(ok);
             return;
         }
-        let slot = if self.last_slot == u32::MAX { 0 } else { self.last_slot };
+        let slot = if self.last_slot == u32::MAX {
+            0
+        } else if self.profile.mode60 {
+            if self.last_slot % 6 != 4 {
+                // Only finalize the 60 s TX minute after the 5th repeated sub-burst (:40) completes.
+                return;
+            }
+            self.last_slot / 6
+        } else {
+            self.last_slot
+        };
         if ok {
             if let Some(rec) = self.engine.confirm_tx_completed(slot) {
                 self.persist_qso(rec);
@@ -1315,6 +1403,16 @@ impl App {
     /// Take the `DspCmd::Sol950Reset` trigger after a TX slot so the DSP receiver restarts cleanly at 0.00 s.
     pub fn sol950_take_reset(&mut self) -> bool {
         self.sol950d.as_deref_mut().is_some_and(|h| core::mem::take(&mut h.reset_due))
+    }
+
+    /// Take the `DspCmd::Sol950Subslot` trigger for `:10..:40` sub-slots inside a `RAD950-60` RX minute.
+    pub fn sol950_take_subslot(&mut self) -> bool {
+        self.sol950d.as_deref_mut().is_some_and(|h| core::mem::take(&mut h.subslot_due))
+    }
+
+    /// Whether `RAD950-60` (1-minute weak-signal cycle) is currently selected.
+    pub fn sol950_mode60(&self) -> bool {
+        self.sol950d.as_ref().is_some_and(|h| h.profile.mode60)
     }
 
     /// Maximum sleep duration (ms) for the UI task while SOL950 is active, so `DspCmd::Sol950Finish`

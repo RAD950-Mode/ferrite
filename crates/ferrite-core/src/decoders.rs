@@ -9,6 +9,7 @@ use udsc::Receiver as Dsc;
 use uafsk::Demodulator as Afsk;
 use upocsag::Receiver as Pocsag;
 use usol950::Receiver as Sol950;
+use usol950::Receiver60 as Sol950_60;
 
 /// Audio rate the DSP task feeds the decoders.
 pub const RATE_HZ: u32 = 24_000;
@@ -22,6 +23,7 @@ union DecoderInner {
     pocsag: ManuallyDrop<Pocsag>,
     dsc: ManuallyDrop<Dsc>,
     sol950: ManuallyDrop<Sol950>,
+    sol950_60: ManuallyDrop<Sol950_60>,
 }
 
 /// Shared decoder slot: holds one active decoder at a time inside a single `<= 13 KB` union,
@@ -117,6 +119,12 @@ impl Decoder {
                 }
                 self.kind = DecoderKind::Sol950;
             }
+            DecoderKind::Sol950_60 => {
+                unsafe {
+                    Sol950_60::init_in_place(core::ptr::addr_of_mut!(self.inner.sol950_60) as *mut Sol950_60);
+                }
+                self.kind = DecoderKind::Sol950_60;
+            }
         }
     }
 
@@ -125,6 +133,10 @@ impl Decoder {
         if self.kind == DecoderKind::Sol950 {
             let d = unsafe { &*self.inner.sol950 };
             d.diag()
+        } else if self.kind == DecoderKind::Sol950_60 {
+            let d = unsafe { &*self.inner.sol950_60 };
+            let (syms, sub) = d.diag();
+            (syms, sub, false)
         } else {
             (0, 0, false)
         }
@@ -135,12 +147,15 @@ impl Decoder {
         if self.kind == DecoderKind::Sol950 {
             let d = unsafe { &mut *self.inner.sol950 };
             d.take_wf_col()
+        } else if self.kind == DecoderKind::Sol950_60 {
+            let d = unsafe { &mut *self.inner.sol950_60 };
+            d.take_waterfall_col()
         } else {
             None
         }
     }
 
-    /// Finish the current 10 s SOL950 UTC slot, write decoded frames to `out`, optionally export the best
+    /// Finish the current SOL950 slot (or 60 s minute), write decoded frames to `out`, optionally export the best
     /// failed-CRC soft candidate for Cooperative RX, and reset for the next slot.
     #[inline(never)]
     pub fn sol950_finish_with_soft(
@@ -153,15 +168,29 @@ impl Decoder {
             let n = d.finish_slot_with_soft(out, soft);
             d.reset();
             n
+        } else if self.kind == DecoderKind::Sol950_60 {
+            let d = unsafe { &mut *self.inner.sol950_60 };
+            let n = d.finish_minute(out);
+            d.reset();
+            n
         } else {
             0
         }
     }
 
-    /// Reset the SOL950 receiver for a fresh 10 s RX slot without running `finish_slot` (used after a TX slot).
+    /// Reset the SOL950 receiver for a fresh RX slot/minute without running LDPC decode (used after a TX slot).
     pub fn sol950_reset(&mut self) {
         if self.kind == DecoderKind::Sol950 {
             unsafe { (*self.inner.sol950).reset() };
+        } else if self.kind == DecoderKind::Sol950_60 {
+            unsafe { (*self.inner.sol950_60).reset() };
+        }
+    }
+
+    /// Advance `RAD950-60` to the next 10-second sub-burst inside the active 60 s RX minute.
+    pub fn sol950_start_subslot(&mut self) {
+        if self.kind == DecoderKind::Sol950_60 {
+            unsafe { (*self.inner.sol950_60).start_subslot() };
         }
     }
 
@@ -203,6 +232,10 @@ impl Decoder {
             }
             DecoderKind::Sol950 => {
                 let d = unsafe { &mut *self.inner.sol950 };
+                d.push_samples(block);
+            }
+            DecoderKind::Sol950_60 => {
+                let d = unsafe { &mut *self.inner.sol950_60 };
                 d.push_samples(block);
             }
         }
