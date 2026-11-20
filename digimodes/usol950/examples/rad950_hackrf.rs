@@ -191,6 +191,9 @@ struct TxJob {
     frame: Frame,
     subch: usize,
     summary: String,
+    /// Optional required slot parity (`0` = even, `1` = odd) so replies always fire on the
+    /// opposite parity from the slot we heard the peer transmit in (preventing Auto-CQ collisions).
+    parity: Option<u64>,
 }
 
 struct SharedState {
@@ -976,6 +979,7 @@ fn handle_decoded(state: &Arc<Mutex<SharedState>>, slot: u64, frames: &[Decoded]
                         frame: reply,
                         subch: my_subch,
                         summary,
+                        parity: Some((slot + 1) % 2),
                     });
                     let qso = QsoLogEntry {
                         utc_sec,
@@ -2169,7 +2173,11 @@ fn slot_worker(state: Arc<Mutex<SharedState>>) {
         let next_slot = (now_ms + rem_ms + 50) / 10_000;
         let will_tx = last_tx_slot.is_none_or(|prev| next_slot >= prev + 2) && {
             let st = state.lock().unwrap();
-            !st.tx_queue.is_empty() || (st.auto_cq && (next_slot % 2 == st.cq_parity))
+            let q_ready = st
+                .tx_queue
+                .front()
+                .is_some_and(|j| j.parity.is_none_or(|p| next_slot % 2 == p));
+            q_ready || (st.tx_queue.is_empty() && st.auto_cq && (next_slot % 2 == st.cq_parity))
         };
         let lead_ms = if will_tx { 350 } else { 0 };
         if in_slot > 250 && rem_ms > lead_ms {
@@ -2216,8 +2224,15 @@ fn slot_worker(state: Arc<Mutex<SharedState>>) {
             }
             let job = if !tx_allowed {
                 None
-            } else if let Some(j) = st.tx_queue.pop_front() {
-                Some(j)
+            } else if st
+                .tx_queue
+                .front()
+                .is_some_and(|j| j.parity.is_none_or(|p| slot % 2 == p))
+            {
+                st.tx_queue.pop_front()
+            } else if !st.tx_queue.is_empty() {
+                // Waiting for the opposite parity slot so we don't collide with the peer's TX slot.
+                None
             } else if st.auto_cq && (slot % 2 == st.cq_parity) {
                 let frame = Frame::Cq {
                     sender: st.cfg.call,
@@ -2229,6 +2244,7 @@ fn slot_worker(state: Arc<Mutex<SharedState>>) {
                     frame,
                     subch: st.cfg.subch,
                     summary: format!("CQ {} {}", st.cfg.call_str, st.cfg.grid_str),
+                    parity: Some(st.cq_parity),
                 })
             } else {
                 None
@@ -3279,6 +3295,7 @@ fn main() -> ExitCode {
             frame,
             subch: cfg.subch,
             summary: format!("CQ {} {}", cfg.call_str, cfg.grid_str),
+            parity: None,
         };
         println!(
             "TX-ONCE: {} on {:.3} MHz (cal {:+.1} ppm, subch {} = {} Hz, tx_gain={} dB, dry={})",
@@ -3319,6 +3336,7 @@ fn main() -> ExitCode {
             frame,
             subch: cfg.subch,
             summary: format!("{} de {} {tag} {:+}dB", to_str, cfg.call_str, snr_db),
+            parity: None,
         };
         println!(
             "TX-REPLY: {} on {:.3} MHz (cal {:+.1} ppm, subch {} = {} Hz)",
@@ -3458,16 +3476,22 @@ fn main() -> ExitCode {
                                     reserved: false,
                                 };
                                 let subch = st.cfg.subch;
+                                let target_parity = (h.last_slot + 1) % 2;
                                 let summary = format!(
                                     "{} de {} RX {:+}dB",
                                     h.call_str, st.cfg.call_str, h.snr_db
                                 );
+                                st.auto_cq = false;
                                 st.tx_queue.push_front(TxJob {
                                     frame,
                                     subch,
                                     summary: summary.clone(),
+                                    parity: Some(target_parity),
                                 });
-                                tui.set_toast(format!("Queued answer: {summary}"));
+                                tui.set_toast(format!(
+                                    "Queued answer ({} slot): {summary}",
+                                    if target_parity == 0 { "even" } else { "odd" }
+                                ));
                             } else {
                                 tui.set_toast("No heard station selected");
                             }
@@ -3489,6 +3513,7 @@ fn main() -> ExitCode {
                                     frame,
                                     subch,
                                     summary: summary.clone(),
+                                    parity: None,
                                 });
                                 tui.set_toast(format!("Queued CQ for next TX slot: {summary}"));
                             }

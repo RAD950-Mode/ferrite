@@ -591,7 +591,9 @@ impl Engine {
         // 1. Explicit `owed_reply` (`ACK=1` prioritized ahead of `ACK=0`, highest SNR first).
         let mut best: Option<(usize, bool, u8, i8)> = None;
         for (i, p) in self.peers.iter().enumerate() {
-            if !p.active || p.window != window {
+            // Only transmit on the opposite parity from the slot we last heard `p` in,
+            // preventing same-parity collisions with a peer running Auto-CQ.
+            if !p.active || p.window != window || ((slot ^ p.last_seen_slot) & 1) == 0 {
                 continue;
             }
             if let Some(ack) = p.owed_reply {
