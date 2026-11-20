@@ -77,7 +77,18 @@ enum CalMode {
     Auto,
     WwvOnly,
     AmBcb,
+    Atsc,
+    Lte,
     Custom(u64),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CalKind {
+    Atomic,
+    LteGps,
+    AtscPilot,
+    Custom,
+    AmBcb,
 }
 
 #[derive(Clone)]
@@ -87,7 +98,7 @@ struct CalHit {
     offset_hz: f64,
     ppm: f64,
     snr_db: f64,
-    atomic: bool,
+    kind: CalKind,
     birdie: bool,
     peak_pct: f32,
 }
@@ -295,7 +306,9 @@ fn usage() {
     eprintln!("  --tx-once                 Transmit a single CQ immediately and exit (for bench/OTA tests)");
     eprintln!("  --log <PATH>              QSO log file path (default: rad950_hackrf.log)");
     eprintln!("  --slot-offset-ms <MS>     Shift 10 s slot clock by signed ms (for indoor non-GPS bench sync)");
-    eprintln!("  --calibrate               Auto self-calibrate ppm via WWV/CHU + AM broadcast carriers and exit");
+    eprintln!("  --calibrate               Auto self-calibrate ppm (LTE GPS -> ATSC TV -> WWV/CHU -> AM BCB)");
+    eprintln!("  --cal-lte                 Scan US LTE FDD downlink PSS (GPS-disciplined ±0.05 ppm) and exit");
+    eprintln!("  --cal-atsc                Scan UHF ATSC 1.0 TV pilot carriers (ch 14-36) and exit");
     eprintln!("  --cal-wwv                 Probe WWV/CHU atomic HF carriers only and exit");
     eprintln!("  --cal-am                  Scan AM broadcast band (540-1700 kHz, 10 kHz grid) and exit");
     eprintln!("  --cal-freq <HZ>           Probe a single known carrier frequency in Hz and exit");
@@ -1063,11 +1076,13 @@ fn fft_complex(re: &mut [f64], im: &mut [f64]) {
     }
 }
 
-/// Capture `n_samples` raw `cs8` IQ samples from HackRF One at `center_hz` (`2.4 MS/s`).
-fn capture_hackrf_cs8(
+/// Capture `n_samples` raw `cs8` IQ samples from HackRF One at `center_hz` and sample rate `fs_hz`.
+fn capture_hackrf_cs8_fs(
     serial: Option<&str>,
     center_hz: u64,
+    fs_hz: u32,
     n_samples: u64,
+    min_bytes: usize,
     lna_db: u8,
     vga_db: u8,
     amp: bool,
@@ -1079,7 +1094,7 @@ fn capture_hackrf_cs8(
         "-f",
         &center_hz.to_string(),
         "-s",
-        &HACKRF_FS.to_string(),
+        &fs_hz.to_string(),
         "-n",
         &n_samples.to_string(),
         "-a",
@@ -1143,7 +1158,7 @@ fn capture_hackrf_cs8(
     if let Some(e) = read_err {
         return Err(e);
     }
-    if raw.len() < 8192 * 400 * 2 {
+    if raw.len() < min_bytes {
         let mut err_str = String::new();
         if let Some(mut se) = child.stderr.take() {
             let _ = se.read_to_string(&mut err_str);
@@ -1151,6 +1166,27 @@ fn capture_hackrf_cs8(
         return Err(format!("short HackRF capture ({} bytes): {}", raw.len(), err_str.trim()));
     }
     Ok(raw)
+}
+
+/// Capture `n_samples` raw `cs8` IQ samples from HackRF One at `center_hz` (`2.4 MS/s`).
+fn capture_hackrf_cs8(
+    serial: Option<&str>,
+    center_hz: u64,
+    n_samples: u64,
+    lna_db: u8,
+    vga_db: u8,
+    amp: bool,
+) -> Result<Vec<u8>, String> {
+    capture_hackrf_cs8_fs(
+        serial,
+        center_hz,
+        HACKRF_FS,
+        n_samples,
+        8192 * 400 * 2,
+        lna_db,
+        vga_db,
+        amp,
+    )
 }
 
 /// Demodulate a target carrier at `target_hz` from a `2.4 MS/s` `cs8` capture centered at `center_hz`,
@@ -1281,7 +1317,7 @@ fn probe_single_carrier(
     cfg: &NodeConfig,
     label: &str,
     target_hz: u64,
-    atomic: bool,
+    kind: CalKind,
 ) -> Result<CalHit, String> {
     let center_hz = target_hz.saturating_sub(RF_OFFSET_HZ as u64).max(1_000_000);
     let n_samples: u64 = 400 * 8192 + 48_000; // ~1.39 s
@@ -1292,17 +1328,490 @@ fn probe_single_carrier(
     // HackRF internal 10/20 MHz clock harmonics land on 5 MHz multiples near ~0 ppm as pure unmodulated CW
     // (sidebands > 32 dB below carrier), whereas real off-air WWV carries 100/500/600/1000 Hz AM modulation.
     let is_5mhz_mult = target_hz.is_multiple_of(5_000_000);
-    let birdie = atomic && is_5mhz_mult && snr_db > 28.0 && ppm.abs() < 1.5 && (snr_db - sb_snr_db) > 32.0;
+    let birdie =
+        kind == CalKind::Atomic && is_5mhz_mult && snr_db > 28.0 && ppm.abs() < 1.5 && (snr_db - sb_snr_db) > 32.0;
     Ok(CalHit {
         label: label.to_string(),
         nominal_hz: target_hz,
         offset_hz,
         ppm,
         snr_db,
-        atomic,
+        kind,
         birdie,
         peak_pct,
     })
+}
+
+/// Measure a UHF carrier (such as an ATSC 1.0 TV pilot) with a wide `±45 kHz` (`±75 ppm` at 600 MHz)
+/// coarse search at 96 kHz baseband, followed by a fine 6 kHz FFT if `cs8` is long enough (~1.4 s).
+fn measure_uhf_pilot_iq(
+    cs8: &[u8],
+    center_hz: u64,
+    target_hz_f64: f64,
+    max_ppm: f64,
+) -> Option<(f64, f64, f32)> {
+    const COARSE_DECIM: usize = 25; // 2.4 MS/s -> 96,000 Hz complex baseband (±48 kHz)
+    const FFT_N: usize = 8192; // 96000 / 8192 = 11.71875 Hz/bin (~85.3 ms)
+    let need_coarse = COARSE_DECIM * FFT_N;
+    if cs8.len() < need_coarse * 2 {
+        return None;
+    }
+
+    let shift_hz = target_hz_f64 - center_hz as f64;
+    let dphi = -2.0 * std::f64::consts::PI * shift_hz / (HACKRF_FS as f64);
+    let (step_r, step_i) = (dphi.cos(), dphi.sin());
+    let mut re = vec![0.0f64; FFT_N];
+    let mut im = vec![0.0f64; FFT_N];
+    let (mut lo_r, mut lo_i) = (1.0f64, 0.0f64);
+    let mut max_abs = 0i32;
+
+    for out_k in 0..FFT_N {
+        let base = out_k * COARSE_DECIM * 2;
+        let (mut acc_r, mut acc_i) = (0.0f64, 0.0f64);
+        for m in 0..COARSE_DECIM {
+            let si = cs8[base + 2 * m] as i8;
+            let sq = cs8[base + 2 * m + 1] as i8;
+            max_abs = max_abs.max((si as i32).abs()).max((sq as i32).abs());
+            let (xi, xq) = (si as f64, sq as f64);
+            acc_r += xi * lo_r - xq * lo_i;
+            acc_i += xi * lo_i + xq * lo_r;
+            let nr = lo_r * step_r - lo_i * step_i;
+            lo_i = lo_r * step_i + lo_i * step_r;
+            lo_r = nr;
+        }
+        let mag = (lo_r * lo_r + lo_i * lo_i).sqrt();
+        if mag > 0.0 {
+            lo_r /= mag;
+            lo_i /= mag;
+        }
+        let w = 0.5 * (1.0 - (2.0 * std::f64::consts::PI * out_k as f64 / FFT_N as f64).cos());
+        re[out_k] = acc_r * w;
+        im[out_k] = acc_i * w;
+    }
+    fft_complex(&mut re, &mut im);
+
+    let fs_bb = HACKRF_FS as f64 / COARSE_DECIM as f64;
+    let bin_hz = fs_bb / FFT_N as f64;
+    let search_hz = (target_hz_f64 * max_ppm / 1_000_000.0).clamp(1_000.0, 44_000.0);
+    let search_bins = (search_hz / bin_hz).ceil() as isize;
+
+    let mut pwr = vec![0.0f64; FFT_N];
+    for k in 0..FFT_N {
+        pwr[k] = re[k] * re[k] + im[k] * im[k];
+    }
+    let mut best_s = 0isize;
+    let mut best_p = -1.0f64;
+    for s in -search_bins..=search_bins {
+        let idx = s.rem_euclid(FFT_N as isize) as usize;
+        if pwr[idx] > best_p {
+            best_p = pwr[idx];
+            best_s = s;
+        }
+    }
+    let idx_m = (best_s - 1).rem_euclid(FFT_N as isize) as usize;
+    let idx_0 = best_s.rem_euclid(FFT_N as isize) as usize;
+    let idx_p = (best_s + 1).rem_euclid(FFT_N as isize) as usize;
+    let (ym, y0, yp) = (
+        pwr[idx_m].max(1e-12).ln(),
+        pwr[idx_0].max(1e-12).ln(),
+        pwr[idx_p].max(1e-12).ln(),
+    );
+    let denom = ym - 2.0 * y0 + yp;
+    let delta = if denom.abs() > 1e-12 {
+        (0.5 * (ym - yp) / denom).clamp(-0.5, 0.5)
+    } else {
+        0.0
+    };
+    let coarse_offset_hz = (best_s as f64 + delta) * bin_hz;
+
+    let excl_bins = (200.0 / bin_hz).ceil() as isize;
+    let mut noise_bins = Vec::new();
+    for s in -search_bins..=search_bins {
+        if (s - best_s).abs() > excl_bins {
+            noise_bins.push(pwr[s.rem_euclid(FFT_N as isize) as usize]);
+        }
+    }
+    if noise_bins.is_empty() {
+        return None;
+    }
+    noise_bins.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let snr_db = 10.0 * (best_p / noise_bins[noise_bins.len() / 2].max(1e-12)).log10();
+    let peak_pct = (max_abs as f32 / 127.0) * 100.0;
+
+    // If we have a full ~1.4 s capture, refine around `coarse_offset_hz` at 0.73 Hz/bin!
+    if cs8.len() >= 400 * 8192 * 2 {
+        let fine_target = (target_hz_f64 + coarse_offset_hz).round() as u64;
+        if let Some((fine_err, fine_snr, _, fine_peak)) =
+            measure_carrier_iq(cs8, center_hz, fine_target, 1.0)
+        {
+            let total_err = (fine_target as f64 - target_hz_f64) + fine_err;
+            return Some((total_err, fine_snr, fine_peak));
+        }
+    }
+    Some((coarse_offset_hz, snr_db, peak_pct))
+}
+
+/// Scan North American UHF ATSC 1.0 TV channels 14..=36 (470–608 MHz) for strong VSB pilot carriers
+/// (`f_low + 309,440.559 Hz`), then run a 1.4 s precision FFT on the top 3 strongest stations.
+fn scan_atsc_pilots(cfg: &NodeConfig, state: &Arc<Mutex<SharedState>>) -> Result<Vec<CalHit>, String> {
+    let mut survey: Vec<(u32, f64, f64)> = Vec::new(); // (ch, pilot_hz, snr_db)
+    let survey_samples: u64 = 25 * 8192 + 24_000; // ~95 ms
+    for ch in 14u32..=36 {
+        if !state.lock().unwrap().running {
+            break;
+        }
+        let f_low = 470_000_000.0 + (ch - 14) as f64 * 6_000_000.0;
+        let pilot_hz = f_low + 309_440.559;
+        let center_hz = (pilot_hz - RF_OFFSET_HZ as f64).round() as u64;
+        {
+            let mut st = state.lock().unwrap();
+            st.cal_status = format!("Scanning ATSC UHF ch {ch} ({:.3} MHz)...", pilot_hz / 1e6);
+            st.phase_note = st.cal_status.clone();
+        }
+        if let Ok(cs8) = capture_hackrf_cs8_fs(
+            cfg.serial.as_deref(),
+            center_hz,
+            HACKRF_FS,
+            survey_samples,
+            25 * 8192 * 2,
+            24,
+            24,
+            false,
+        ) {
+            if let Some((_off, snr_db, _peak)) = measure_uhf_pilot_iq(&cs8, center_hz, pilot_hz, 70.0) {
+                if snr_db >= 16.0 {
+                    survey.push((ch, pilot_hz, snr_db));
+                }
+            }
+        }
+    }
+    survey.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+
+    let mut hits = Vec::new();
+    let fine_samples: u64 = 400 * 8192 + 48_000; // ~1.39 s
+    for &(ch, pilot_hz, _) in survey.iter().take(4) {
+        if !state.lock().unwrap().running {
+            break;
+        }
+        let center_hz = (pilot_hz - RF_OFFSET_HZ as f64).round() as u64;
+        {
+            let mut st = state.lock().unwrap();
+            st.cal_status = format!("Measuring ATSC ch {ch} pilot ({:.3} MHz)...", pilot_hz / 1e6);
+            st.phase_note = st.cal_status.clone();
+        }
+        if let Ok(cs8) = capture_hackrf_cs8(cfg.serial.as_deref(), center_hz, fine_samples, 24, 24, false) {
+            if let Some((offset_hz, snr_db, peak_pct)) =
+                measure_uhf_pilot_iq(&cs8, center_hz, pilot_hz, 70.0)
+            {
+                let ppm = (offset_hz / pilot_hz) * 1_000_000.0;
+                hits.push(CalHit {
+                    label: format!("ATSC ch {ch:<2}"),
+                    nominal_hz: pilot_hz.round() as u64,
+                    offset_hz,
+                    ppm,
+                    snr_db,
+                    kind: CalKind::AtscPilot,
+                    birdie: false,
+                    peak_pct,
+                });
+            }
+        }
+    }
+    hits.sort_by(|a, b| b.snr_db.partial_cmp(&a.snr_db).unwrap_or(std::cmp::Ordering::Equal));
+    Ok(hits)
+}
+
+/// Prime US LTE FDD downlink center frequencies (GPS-disciplined to ±0.05 ppm).
+const LTE_US_CENTERS: &[(&str, u64)] = &[
+    ("LTE B13 751.0M", 751_000_000),  // Verizon 10 MHz (nationwide)
+    ("LTE B12 739.0M", 739_000_000),  // AT&T 10 MHz
+    ("LTE B12 734.0M", 734_000_000),  // T-Mobile 5/10 MHz
+    ("LTE B12 742.5M", 742_500_000),  // AT&T/USCC
+    ("LTE B12 743.5M", 743_500_000),  // AT&T
+    ("LTE B5  880.0M", 880_000_000),  // AT&T/Verizon
+    ("LTE B5  874.0M", 874_000_000),  // AT&T
+    ("LTE B5  885.0M", 885_000_000),  // Verizon
+    ("LTE B5  890.0M", 890_000_000),  // Verizon
+    ("LTE B71 632.0M", 632_000_000),  // T-Mobile
+    ("LTE B71 642.0M", 642_000_000),  // T-Mobile
+    ("LTE B71 622.0M", 622_000_000),  // T-Mobile
+];
+
+/// Generate the 3 standard 128-sample time-domain LTE PSS templates (1.92 MS/s, Zadoff-Chu u = 25, 29, 34).
+fn make_lte_pss_templates() -> [[(f64, f64); 128]; 3] {
+    const ROOTS: [f64; 3] = [25.0, 29.0, 34.0];
+    let mut out = [[(0.0, 0.0); 128]; 3];
+    for (r_idx, &u) in ROOTS.iter().enumerate() {
+        let mut re = [0.0f64; 128];
+        let mut im = [0.0f64; 128];
+        for n in 0..62usize {
+            let angle = if n < 31 {
+                -std::f64::consts::PI * u * (n * (n + 1)) as f64 / 63.0
+            } else {
+                -std::f64::consts::PI * u * ((n + 1) * (n + 2)) as f64 / 63.0
+            };
+            // Subcarrier k in [-31..-1, +1..+31] mapped to FFT bins [97..127, 1..31].
+            let k = if n < 31 { 128 - 31 + n } else { 1 + (n - 31) };
+            // IFFT via conjugate-FFT: store conj(X[k]) then run forward FFT and conjugate.
+            re[k] = angle.cos();
+            im[k] = -angle.sin();
+        }
+        fft_complex(&mut re, &mut im);
+        let mut norm2 = 0.0f64;
+        for k in 0..128 {
+            im[k] = -im[k];
+            norm2 += re[k] * re[k] + im[k] * im[k];
+        }
+        let inv = 1.0 / norm2.sqrt().max(1e-12);
+        for k in 0..128 {
+            out[r_idx][k] = (re[k] * inv, im[k] * inv);
+        }
+    }
+    out
+}
+
+/// Correlate `iq` (at 1.92 MS/s) with an LTE PSS template shifted by `df_hz` at a specific sample index `pos`.
+fn lte_pss_corr_at(iq: &[(f64, f64)], tmpl: &[(f64, f64); 128], pos: usize, df_hz: f64) -> (f64, f64) {
+    let dphi = -2.0 * std::f64::consts::PI * df_hz / 1_920_000.0;
+    let (step_r, step_i) = (dphi.cos(), dphi.sin());
+    let (mut lo_r, mut lo_i) = (1.0f64, 0.0f64);
+    let (mut acc_r, mut acc_i) = (0.0f64, 0.0f64);
+    for m in 0..128 {
+        let (xi, xq) = iq[pos + m];
+        // Shift input by -df_hz, then multiply by conj(tmpl[m]).
+        let sr = xi * lo_r - xq * lo_i;
+        let si = xi * lo_i + xq * lo_r;
+        let (tr, ti) = tmpl[m];
+        acc_r += sr * tr + si * ti;
+        acc_i += si * tr - sr * ti;
+        let nr = lo_r * step_r - lo_i * step_i;
+        lo_i = lo_r * step_i + lo_i * step_r;
+        lo_r = nr;
+    }
+    (acc_r, acc_i)
+}
+
+/// Probe a single LTE downlink center frequency at 3.84 MS/s (2x 1.92 MS/s) using PSS correlation
+/// and 5.000 ms PSS-to-PSS coherent phase advance for sub-Hz (< 0.001 ppm) frequency accuracy.
+fn probe_lte_channel(
+    cfg: &NodeConfig,
+    label: &str,
+    center_hz: u64,
+    templates: &[[(f64, f64); 128]; 3],
+) -> Result<Option<CalHit>, String> {
+    const LTE_FS_RAW: u32 = 3_840_000;
+    const HALF_FRAME: usize = 9_600; // 5.000 ms at 1.92 MS/s
+    const N_SLOTS: usize = 10; // 50 ms span -> 10 PSS copies
+    const N_IQ: usize = HALF_FRAME * (N_SLOTS + 1) + 256;
+    let n_samples = (N_IQ * 2) as u64;
+
+    let cs8 = capture_hackrf_cs8_fs(
+        cfg.serial.as_deref(),
+        center_hz,
+        LTE_FS_RAW,
+        n_samples,
+        N_IQ * 4,
+        24,
+        24,
+        false,
+    )?;
+
+    // Decimate 3.84 MS/s -> 1.92 MS/s (2-tap sum) and remove DC bias.
+    let mut iq = Vec::with_capacity(N_IQ);
+    let mut max_abs = 0i32;
+    let (mut sum_i, mut sum_q) = (0.0f64, 0.0f64);
+    for k in 0..N_IQ {
+        let b = k * 4;
+        let i0 = cs8[b] as i8 as i32;
+        let q0 = cs8[b + 1] as i8 as i32;
+        let i1 = cs8[b + 2] as i8 as i32;
+        let q1 = cs8[b + 3] as i8 as i32;
+        max_abs = max_abs.max(i0.abs()).max(q0.abs()).max(i1.abs()).max(q1.abs());
+        let ri = (i0 + i1) as f64;
+        let rq = (q0 + q1) as f64;
+        sum_i += ri;
+        sum_q += rq;
+        iq.push((ri, rq));
+    }
+    let mean_i = sum_i / N_IQ as f64;
+    let mean_q = sum_q / N_IQ as f64;
+    for s in &mut iq {
+        s.0 -= mean_i;
+        s.1 -= mean_q;
+    }
+
+    // Coarse search: fold 2 half-frames via FFT correlation? Even faster: 16384-point FFT cross-correlation
+    // across 1 half-frame (9,600 samples) for each 5 kHz frequency hypothesis in ±45 kHz!
+    const C_N: usize = 16_384;
+    let mut tmpl_fft = vec![(vec![0.0f64; C_N], vec![0.0f64; C_N]); 3];
+    for t in 0..3 {
+        for m in 0..128 {
+            // Time-reversed conjugate for FFT cross-correlation: corr[n] = IFFT(FFT(x) * conj(FFT(h)))
+            tmpl_fft[t].0[m] = templates[t][m].0;
+            tmpl_fft[t].1[m] = templates[t][m].1;
+        }
+        let (ref mut tr, ref mut ti) = tmpl_fft[t];
+        fft_complex(tr, ti);
+    }
+
+    let mut best_snr = 0.0f64;
+    let mut best_tid = 0usize;
+    let mut best_pos = 0usize;
+    let mut best_df = 0.0f64;
+
+    let mut x_re = vec![0.0f64; C_N];
+    let mut x_im = vec![0.0f64; C_N];
+    let mut c_re = vec![0.0f64; C_N];
+    let mut c_im = vec![0.0f64; C_N];
+
+    for step in -9i32..=9 {
+        let df_hz = step as f64 * 5_000.0;
+        let dphi = -2.0 * std::f64::consts::PI * df_hz / 1_920_000.0;
+        let (sr, si) = (dphi.cos(), dphi.sin());
+        let (mut lr, mut li) = (1.0f64, 0.0f64);
+        for k in 0..C_N {
+            if k < HALF_FRAME + 128 {
+                let (xi, xq) = iq[k];
+                x_re[k] = xi * lr - xq * li;
+                x_im[k] = xi * li + xq * lr;
+                let nr = lr * sr - li * si;
+                li = lr * si + li * sr;
+                lr = nr;
+            } else {
+                x_re[k] = 0.0;
+                x_im[k] = 0.0;
+            }
+        }
+        fft_complex(&mut x_re, &mut x_im);
+
+        for (t, (tf_re, tf_im)) in tmpl_fft.iter().enumerate() {
+            for k in 0..C_N {
+                // Conjugate(X * conj(H)) -> forward FFT gives N * conj(corr)
+                let pr = x_re[k] * tf_re[k] + x_im[k] * tf_im[k];
+                let pi = x_im[k] * tf_re[k] - x_re[k] * tf_im[k];
+                c_re[k] = pr;
+                c_im[k] = -pi;
+            }
+            fft_complex(&mut c_re, &mut c_im);
+            let mut peak = 0.0f64;
+            let mut peak_i = 0usize;
+            let mut sum_p = 0.0f64;
+            for k in 0..HALF_FRAME {
+                let p = c_re[k] * c_re[k] + c_im[k] * c_im[k];
+                sum_p += p;
+                if p > peak {
+                    peak = p;
+                    peak_i = k;
+                }
+            }
+            let mean_p = (sum_p / HALF_FRAME as f64).max(1e-12);
+            let snr_db = 10.0 * (peak / mean_p).log10();
+            if snr_db > best_snr {
+                best_snr = snr_db;
+                best_tid = t;
+                best_pos = peak_i;
+                best_df = df_hz;
+            }
+        }
+    }
+
+    if best_snr < 17.5 {
+        return Ok(None);
+    }
+
+    // Refine timing (±2 samples) and frequency (±4 kHz in 250 Hz steps -> ±300 Hz in 25 Hz steps)
+    // coherently across all 10 consecutive 5.000 ms PSS copies!
+    let tmpl = &templates[best_tid];
+    let mut best_p2 = -1.0f64;
+    let mut ref_pos = best_pos;
+    for dp in -2isize..=2 {
+        let p0 = (best_pos as isize + dp).clamp(0, (HALF_FRAME - 1) as isize) as usize;
+        let (cr, ci) = lte_pss_corr_at(&iq, tmpl, p0, best_df);
+        let m2 = cr * cr + ci * ci;
+        if m2 > best_p2 {
+            best_p2 = m2;
+            ref_pos = p0;
+        }
+    }
+
+    let mut cur_df = best_df;
+    for &(span, step) in &[(4000.0f64, 250.0f64), (300.0, 25.0)] {
+        let n_steps = (span / step) as i32;
+        let mut best_coh = -1.0f64;
+        let mut win_df = cur_df;
+        for s in -n_steps..=n_steps {
+            let df = cur_df + s as f64 * step;
+            // Coherently sum all 10 PSS correlations compensated by exp(-j 2pi df * k * 0.005).
+            let (mut sum_r, mut sum_i) = (0.0f64, 0.0f64);
+            for k in 0..N_SLOTS {
+                let pos = ref_pos + k * HALF_FRAME;
+                let (cr, ci) = lte_pss_corr_at(&iq, tmpl, pos, df);
+                let phi = -2.0 * std::f64::consts::PI * df * (k as f64 * 0.005);
+                let (pr, pi) = (phi.cos(), phi.sin());
+                sum_r += cr * pr - ci * pi;
+                sum_i += cr * pi + ci * pr;
+            }
+            let coh = sum_r * sum_r + sum_i * sum_i;
+            if coh > best_coh {
+                best_coh = coh;
+                win_df = df;
+            }
+        }
+        cur_df = win_df;
+    }
+
+    // Final sub-Hz differential phase across consecutive 5.000 ms PSS slots.
+    let mut prev: Option<(f64, f64)> = None;
+    let (mut dsum_r, mut dsum_i) = (0.0f64, 0.0f64);
+    for k in 0..N_SLOTS {
+        let pos = ref_pos + k * HALF_FRAME;
+        let (cr, ci) = lte_pss_corr_at(&iq, tmpl, pos, cur_df);
+        let phi = -2.0 * std::f64::consts::PI * cur_df * (k as f64 * 0.005);
+        let (pr, pi) = (phi.cos(), phi.sin());
+        let dr = cr * pr - ci * pi;
+        let di = cr * pi + ci * pr;
+        if let Some((qr, qi)) = prev {
+            dsum_r += dr * qr + di * qi;
+            dsum_i += di * qr - dr * qi;
+        }
+        prev = Some((dr, di));
+    }
+    let resid_hz = dsum_i.atan2(dsum_r) / (2.0 * std::f64::consts::PI * 0.005);
+    let total_df = cur_df + resid_hz;
+    let ppm = (total_df / center_hz as f64) * 1_000_000.0;
+    let peak_pct = (max_abs as f32 / 127.0) * 100.0;
+
+    Ok(Some(CalHit {
+        label: format!("{label} #{best_tid}"),
+        nominal_hz: center_hz,
+        offset_hz: total_df,
+        ppm,
+        snr_db: best_snr,
+        kind: CalKind::LteGps,
+        birdie: false,
+        peak_pct,
+    }))
+}
+
+fn scan_lte_pss(cfg: &NodeConfig, state: &Arc<Mutex<SharedState>>) -> Result<Vec<CalHit>, String> {
+    let templates = make_lte_pss_templates();
+    let mut hits = Vec::new();
+    for &(label, freq_hz) in LTE_US_CENTERS {
+        if !state.lock().unwrap().running {
+            break;
+        }
+        {
+            let mut st = state.lock().unwrap();
+            st.cal_status = format!("Scanning {label} (LTE PSS)...");
+            st.phase_note = st.cal_status.clone();
+        }
+        if let Ok(Some(hit)) = probe_lte_channel(cfg, label, freq_hz, &templates) {
+            state.lock().unwrap().cal_hits.push(hit.clone());
+            hits.push(hit);
+        }
+    }
+    hits.sort_by(|a, b| b.snr_db.partial_cmp(&a.snr_db).unwrap_or(std::cmp::Ordering::Equal));
+    Ok(hits)
 }
 
 /// Single 1.4 s wideband capture across the entire AM broadcast band (540–1700 kHz, 10 kHz US grid),
@@ -1372,7 +1881,7 @@ fn scan_am_bcb(cfg: &NodeConfig) -> Result<Vec<CalHit>, String> {
                 offset_hz,
                 ppm,
                 snr_db,
-                atomic: false,
+                kind: CalKind::AmBcb,
                 birdie: false,
                 peak_pct,
             });
@@ -1383,10 +1892,42 @@ fn scan_am_bcb(cfg: &NodeConfig) -> Result<Vec<CalHit>, String> {
 }
 
 fn summarize_calibration(hits: &[CalHit]) -> Option<(f64, String)> {
-    // Priority 1: atomic HF standards (WWV/WWVH/CHU) with SNR >= 14 dB and not flagged as internal clock birdies.
+    // Priority 1: GPS-disciplined LTE downlink towers (±0.05 ppm spec, SNR >= 17.5 dB).
+    let mut lte_good: Vec<&CalHit> = hits
+        .iter()
+        .filter(|h| h.kind == CalKind::LteGps && h.snr_db >= 17.5)
+        .collect();
+    if !lte_good.is_empty() {
+        lte_good.sort_by(|a, b| a.ppm.partial_cmp(&b.ppm).unwrap_or(std::cmp::Ordering::Equal));
+        let med = lte_good[lte_good.len() / 2].ppm;
+        let cluster: Vec<&CalHit> = lte_good
+            .iter()
+            .copied()
+            .filter(|h| (h.ppm - med).abs() <= 1.0)
+            .collect();
+        let best = cluster
+            .iter()
+            .max_by(|a, b| a.snr_db.partial_cmp(&b.snr_db).unwrap_or(std::cmp::Ordering::Equal))
+            .copied()
+            .unwrap_or(lte_good[0]);
+        let wsum: f64 = cluster.iter().map(|h| h.snr_db.max(1.0)).sum();
+        let avg_ppm = cluster.iter().map(|h| h.ppm * h.snr_db.max(1.0)).sum::<f64>() / wsum;
+        return Some((
+            avg_ppm,
+            format!(
+                "LTE GPS ({}/{} towers agree, best {} {:.1} dB)",
+                cluster.len(),
+                lte_good.len(),
+                best.label,
+                best.snr_db
+            ),
+        ));
+    }
+
+    // Priority 2: atomic HF standards (WWV/WWVH/CHU) with SNR >= 14 dB and not flagged as internal clock birdies.
     let mut atomic_good: Vec<&CalHit> = hits
         .iter()
-        .filter(|h| h.atomic && !h.birdie && h.snr_db >= 14.0)
+        .filter(|h| h.kind == CalKind::Atomic && !h.birdie && h.snr_db >= 14.0)
         .collect();
     atomic_good.sort_by(|a, b| b.snr_db.partial_cmp(&a.snr_db).unwrap_or(std::cmp::Ordering::Equal));
     if let Some(best) = atomic_good.first() {
@@ -1405,18 +1946,39 @@ fn summarize_calibration(hits: &[CalHit]) -> Option<(f64, String)> {
         return Some((avg_ppm, desc));
     }
 
-    // Priority 2: single custom reference if present and SNR >= 14 dB.
-    if let Some(custom) = hits.iter().find(|h| h.label.starts_with("Custom") && h.snr_db >= 14.0) {
+    // Priority 3: ATSC 1.0 UHF TV pilots (SNR >= 18 dB), median across up to top 4 channels.
+    let mut atsc_good: Vec<&CalHit> = hits
+        .iter()
+        .filter(|h| h.kind == CalKind::AtscPilot && h.snr_db >= 18.0)
+        .take(4)
+        .collect();
+    if !atsc_good.is_empty() {
+        atsc_good.sort_by(|a, b| a.ppm.partial_cmp(&b.ppm).unwrap_or(std::cmp::Ordering::Equal));
+        let med_ppm = atsc_good[atsc_good.len() / 2].ppm;
+        let agreeing = atsc_good.iter().filter(|h| (h.ppm - med_ppm).abs() <= 2.0).count();
+        let best_snr = atsc_good.iter().map(|h| h.snr_db).fold(0.0f64, f64::max);
+        return Some((
+            med_ppm,
+            format!(
+                "ATSC TV pilot median ({agreeing}/{} stations within ±2 ppm, peak {:.1} dB)",
+                atsc_good.len(),
+                best_snr
+            ),
+        ));
+    }
+
+    // Priority 4: single custom reference if present and SNR >= 14 dB.
+    if let Some(custom) = hits.iter().find(|h| h.kind == CalKind::Custom && h.snr_db >= 14.0) {
         return Some((
             custom.ppm,
             format!("{} ({:.1} dB)", custom.label, custom.snr_db),
         ));
     }
 
-    // Priority 3: median across strong AM BCB carriers (SNR >= 18 dB) so any slightly off-freq station cancels out.
+    // Priority 5: median across strong AM BCB carriers (SNR >= 18 dB).
     let mut am_good: Vec<&CalHit> = hits
         .iter()
-        .filter(|h| !h.atomic && h.snr_db >= 18.0)
+        .filter(|h| h.kind == CalKind::AmBcb && h.snr_db >= 18.0)
         .take(7)
         .collect();
     if am_good.is_empty() {
@@ -1451,7 +2013,63 @@ fn run_calibration(mode: CalMode, state: &Arc<Mutex<SharedState>>) {
     let mut all_hits: Vec<CalHit> = Vec::new();
 
     match mode {
-        CalMode::Auto | CalMode::WwvOnly => {
+        CalMode::Auto => {
+            // Stage 1: GPS-disciplined LTE downlink towers (±0.05 ppm, works indoors).
+            if let Ok(lte_hits) = scan_lte_pss(&cfg, state) {
+                all_hits.extend(lte_hits);
+            }
+            // If LTE didn't lock strongly, try UHF ATSC 1.0 TV pilots.
+            if summarize_calibration(&all_hits).is_none() && state.lock().unwrap().running {
+                if let Ok(atsc_hits) = scan_atsc_pilots(&cfg, state) {
+                    all_hits.extend(atsc_hits.iter().cloned());
+                    state.lock().unwrap().cal_hits.extend(atsc_hits);
+                }
+            }
+            // If neither LTE nor ATSC locked, fall back to WWV/CHU atomic HF + AM broadcast band.
+            if summarize_calibration(&all_hits).is_none() && state.lock().unwrap().running {
+                for &(label, freq_hz) in WWV_REFS {
+                    if !state.lock().unwrap().running {
+                        break;
+                    }
+                    {
+                        let mut st = state.lock().unwrap();
+                        st.cal_status = format!("Probing {label}...");
+                        st.phase_note = st.cal_status.clone();
+                    }
+                    if let Ok(hit) = probe_single_carrier(&cfg, label, freq_hz, CalKind::Atomic) {
+                        all_hits.push(hit.clone());
+                        state.lock().unwrap().cal_hits.push(hit);
+                    }
+                }
+                if state.lock().unwrap().running {
+                    {
+                        let mut st = state.lock().unwrap();
+                        st.cal_status = "Scanning AM broadcast band (540–1700 kHz, 10 kHz grid)...".to_string();
+                        st.phase_note = st.cal_status.clone();
+                    }
+                    if let Ok(am_hits) = scan_am_bcb(&cfg) {
+                        all_hits.extend(am_hits.iter().cloned());
+                        state.lock().unwrap().cal_hits.extend(am_hits);
+                    }
+                }
+            }
+        }
+        CalMode::Lte => {
+            match scan_lte_pss(&cfg, state) {
+                Ok(lte_hits) => all_hits.extend(lte_hits),
+                Err(e) => state.lock().unwrap().cal_status = format!("LTE scan error: {e}"),
+            }
+        }
+        CalMode::Atsc => {
+            match scan_atsc_pilots(&cfg, state) {
+                Ok(atsc_hits) => {
+                    all_hits.extend(atsc_hits.iter().cloned());
+                    state.lock().unwrap().cal_hits.extend(atsc_hits);
+                }
+                Err(e) => state.lock().unwrap().cal_status = format!("ATSC scan error: {e}"),
+            }
+        }
+        CalMode::WwvOnly => {
             for &(label, freq_hz) in WWV_REFS {
                 if !state.lock().unwrap().running {
                     break;
@@ -1461,30 +2079,13 @@ fn run_calibration(mode: CalMode, state: &Arc<Mutex<SharedState>>) {
                     st.cal_status = format!("Probing {label}...");
                     st.phase_note = st.cal_status.clone();
                 }
-                match probe_single_carrier(&cfg, label, freq_hz, true) {
+                match probe_single_carrier(&cfg, label, freq_hz, CalKind::Atomic) {
                     Ok(hit) => {
                         all_hits.push(hit.clone());
-                        let mut st = state.lock().unwrap();
-                        st.cal_hits.push(hit);
+                        state.lock().unwrap().cal_hits.push(hit);
                     }
                     Err(e) => {
                         state.lock().unwrap().cal_status = format!("{label} error: {e}");
-                    }
-                }
-            }
-            if mode == CalMode::Auto && state.lock().unwrap().running {
-                {
-                    let mut st = state.lock().unwrap();
-                    st.cal_status = "Scanning AM broadcast band (540–1700 kHz, 10 kHz grid)...".to_string();
-                    st.phase_note = st.cal_status.clone();
-                }
-                match scan_am_bcb(&cfg) {
-                    Ok(am_hits) => {
-                        all_hits.extend(am_hits.iter().cloned());
-                        state.lock().unwrap().cal_hits.extend(am_hits);
-                    }
-                    Err(e) => {
-                        state.lock().unwrap().cal_status = format!("AM BCB scan error: {e}");
                     }
                 }
             }
@@ -1512,7 +2113,7 @@ fn run_calibration(mode: CalMode, state: &Arc<Mutex<SharedState>>) {
                 st.cal_status = format!("Probing {label}...");
                 st.phase_note = st.cal_status.clone();
             }
-            match probe_single_carrier(&cfg, &label, freq_hz, false) {
+            match probe_single_carrier(&cfg, &label, freq_hz, CalKind::Custom) {
                 Ok(hit) => {
                     all_hits.push(hit.clone());
                     state.lock().unwrap().cal_hits.push(hit);
@@ -2197,7 +2798,7 @@ fn render_tui(state: &Arc<Mutex<SharedState>>, tui: &TuiState) {
                     trunc(why, cols.saturating_sub(32))
                 ));
             } else {
-                buf.push_str(" \x1b[2mPress [r] Auto (WWV/CHU + AM BCB), [w] WWV/CHU only, [m] AM BCB scan, or [f] Custom Hz\x1b[0m\x1b[K\r\n");
+                buf.push_str(" \x1b[2mPress [r] Auto, [e] LTE GPS, [t] ATSC TV, [w] WWV/CHU, [m] AM BCB, or [f] Custom Hz (e.g. RT-950 FM PTT)\x1b[0m\x1b[K\r\n");
             }
             if let Some(ref ed) = tui.editing {
                 buf.push_str(&format!(
@@ -2217,18 +2818,18 @@ fn render_tui(state: &Arc<Mutex<SharedState>>, tui: &TuiState) {
                     if let Some(h) = st.cal_hits.get(i) {
                         let col = if h.birdie {
                             "\x1b[2;33m"
-                        } else if h.atomic && h.snr_db >= 14.0 {
+                        } else if matches!(h.kind, CalKind::LteGps | CalKind::Atomic) && h.snr_db >= 12.0 {
                             "\x1b[1;32m"
-                        } else if !h.atomic && h.snr_db >= 18.0 {
+                        } else if matches!(h.kind, CalKind::AtscPilot | CalKind::AmBcb | CalKind::Custom) && h.snr_db >= 14.0 {
                             "\x1b[36m"
                         } else {
                             "\x1b[2m"
                         };
                         let note = if h.birdie { " [birdie?]" } else { "" };
                         let row = format!(
-                            " {:<16}  {:>10.3} kHz  {:+7.2} Hz  {:5.1} dB  {:+8.2} ppm   {:4.0}%{note}",
+                            " {:<16}  {:>10.3} MHz  {:+7.2} Hz  {:5.1} dB  {:+8.2} ppm   {:4.0}%{note}",
                             h.label,
-                            h.nominal_hz as f64 / 1000.0,
+                            h.nominal_hz as f64 / 1_000_000.0,
                             h.offset_hz,
                             h.snr_db,
                             h.ppm,
@@ -2258,7 +2859,7 @@ fn render_tui(state: &Arc<Mutex<SharedState>>, tui: &TuiState) {
         View::Operate => " [c] CQ  [a] Auto-CQ  [Enter] Answer  [b] Band  [d] Dry-TX  [s] Settings  [l] Log  [k] Cal  [q] Quit",
         View::Settings => " [↑/↓] Select  [←/→] Change  [Enter] Edit/Toggle  [Esc/1] Operate  [q] Quit",
         View::Log => " [1/Esc] Operate  [2/s] Settings  [4/k] Cal  [q] Quit",
-        View::Calibrate => " [r] Auto WWV+AM  [w] WWV/CHU  [m] AM BCB  [f] Custom Hz  [Enter] Apply ppm  [1/Esc] Operate  [q] Quit",
+        View::Calibrate => " [r] Auto  [e] LTE GPS  [t] ATSC TV  [w] WWV/CHU  [m] AM BCB  [f] Custom Hz  [Enter] Apply  [1/Esc] Operate",
     };
     buf.push_str(&format!("\x1b[7m{}\x1b[K\x1b[0m", trunc(hints, cols)));
 
@@ -2450,6 +3051,8 @@ fn main() -> ExitCode {
             }
             "--loopback" => loopback = true,
             "--calibrate" => cli_cal = Some(CalMode::Auto),
+            "--cal-lte" => cli_cal = Some(CalMode::Lte),
+            "--cal-atsc" => cli_cal = Some(CalMode::Atsc),
             "--cal-wwv" => cli_cal = Some(CalMode::WwvOnly),
             "--cal-am" => cli_cal = Some(CalMode::AmBcb),
             "--cal-freq" if i + 1 < args.len() => {
@@ -2624,7 +3227,7 @@ fn main() -> ExitCode {
         frames_rx: 0,
         cal_request: None,
         cal_running: false,
-        cal_status: "Idle — press [r] Auto (WWV/CHU + AM BCB), [w] WWV/CHU, [m] AM BCB, or [f] Custom Hz".to_string(),
+        cal_status: "Idle — press [r] Auto, [e] LTE GPS, [t] ATSC TV, [w] WWV/CHU, [m] AM BCB, or [f] Custom Hz".to_string(),
         cal_hits: Vec::new(),
         cal_recommended: None,
     }));
@@ -2957,8 +3560,28 @@ fn main() -> ExitCode {
                                 tui.set_toast("Calibration already running...");
                             } else {
                                 st.cal_request = Some(CalMode::Auto);
-                                st.cal_status = "Queued Auto calibration (WWV/CHU + AM BCB)...".to_string();
-                                tui.set_toast("Starting Auto calibration (WWV/CHU + AM BCB)...");
+                                st.cal_status = "Queued Auto calibration (LTE GPS -> ATSC TV -> WWV/AM)...".to_string();
+                                tui.set_toast("Starting Auto calibration...");
+                            }
+                        }
+                        Key::Char('e') => {
+                            let mut st = state.lock().unwrap();
+                            if st.cal_running {
+                                tui.set_toast("Calibration already running...");
+                            } else {
+                                st.cal_request = Some(CalMode::Lte);
+                                st.cal_status = "Queued LTE GPS-disciplined downlink PSS scan...".to_string();
+                                tui.set_toast("Starting LTE GPS calibration...");
+                            }
+                        }
+                        Key::Char('t') => {
+                            let mut st = state.lock().unwrap();
+                            if st.cal_running {
+                                tui.set_toast("Calibration already running...");
+                            } else {
+                                st.cal_request = Some(CalMode::Atsc);
+                                st.cal_status = "Queued UHF ATSC 1.0 TV pilot scan (ch 14–36)...".to_string();
+                                tui.set_toast("Starting ATSC TV pilot scan...");
                             }
                         }
                         Key::Char('w') => {
