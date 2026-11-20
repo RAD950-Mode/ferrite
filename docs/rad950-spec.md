@@ -1,8 +1,8 @@
 # RAD950 Protocol & Operating Specification (v1)
 
-Normative specification of the **RAD950** (`usol950` / `SOL950`) HF weak-signal protocol, Run / Hunter operating modes, Hourly UTC Rendezvous, and Spots API as implemented and over-the-air verified across two radio paths (sharing the `usol950` codec crate):
-- **Embedded handheld firmware:** Ferrite on Radtel RT-950 Pro (`digimodes/usol950`, `crates/ferrite-core/src/sol950.rs`, `crates/ferrite-app/src/sol950.rs`, `crates/ferrite-app/src/rad950_rdv.rs`, `firmware/src/tasks/ui.rs`).
-- **Host SDR transceiver / skimmer:** `digimodes/usol950/examples/rad950_hackrf.rs` (HackRF One, 2.4 MS/s USB DDC).
+Normative specification of the **RAD950** (`urad950` / `RAD950`) HF weak-signal protocol, Run / Hunter operating modes, Hourly UTC Rendezvous, and Spots API as implemented and over-the-air verified across two radio paths (sharing the `urad950` codec crate):
+- **Embedded handheld firmware:** Ferrite on Radtel RT-950 Pro (`digimodes/urad950`, `crates/ferrite-core/src/rad950.rs`, `crates/ferrite-app/src/rad950.rs`, `crates/ferrite-app/src/rad950_rdv.rs`, `firmware/src/tasks/ui.rs`).
+- **Host SDR transceiver / skimmer:** `digimodes/urad950/examples/rad950_hackrf.rs` (HackRF One, 2.4 MS/s USB DDC).
 - **Web Spots API:** `rad950-web/src/spots.ts`.
 
 ---
@@ -192,7 +192,7 @@ Skimmers and host SDRs (`rad950_hackrf --spot`) upload decoded slots asynchronou
 
 ## 7. Golden Interoperability Test Vectors
 
-Verified against `usol950::tests::golden_spec_test_vectors`:
+Verified against `urad950::tests::golden_spec_test_vectors`:
 
 ### Vector 1: `CQ NQ6N EN61` (`tx_pwr = 11` / `+30 dBm`, `suffix = 0`)
 - **`payload64`:** `0x30DDC102171B0000`
@@ -213,7 +213,7 @@ Verified against `usol950::tests::golden_spec_test_vectors`:
 ## 8. `RAD950-60` 1-Minute Weak-Signal Cycle (v1-Compatible)
 
 Optional 60-second UTC minute cycle (`utc_sec / 60`, alternating even/odd minutes) using the **exact same v1 wire format**:
-- **Sub-slots `0..=4` (`:00, :10, :20, :30, :40`):** TX repeats the identical `8.80 s` v1 burst 5 times; RX stacks all 5 sub-slots into a folded passband spectrogram (`usol950::Receiver60`, `116 × 150` 5-bit cells = `10,875 B`, fitting inside Ferrite's shared `13 KB` `Decoder` union slot).
+- **Sub-slots `0..=4` (`:00, :10, :20, :30, :40`):** TX repeats the identical `8.80 s` v1 burst 5 times; RX stacks all 5 sub-slots into a folded passband spectrogram (`urad950::Receiver60`, `116 × 150` 5-bit cells = `10,875 B`, fitting inside Ferrite's shared `13 KB` `Decoder` union slot).
 - **Sub-slot `5` (`:50–:59`):** 10-second PA cooldown and decode turnaround guard (no TX; RX runs blind `S0+S1+S2` stacked-sync acquisition and `(184, 78)` LDPC decode).
 - **Compatibility & crossover:** Standard 10 s v1 receivers decode strong `RAD950-60` transmissions on the first 10 s burst; below `~−18.5 dB` (2,500 Hz ref) where 10 s v1 drops to 0 QSOs/hr, `RAD950-60` extends blind decode down to `−19..−20 dB` (`4–18` QSOs/hr).
 

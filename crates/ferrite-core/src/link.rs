@@ -207,7 +207,7 @@ pub mod msg {
     /// now (u32, 0 while the radio has no time), then its source (u8: 0 none, 1 GPS, 2 set by hand or the link).
     /// Only from
     pub const CLOCK: u8 = 0x63;
-    /// Cooperative RX result for the just-finished SOL950 slot. Empty request, versioned fixed-width response.
+    /// Cooperative RX result for the just-finished RAD950 slot. Empty request, versioned fixed-width response.
     /// This carries decoded frames and one failed-CRC soft candidate to a local host over cable or Bluetooth.
     pub const COOP_RX: u8 = 0x64;
 }

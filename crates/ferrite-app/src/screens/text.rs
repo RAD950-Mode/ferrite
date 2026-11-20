@@ -53,10 +53,10 @@ pub enum TextFor {
     /// 0 5 9 9: who auto reply answers (APRS-57.1): capitals, digits and `-`, * typing the wildcard.
     ReplyTo,
     /// RAD950 Setup & Chat: base callsign (up to 6 chars), optional prefix (up to 4), manual grid (4), short chat message (up to 40).
-    Sol950Call,
-    Sol950Prefix,
-    Sol950Grid,
-    Sol950Chat,
+    Rad950Call,
+    Rad950Prefix,
+    Rad950Grid,
+    Rad950Chat,
 }
 
 /// What a text takes: any text, a channel name (the name set, CHAN-31), capitals and digits (a callsign, a grid
@@ -88,10 +88,10 @@ impl TextFor {
             TextFor::ContactCall => "Contact callsign",
             TextFor::ContactName => "Contact name",
             TextFor::ReplyTo => "Reply to",
-            TextFor::Sol950Call => "RAD950 call",
-            TextFor::Sol950Prefix => "RAD950 prefix",
-            TextFor::Sol950Grid => "RAD950 grid",
-            TextFor::Sol950Chat => "Chat message",
+            TextFor::Rad950Call => "RAD950 call",
+            TextFor::Rad950Prefix => "RAD950 prefix",
+            TextFor::Rad950Grid => "RAD950 grid",
+            TextFor::Rad950Chat => "Chat message",
         }
     }
 
@@ -102,9 +102,9 @@ impl TextFor {
             TextFor::ContactCall | TextFor::ReplyTo => 9,
             TextFor::DtmfName(_) => 10,
             TextFor::GridFixed | TextFor::GridWaypoint => 6,
-            TextFor::Sol950Call => 6,
-            TextFor::Sol950Prefix | TextFor::Sol950Grid => 4,
-            TextFor::Sol950Chat => 40,
+            TextFor::Rad950Call => 6,
+            TextFor::Rad950Prefix | TextFor::Rad950Grid => 4,
+            TextFor::Rad950Chat => 40,
             TextFor::Capcode => 7,
             TextFor::Clock => 12,
             _ => 16,
@@ -135,10 +135,10 @@ impl TextFor {
             TextFor::ReplyTo => Buf::from(app.aprs_cfg().reply_to_text()),
             TextFor::ContactCall => Buf::from(app.contact_call.as_bytes()),
             TextFor::ContactName => store.data().contact_of(app.contact_call.as_bytes()).map_or(Buf::new(), |c| Buf::from(c.name.as_bytes())),
-            TextFor::Sol950Call => app.sol950_host().map_or(Buf::new(), |h| Buf::from(h.profile.base_call_bytes())),
-            TextFor::Sol950Prefix => app.sol950_host().map_or(Buf::new(), |h| Buf::from(&h.profile.prefix[..h.profile.prefix_len as usize])),
-            TextFor::Sol950Grid => app.sol950_host().map_or(Buf::new(), |h| Buf::from(&h.profile.manual_grid)),
-            TextFor::Sol950Chat => Buf::new(),
+            TextFor::Rad950Call => app.rad950_host().map_or(Buf::new(), |h| Buf::from(h.profile.base_call_bytes())),
+            TextFor::Rad950Prefix => app.rad950_host().map_or(Buf::new(), |h| Buf::from(&h.profile.prefix[..h.profile.prefix_len as usize])),
+            TextFor::Rad950Grid => app.rad950_host().map_or(Buf::new(), |h| Buf::from(&h.profile.manual_grid)),
+            TextFor::Rad950Chat => Buf::new(),
         }
     }
 
@@ -148,9 +148,9 @@ impl TextFor {
             | TextFor::GridFixed
             | TextFor::GridWaypoint
             | TextFor::ContactCall
-            | TextFor::Sol950Call
-            | TextFor::Sol950Prefix
-            | TextFor::Sol950Grid => Kind::Caps,
+            | TextFor::Rad950Call
+            | TextFor::Rad950Prefix
+            | TextFor::Rad950Grid => Kind::Caps,
             TextFor::Capcode | TextFor::Clock => Kind::Digits,
             TextFor::AprsPath => Kind::Path,
             TextFor::ReplyTo => Kind::Pattern,
@@ -206,7 +206,7 @@ impl Text {
             (_, Kind::Name, 3) => 4,
             // the capitals of a callsign, grid square or path: their own key 1 (APRS-37, SETUP-12)
             (TextFor::Callsign, _, 0) => 6,
-            (TextFor::GridFixed | TextFor::GridWaypoint | TextFor::Sol950Call | TextFor::Sol950Prefix | TextFor::Sol950Grid, _, 0) => 7,
+            (TextFor::GridFixed | TextFor::GridWaypoint | TextFor::Rad950Call | TextFor::Rad950Prefix | TextFor::Rad950Grid, _, 0) => 7,
             (_, Kind::Caps | Kind::Path | Kind::Pattern, 0) => 5,
             (_, _, m) => m,
         }
@@ -476,45 +476,45 @@ fn keep(to: TextFor, app: &mut App, store: &impl ChannelStore) {
             }
             return;
         }
-        TextFor::Sol950Call => {
-            if !t.is_empty() && ferrite_core::sol950::usol950::Callsign::encode(t.as_bytes()).is_err() {
+        TextFor::Rad950Call => {
+            if !t.is_empty() && ferrite_core::rad950::urad950::Callsign::encode(t.as_bytes()).is_err() {
                 return app.show_toast(b"RAD950 call", b"like NQ6N or W1AW", false);
             }
-            if let Some(h) = app.sol950_host_mut() {
+            if let Some(h) = app.rad950_host_mut() {
                 h.profile.set_base_call(t.as_bytes());
                 h.profile_dirty = true;
                 h.sync_engine_config();
             }
         }
-        TextFor::Sol950Prefix => {
-            if let Some(h) = app.sol950_host_mut() {
+        TextFor::Rad950Prefix => {
+            if let Some(h) = app.rad950_host_mut() {
                 h.profile.set_prefix(t.as_bytes());
                 h.profile_dirty = true;
                 h.sync_engine_config();
             }
         }
-        TextFor::Sol950Grid => {
+        TextFor::Rad950Grid => {
             let b = t.as_bytes();
             let valid = b.len() == 4
-                && ferrite_core::sol950::usol950::frame::encode_grid4(&[b[0], b[1], b[2], b[3]]).is_some();
+                && ferrite_core::rad950::urad950::frame::encode_grid4(&[b[0], b[1], b[2], b[3]]).is_some();
             if !valid {
                 return app.show_toast(b"RAD950 grid", b"4 chars like FN31", false);
             }
-            if let Some(h) = app.sol950_host_mut() {
+            if let Some(h) = app.rad950_host_mut() {
                 h.profile.manual_grid = [b[0], b[1], b[2], b[3]];
                 h.profile_dirty = true;
                 h.sync_engine_config();
             }
         }
-        TextFor::Sol950Chat => {
+        TextFor::Rad950Chat => {
             if t.as_bytes().is_empty() {
                 return app.show_toast(b"Chat message", b"Enter a message", false);
             }
-            if let Some(h) = app.sol950_host_mut() {
+            if let Some(h) = app.rad950_host_mut() {
                 h.chat.set_literal_draft(t.as_bytes());
             }
             app.back();
-            app.screen = Screen::Sol950(super::sol950::Sol950Scr::CHAT_PREVIEW);
+            app.screen = Screen::Rad950(super::rad950::Rad950Scr::CHAT_PREVIEW);
             return;
         }
     }

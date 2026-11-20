@@ -265,16 +265,16 @@ pub struct SimCore {
     /// `--cut-restart` (decision 339): the store's writes queued as on the radio, and the next restart after a raw
     /// write is a power cut: what the Storage task hadn't done yet is lost (the stamp, when Console sent it last).
     cut_restart: bool,
-    /// Simulated 8.8 s SOL950 TX burst end timestamp (ms) and the frame being transmitted.
-    sol950_tx_end_ms: Option<(u32, ferrite_core::sol950::usol950::Frame)>,
+    /// Simulated 8.8 s RAD950 TX burst end timestamp (ms) and the frame being transmitted.
+    rad950_tx_end_ms: Option<(u32, ferrite_core::rad950::urad950::Frame)>,
     /// Last TX frame completed in the simulator (used to generate realistic peer replies on the next RX slot).
-    sol950_last_tx: Option<ferrite_core::sol950::usol950::Frame>,
-    /// Counter for rotating simulated SOL950 stations in the interactive simulator.
-    sol950_sim_idx: u8,
-    /// Last 200 ms panafall tick pushed to `Sol950Host::wf`.
-    sol950_wf_tick: u32,
-    /// Pre-synthesized authentic `usol950::Receiver` waterfall sequence (lazily generated on first SOL950 open).
-    sol950_wf_seq: Vec<([u8; 12], bool)>,
+    rad950_last_tx: Option<ferrite_core::rad950::urad950::Frame>,
+    /// Counter for rotating simulated RAD950 stations in the interactive simulator.
+    rad950_sim_idx: u8,
+    /// Last 200 ms panafall tick pushed to `Rad950Host::wf`.
+    rad950_wf_tick: u32,
+    /// Pre-synthesized authentic `urad950::Receiver` waterfall sequence (lazily generated on first RAD950 open).
+    rad950_wf_seq: Vec<([u8; 12], bool)>,
 }
 
 /// One render pass as [`SimCore::watch_passes`] records it.
@@ -436,11 +436,11 @@ impl SimCore {
             gps: None,
             gps_off: false,
             cut_restart: false,
-            sol950_tx_end_ms: None,
-            sol950_last_tx: None,
-            sol950_sim_idx: 0,
-            sol950_wf_tick: 0,
-            sol950_wf_seq: Vec::new(),
+            rad950_tx_end_ms: None,
+            rad950_last_tx: None,
+            rad950_sim_idx: 0,
+            rad950_wf_tick: 0,
+            rad950_wf_seq: Vec::new(),
         };
         if owner_card {
             ferrite_app::sample::owner_card(s.app.settings_mut());
@@ -652,51 +652,51 @@ impl SimCore {
             let sat_t = if secs < 1_700_000_000 { ferrite_app::sat::SIM_T0 + now / 1000 } else { secs as u32 };
             let here = store.extra.fix.get().map(|f| (f.pos.lat, f.pos.lon, f.alt_m));
             app.sat_clock(Some(sat_t), true, here);
-            let sol_open = app.sol950_open();
-            if let Some(h) = app.sol950_host_mut() {
+            let sol_open = app.rad950_open();
+            if let Some(h) = app.rad950_host_mut() {
                 let gps_grid = here.map(|(lat, lon, _)| ferrite_app::gpsdata::pos_to_grid4(lat, lon));
-                h.update_clock(sat_t, (now % 1000) as u16, 40, ferrite_app::sol950::ClockSource::Gps, gps_grid);
+                h.update_clock(sat_t, (now % 1000) as u16, 40, ferrite_app::rad950::ClockSource::Gps, gps_grid);
                 let wf_tick = now / 200;
-                if sol_open && !h.tx_in_flight && wf_tick != self.sol950_wf_tick {
-                    self.sol950_wf_tick = wf_tick;
-                    if self.sol950_wf_seq.is_empty() {
-                        self.sol950_wf_seq = crate::sol950_wf::sample_panafall();
+                if sol_open && !h.tx_in_flight && wf_tick != self.rad950_wf_tick {
+                    self.rad950_wf_tick = wf_tick;
+                    if self.rad950_wf_seq.is_empty() {
+                        self.rad950_wf_seq = crate::rad950_wf::sample_panafall();
                     }
-                    let (col, edge) = self.sol950_wf_seq[(wf_tick as usize) % self.sol950_wf_seq.len()];
+                    let (col, edge) = self.rad950_wf_seq[(wf_tick as usize) % self.rad950_wf_seq.len()];
                     h.wf.push(col, edge, false);
                 }
             }
-            if let Some((rf_freq, power, frame)) = app.sol950_take_tx() {
-                send(radio, ferrite_core::msg::RadioCmd::Sol950Tx { freq: rf_freq, power });
-                self.sol950_tx_end_ms = Some((now.saturating_add(8_800), frame));
+            if let Some((rf_freq, power, frame)) = app.rad950_take_tx() {
+                send(radio, ferrite_core::msg::RadioCmd::Rad950Tx { freq: rf_freq, power });
+                self.rad950_tx_end_ms = Some((now.saturating_add(8_800), frame));
             }
-            if let Some((end, frame)) = self.sol950_tx_end_ms {
+            if let Some((end, frame)) = self.rad950_tx_end_ms {
                 if now >= end {
-                    self.sol950_tx_end_ms = None;
-                    self.sol950_last_tx = Some(frame);
-                    send(radio, ferrite_core::msg::RadioCmd::Sol950Abort);
-                    if let Some(h) = app.sol950_host_mut() {
+                    self.rad950_tx_end_ms = None;
+                    self.rad950_last_tx = Some(frame);
+                    send(radio, ferrite_core::msg::RadioCmd::Rad950Abort);
+                    if let Some(h) = app.rad950_host_mut() {
                         h.on_tx_done(true);
                     }
                 }
             }
-            if app.sol950_take_finish().is_some() && app.sol950_open() {
-                use ferrite_core::sol950::usol950::frame::encode_grid4;
-                use ferrite_core::sol950::usol950::{Callsign, Decoded, Frame};
+            if app.rad950_take_finish().is_some() && app.rad950_open() {
+                use ferrite_core::rad950::urad950::frame::encode_grid4;
+                use ferrite_core::rad950::urad950::{Callsign, Decoded, Frame};
                 const ROSTER: [(&[u8], [u8; 4], i8, u16); 4] = [
                     (b"K1ABC", *b"FN31", -12, 1130),
                     (b"W6XYZ", *b"CM87", -15, 1380),
                     (b"G4DEF", *b"IO91", -17, 1620),
                     (b"JA1GHI", *b"PM95", -19, 1850),
                 ];
-                if let Some(h) = app.sol950_host_mut() {
+                if let Some(h) = app.rad950_host_mut() {
                     let my_call = h.profile.callsign();
                     // If we just transmitted in the previous slot, have the peer answer on this RX slot!
-                    if let (Some(tx_frame), Some(me)) = (self.sol950_last_tx.take(), my_call) {
+                    if let (Some(tx_frame), Some(me)) = (self.rad950_last_tx.take(), my_call) {
                         match tx_frame {
                             Frame::Cq { .. } => {
-                                let (call, grid, snr, hz) = ROSTER[self.sol950_sim_idx as usize % ROSTER.len()];
-                                self.sol950_sim_idx = self.sol950_sim_idx.wrapping_add(1);
+                                let (call, grid, snr, hz) = ROSTER[self.rad950_sim_idx as usize % ROSTER.len()];
+                                self.rad950_sim_idx = self.rad950_sim_idx.wrapping_add(1);
                                 let peer = Callsign::encode(call).unwrap();
                                 // Feed both a CQ (so grid is known) and a directed RX reply to our CQ.
                                 h.on_rx_frame(Decoded {
@@ -722,7 +722,7 @@ impl SimCore {
                                 });
                             }
                             Frame::ExtFrag { .. } => {
-                                use ferrite_core::sol950::usol950::chat::{
+                                use ferrite_core::rad950::urad950::chat::{
                                     decode_chat_frame, encode_chat_frame, ChatBody, ChatCtrl, ChatPacket, StationCard,
                                 };
                                 if let Some(pkt) = decode_chat_frame(tx_frame) {
@@ -749,17 +749,17 @@ impl SimCore {
                                             feed(pkt.seq.wrapping_add(1), ChatBody::Question { topic: 2, variant: 0 });
                                         }
                                         ChatBody::Weather(_) => {
-                                            use ferrite_core::sol950::usol950::chat::WeatherCard;
+                                            use ferrite_core::rad950::urad950::chat::WeatherCard;
                                             feed(pkt.seq, ChatBody::Ctrl(ChatCtrl::Ack { ack_seq: pkt.seq, frag_mask: 1 }));
                                             feed(pkt.seq.wrapping_add(1), ChatBody::Weather(WeatherCard::DEFAULT));
                                         }
                                         ChatBody::About(_) => {
-                                            use ferrite_core::sol950::usol950::chat::AboutCard;
+                                            use ferrite_core::rad950::urad950::chat::AboutCard;
                                             feed(pkt.seq, ChatBody::Ctrl(ChatCtrl::Ack { ack_seq: pkt.seq, frag_mask: 1 }));
                                             feed(pkt.seq.wrapping_add(1), ChatBody::About(AboutCard::DEFAULT));
                                         }
                                         ChatBody::Rendezvous(rv) => {
-                                            use ferrite_core::sol950::usol950::chat::{RendezvousAction, RendezvousCard};
+                                            use ferrite_core::rad950::urad950::chat::{RendezvousAction, RendezvousCard};
                                             feed(pkt.seq, ChatBody::Ctrl(ChatCtrl::Ack { ack_seq: pkt.seq, frag_mask: 1 }));
                                             let accepted = match rv {
                                                 RendezvousCard::Schedule { days_ahead, utc_min, dial_preset, profile, subch, offer_ref, .. } => {
@@ -791,8 +791,8 @@ impl SimCore {
                         }
                     } else {
                         // Normal RX slot: hear one CQ caller from the rotating band roster.
-                        let (call, grid, snr, hz) = ROSTER[self.sol950_sim_idx as usize % ROSTER.len()];
-                        self.sol950_sim_idx = self.sol950_sim_idx.wrapping_add(1);
+                        let (call, grid, snr, hz) = ROSTER[self.rad950_sim_idx as usize % ROSTER.len()];
+                        self.rad950_sim_idx = self.rad950_sim_idx.wrapping_add(1);
                         h.on_rx_frame(Decoded {
                             frame: Frame::Cq {
                                 sender: Callsign::encode(call).unwrap(),
@@ -809,8 +809,8 @@ impl SimCore {
             }
             app.tick(now, &radio.live, store);
             while let Some(c) = app.pop_cmd() {
-                if matches!(c, ferrite_core::msg::RadioCmd::Sol950Abort) && self.sol950_tx_end_ms.take().is_some() {
-                    if let Some(h) = app.sol950_host_mut() {
+                if matches!(c, ferrite_core::msg::RadioCmd::Rad950Abort) && self.rad950_tx_end_ms.take().is_some() {
+                    if let Some(h) = app.rad950_host_mut() {
                         h.on_tx_done(false);
                     }
                 }
@@ -1454,7 +1454,7 @@ fn power_on(store: &Store, radio: &mut FakeRadio) -> App {
     let st: &'static Store = unsafe { &*(store as *const Store) };
     let sats = ferrite_core::sat::data::Live::new(ferrite_store::sats::StoreSats(st));
     app.sat_attach(Box::leak(Box::new(sats)));
-    app.sol950_attach(Box::leak(Box::new(ferrite_app::sol950::Sol950Host::new())));
+    app.rad950_attach(Box::leak(Box::new(ferrite_app::rad950::Rad950Host::new())));
     store.restore(&mut app);
     while let Some(c) = app.pop_cmd() {
         radio.cmd(c);
@@ -1653,23 +1653,23 @@ mod tests {
         for k in [Key::Menu, Key::Digit(0), Key::Digit(3), Key::Digit(7)] {
             tap(&mut s, k, &mut t);
         }
-        assert!(s.app.sol950_open(), "RAD950 should be open: {}", s.screen_name());
+        assert!(s.app.rad950_open(), "RAD950 should be open: {}", s.screen_name());
 
         // 2. Step until a simulated CQ caller appears (up to 15 s)
         let mut saw_peer = false;
         for _ in 0..750 {
             t += 20;
             s.step(t);
-            if s.app.sol950_host().is_some_and(|h| {
-                let mut rows = [ferrite_core::sol950::ActivityRow {
-                    peer: ferrite_core::sol950::usol950::Callsign::from_raw(0).unwrap(),
+            if s.app.rad950_host().is_some_and(|h| {
+                let mut rows = [ferrite_core::rad950::ActivityRow {
+                    peer: ferrite_core::rad950::urad950::Callsign::from_raw(0).unwrap(),
                     grid4: 0,
                     snr_db: 0,
                     last_seen_slot: 0,
                     window: 0,
                     owed_reply: None,
                     logged: false,
-                }; ferrite_core::sol950::MAX_PEERS];
+                }; ferrite_core::rad950::MAX_PEERS];
                 h.engine.activity_rows(&mut rows) > 0
             }) {
                 saw_peer = true;
@@ -1684,13 +1684,13 @@ mod tests {
         for _ in 0..1750 {
             t += 20;
             s.step(t);
-            if s.app.sol950_host().is_some_and(|h| h.saved_ack && h.last_qso.is_some()) {
+            if s.app.rad950_host().is_some_and(|h| h.saved_ack && h.last_qso.is_some()) {
                 saved = true;
                 break;
             }
         }
         if !saved {
-            let h = s.app.sol950_host().unwrap();
+            let h = s.app.rad950_host().unwrap();
             panic!(
                 "QSO did not save: call={:?} utc_ready={} state={:?} saved_ack={} last_qso={:?} screen={}",
                 h.profile.callsign(),
@@ -1709,14 +1709,14 @@ mod tests {
         for _ in 0..1500 {
             t += 20;
             s.step(t);
-            if s.app.sol950_host().is_some_and(|h| h.chat.phase == ChatPhase::Active && h.chat.entry_count >= 1) {
+            if s.app.rad950_host().is_some_and(|h| h.chat.phase == ChatPhase::Active && h.chat.entry_count >= 1) {
                 active_with_q = true;
                 break;
             }
         }
         assert!(active_with_q, "peer should accept invite and ask antenna question");
         // Verify auto-QSY off the 28.078 calling frequency to the paired +4 kHz chat dial (28.082 MHz)!
-        assert_eq!(s.app.sol950_host().unwrap().active_dial(), 2_808_200, "chat should auto-QSY to +4 kHz");
+        assert_eq!(s.app.rad950_host().unwrap().active_dial(), 2_808_200, "chat should auto-QSY to +4 kHz");
 
         // 5. Press OK (Reply -> My station auto-highlighted) -> OK (Preview) -> OK (Send)
         tap(&mut s, Key::Menu, &mut t);
@@ -1731,7 +1731,7 @@ mod tests {
         for _ in 0..2500 {
             t += 20;
             s.step(t);
-            if s.app.sol950_host().is_some_and(|h| {
+            if s.app.rad950_host().is_some_and(|h| {
                 h.chat.entries[..h.chat.entry_count as usize]
                     .iter()
                     .any(|e| e.from_me && e.status == ChatDelivery::Delivered)
@@ -1744,6 +1744,6 @@ mod tests {
 
         // 7. Press 0 (End chat) and verify auto-return to the 28.078 MHz calling frequency!
         tap(&mut s, Key::Digit(0), &mut t);
-        assert_eq!(s.app.sol950_host().unwrap().active_dial(), 2_807_800, "ending chat should return to calling dial");
+        assert_eq!(s.app.rad950_host().unwrap().active_dial(), 2_807_800, "ending chat should return to calling dial");
     }
 }

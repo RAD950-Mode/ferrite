@@ -161,7 +161,7 @@ fn ram_is_small() {
     // broadcast slot took the broadcast, for the sleep timer (BCR-5, decision 352: 4 bytes), 8 with padding, to 1992;
     // the shortcut popup as last drawn on home, so home waits under it (HOME-8: 4 bytes), 8 with padding, to 2000;
     // auto reply's settings in the App's AprsCfg (APRS-57: on and delay, the pattern, the 45-character reply), 56
-    // to 2056; SOL950 host pointer (`sol950d`, 8 on PC, 4 on radio), 8 to 2064
+    // to 2056; RAD950 host pointer (`rad950d`, 8 on PC, 4 on radio), 8 to 2064
     assert!(n <= 2064, "App is {n} bytes");
     let s = core::mem::size_of::<crate::settings::Settings>();
     std::println!("Settings: {s} bytes");
@@ -1080,7 +1080,7 @@ mod remote_edges;
 mod aprs_text;
 /// Satellite mode's radio commands, alarm and mark (chapter 28a).
 mod sat;
-mod sol950;
+mod rad950;
 
 /// Group D's screens: setup, PIN, key test, link, FM broadcast, HF mode, alert, the menu's groups.
 #[path = "tests_d.rs"]

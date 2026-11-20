@@ -170,12 +170,12 @@ fn hello_and_info() {
 /// placed in Bluetooth capture mode. A full report occupies 127 payload bytes after the status byte.
 #[test]
 fn cooperative_rx_report_is_bounded_and_armed() {
-    use crate::sol950::{CoopLink, CoopRxMode, Sol950Host};
-    use ferrite_core::sol950::{CoopRxReport, SLOT_S};
-    use ferrite_core::sol950::usol950::{Callsign, Decoded, Frame, SoftCandidate};
+    use crate::rad950::{CoopLink, CoopRxMode, Rad950Host};
+    use ferrite_core::rad950::{CoopRxReport, SLOT_S};
+    use ferrite_core::rad950::urad950::{Callsign, Decoded, Frame, SoftCandidate};
 
     let mut pc = Pc::new(true);
-    let host: &'static mut Sol950Host = std::boxed::Box::leak(std::boxed::Box::new(Sol950Host::new()));
+    let host: &'static mut Rad950Host = std::boxed::Box::leak(std::boxed::Box::new(Rad950Host::new()));
     host.profile.coop_rx = CoopRxMode::Capture;
     host.profile.coop_link = CoopLink::Bluetooth;
     host.utc_sec = 1_735_689_609;
@@ -201,8 +201,8 @@ fn cooperative_rx_report_is_bounded_and_armed() {
     report.decoded_len = report.decoded.len() as u8;
     report.soft = Some(SoftCandidate { audio_hz: 1052, time_offset_ms: -35, snr_db: -18, sync_score: 321, llrs_4bit: [0x71; 92] });
     host.last_coop = Some(report);
-    pc.app.sol950_attach(host);
-    pc.app.open(crate::screens::nav::Dest::Sol950);
+    pc.app.rad950_attach(host);
+    pc.app.open(crate::screens::nav::Dest::Rad950);
 
     let (status, body) = pc.ask(msg::COOP_RX, &[]);
     assert_eq!(status, Status::Ok as u8);
@@ -226,7 +226,7 @@ fn cooperative_rx_report_is_bounded_and_armed() {
     assert_eq!(bad_arg_status, Status::BadArg as u8);
     assert!(bad_arg.is_empty());
 
-    pc.app.sol950_host_mut().unwrap().profile.coop_link = CoopLink::Usb;
+    pc.app.rad950_host_mut().unwrap().profile.coop_link = CoopLink::Usb;
     let (status, disarmed) = pc.ask(msg::COOP_RX, &[]);
     assert_eq!(status, Status::Ok as u8);
     assert_eq!(&disarmed[..2], &[1, 1]);

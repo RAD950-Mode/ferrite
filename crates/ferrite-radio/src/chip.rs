@@ -540,30 +540,30 @@ pub fn afsk_bk_end<B: Bus>(bk: &mut Bk4829<B>) {
     bk.tone_tx(0);
 }
 
-/// Registers saved by [`sol950_bk_prime`] and restored at unkey by [`sol950_bk_end`].
+/// Registers saved by [`rad950_bk_prime`] and restored at unkey by [`rad950_bk_end`].
 #[cfg(feature = "tx")]
 #[derive(Clone, Copy)]
-pub struct Sol950Saved {
+pub struct Rad950Saved {
     pub regs: [(u8, u16); 9],
     pub base_hz: u32,
     pub narrow: bool,
 }
 
-/// Start SOL950 carrier-stepping on the keyed BK4829: saves modified registers and initial frequency
+/// Start RAD950 carrier-stepping on the keyed BK4829: saves modified registers and initial frequency
 /// `base_hz`, enters `Source::Tones` (`REG_30 = 0xC3FA`, mic off, Tone 1 off).
 #[cfg(feature = "tx")]
-pub fn sol950_bk_prime<B: Bus>(bk: &mut Bk4829<B>, _dev: u16, _g0: u8, narrow: bool) -> Sol950Saved {
+pub fn rad950_bk_prime<B: Bus>(bk: &mut Bk4829<B>, _dev: u16, _g0: u8, narrow: bool) -> Rad950Saved {
     let regs = [0x38u8, 0x39, 0x70, 0x71, 0x47, 0x7E, 0x29, 0x2B, 0x40].map(|r| (r, bk.read(r)));
     let base_hz = bk.freq();
     bk.tx_on(bk4829::tx::Source::Tones, !narrow);
     bk.write(0x70, 0);
-    Sol950Saved { regs, base_hz, narrow }
+    Rad950Saved { regs, base_hz, narrow }
 }
 
-/// Set SOL950 frequency step (`hz` absolute), latching via VCO bit-15 toggle (`bit15_only = true`:
+/// Set RAD950 frequency step (`hz` absolute), latching via VCO bit-15 toggle (`bit15_only = true`:
 /// `0x43FA -> 0xC3FA`) or full `tx_on` (`0x0200 -> 50 us -> 0xC3FA`).
 #[cfg(feature = "tx")]
-pub fn sol950_bk_freq<B: Bus>(bk: &mut Bk4829<B>, hz: u32, bit15_only: bool, narrow: bool) {
+pub fn rad950_bk_freq<B: Bus>(bk: &mut Bk4829<B>, hz: u32, bit15_only: bool, narrow: bool) {
     bk.set_freq(hz);
     if bit15_only {
         bk.write(bk4829::reg::POWER, 0x43FA);
@@ -573,9 +573,9 @@ pub fn sol950_bk_freq<B: Bus>(bk: &mut Bk4829<B>, hz: u32, bit15_only: bool, nar
     }
 }
 
-/// Restore all registers saved by [`sol950_bk_prime`] before unkey completes.
+/// Restore all registers saved by [`rad950_bk_prime`] before unkey completes.
 #[cfg(feature = "tx")]
-pub fn sol950_bk_end<B: Bus>(bk: &mut Bk4829<B>, saved: &Sol950Saved) {
+pub fn rad950_bk_end<B: Bus>(bk: &mut Bk4829<B>, saved: &Rad950Saved) {
     for &(r, v) in &saved.regs {
         bk.write(r, v);
     }

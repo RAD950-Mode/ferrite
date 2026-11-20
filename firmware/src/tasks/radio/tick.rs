@@ -96,12 +96,12 @@ impl Radio {
         self.vox_poll();
         #[cfg(feature = "tx")]
         self.dial_step(); // DTMF-1: the dialled sequence's next step
-        if self.sol950.is_some() {
+        if self.rad950.is_some() {
             #[cfg(feature = "tx")]
             if self.path.keyed().is_some() {
                 return self.tx_tick(now_ms() as u32).await;
             }
-            self.sol950_poll();
+            self.rad950_poll();
             return;
         }
         if self.hf.is_some() {

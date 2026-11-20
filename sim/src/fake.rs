@@ -72,8 +72,8 @@ enum Fake {
     XbStopped(u8),
     /// Satellite mode (SAT-1): the downlink heard, and the uplink a key-up goes out on.
     Sat { up: Freq10 },
-    /// SOL950 weak-signal HF mode (SI4732 USB RX / BK4829 direct-PLL 4-FSK TX).
-    Sol950 { tx: bool },
+    /// RAD950 weak-signal HF mode (SI4732 USB RX / BK4829 direct-PLL 4-FSK TX).
+    Rad950 { tx: bool },
 }
 
 /// Carriers the scope and counter "hear": frequency and level (dBm).
@@ -435,19 +435,19 @@ impl FakeRadio {
                     *up = f;
                 }
             }
-            RadioCmd::Sol950Rx { on: false, .. } => self.set(Fake::Off),
-            RadioCmd::Sol950Rx { on: true, .. } => {
-                if !matches!(self.mode, Fake::Sol950 { .. }) {
-                    self.set(Fake::Sol950 { tx: false });
+            RadioCmd::Rad950Rx { on: false, .. } => self.set(Fake::Off),
+            RadioCmd::Rad950Rx { on: true, .. } => {
+                if !matches!(self.mode, Fake::Rad950 { .. }) {
+                    self.set(Fake::Rad950 { tx: false });
                 }
             }
-            RadioCmd::Sol950Tx { .. } => {
-                if let Fake::Sol950 { tx } = &mut self.mode {
+            RadioCmd::Rad950Tx { .. } => {
+                if let Fake::Rad950 { tx } = &mut self.mode {
                     *tx = true;
                 }
             }
-            RadioCmd::Sol950Abort => {
-                if let Fake::Sol950 { tx } = &mut self.mode {
+            RadioCmd::Rad950Abort => {
+                if let Fake::Rad950 { tx } = &mut self.mode {
                     *tx = false;
                 }
             }
@@ -604,7 +604,7 @@ impl FakeRadio {
                 let rssi = -97 + ((t * 0.9).sin() * 9.0) as i16;
                 ModeLive::Sat { rssi, open: rssi > -100 }
             }
-            Fake::Sol950 { tx } => ModeLive::Sol950 { rx_ready: true, tx_active: tx, rssi: -108, loading: 100 },
+            Fake::Rad950 { tx } => ModeLive::Rad950 { rx_ready: true, tx_active: tx, rssi: -108, loading: 100 },
         };
         // Transmit: speech, the mic level wandering 30-85%.
         if self.live.tx.keyed {

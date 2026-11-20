@@ -628,7 +628,7 @@ impl Job {
                     let rc = if a.shaped && a.signal == Signal::Fsk { " rc" } else { "" };
                     if a.signal.takes_baud() {
                         put!(out, "  txtest: {} {}{} at {} % armed for the next PTT key-up, from the key-up to the release; once", a.signal.name(), a.baud, rc, a.level);
-                    } else if a.signal.is_sol950() {
+                    } else if a.signal.is_rad950() {
                         put!(out, "  txtest: {} (dev {}) at {} % armed for the next PTT key-up; once", a.signal.name(), a.baud, a.level);
                     } else {
                         put!(out, "  txtest: {} at {} % armed for the next PTT key-up, from the key-up to the release; once", a.signal.name(), a.level);
@@ -661,7 +661,7 @@ impl Job {
                         self.line += 1;
                         return Step::Line;
                     }
-                    if a.signal.is_sol950() {
+                    if a.signal.is_rad950() {
                         put!(out, "  {}: BK4829 PLL REG_38/39 (50 Hz/tone; cal +500 Hz steps), REG_30 VCO toggle, TMR5 1.25 ms; restored at unkey", a.signal.name());
                         self.st = St::Over;
                         self.line += 1;

@@ -108,8 +108,8 @@ pub enum Dest {
     ToneSearch,
     /// B22-B24: satellite mode (MENU 0 3 6).
     Satellites,
-    /// SOL950 10 m weak-signal mode (MENU 0 3 7).
-    Sol950,
+    /// RAD950 10 m weak-signal mode (MENU 0 3 7).
+    Rad950,
     /// B15: frequency counter (MENU 0 3 2).
     Counter,
     /// B17: an alert (SAME, DSC distress).
@@ -228,7 +228,7 @@ impl Dest {
             HfMode => ("HF mode", "20a", "B12"),
             ToneSearch => ("Tone search", "22", "B14"),
             Satellites => ("Satellites", "28a", "B22"),
-            Sol950 => ("RAD950", "20b", "B25"),
+            Rad950 => ("RAD950", "20b", "B25"),
             Counter => ("Frequency counter", "22", "B15"),
             Alert => ("Alert", "23", "B17"),
             Crossband => ("Crossband repeater", "19", "B18"),
@@ -336,7 +336,7 @@ pub const MENU0: [(&[u8], Dest); 55] = [
     (&[3, 4], Dest::Crossband),
     (&[3, 5], Dest::ToneSearch),
     (&[3, 6], Dest::Satellites), // SAT-1
-    (&[3, 7], Dest::Sol950),
+    (&[3, 7], Dest::Rad950),
     (&[4, 1], Dest::EventLog),
     (&[4, 2], Dest::Sub(4, 2)),
     (&[4, 5], Dest::Sub(4, 5)),
@@ -470,7 +470,7 @@ pub fn enter(dest: Dest, app: &mut App) -> Screen {
         Dest::WriteProgress => Screen::Link(Link::new(LinkPage::Progress)),
         Dest::HfMode => hf::open(app),
         Dest::Satellites => sat::open(app),
-        Dest::Sol950 => sol950::open(app),
+        Dest::Rad950 => rad950::open(app),
         Dest::Alert => Screen::Alert(super::alert::Alert { silenced: false }),
         // Every destination has its own screen now; a new one shows the placeholder until it is built.
         #[allow(unreachable_patterns)]

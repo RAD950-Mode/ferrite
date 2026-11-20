@@ -1,12 +1,12 @@
-//! Multi-station RAD950 network simulator driving real `ferrite_app::sol950::Sol950Host` instances
-//! over an empirically calibrated HF propagation, 8-subchannel SINR/capture, and `usol950` decode model.
+//! Multi-station RAD950 network simulator driving real `ferrite_app::rad950::Rad950Host` instances
+//! over an empirically calibrated HF propagation, 8-subchannel SINR/capture, and `urad950` decode model.
 //!
 //! Run with:
 //!   cargo run --offline --target-dir /tmp/ferrite-target --release -p ferrite-app --example rad950_net_sim
 
-use ferrite_app::sol950::{AutoAnswer, ClockSource, Sol950Host, Sol950Store, SOL950_DIALS};
+use ferrite_app::rad950::{AutoAnswer, ClockSource, Rad950Host, Rad950Store, RAD950_DIALS};
 use ferrite_core::freq::Freq10;
-use ferrite_core::sol950::usol950::{Decoded, Frame, MAX_DECODED, SUBCHANNELS_HZ};
+use ferrite_core::rad950::urad950::{Decoded, Frame, MAX_DECODED, SUBCHANNELS_HZ};
 use std::collections::HashSet;
 
 struct Rng(u64);
@@ -54,8 +54,8 @@ fn gen_grid(idx: usize) -> [u8; 4] {
     [f[0], f[1], sq0, sq1]
 }
 
-fn make_host(idx: usize, dial_idx: u8, mode60: bool) -> Box<Sol950Host> {
-    let mut h = Box::new(Sol950Host::new());
+fn make_host(idx: usize, dial_idx: u8, mode60: bool) -> Box<Rad950Host> {
+    let mut h = Box::new(Rad950Host::new());
     let call = gen_call(idx);
     h.profile.set_base_call(&call);
     h.profile.manual_grid = gen_grid(idx);
@@ -66,7 +66,7 @@ fn make_host(idx: usize, dial_idx: u8, mode60: bool) -> Box<Sol950Host> {
     h
 }
 
-/// Empirically calibrated `usol950` blind decode probability vs SINR (2,500 Hz reference BW):
+/// Empirically calibrated `urad950` blind decode probability vs SINR (2,500 Hz reference BW):
 /// - `10 s` v1: 95% @ -14 dB, 70% @ -16 dB, 32% @ -17 dB, 7% @ -18 dB, 0% @ -19 dB (50% @ -16.5 dB).
 /// - `60 s` RAD950-60 (`Receiver60`): shifted by -3.5 dB (50% @ -20.0 dB).
 fn decode_prob(sinr_db: f64, mode60: bool) -> f64 {
@@ -119,7 +119,7 @@ struct SimStats {
 /// Run `n_slots` 10-second UTC slots over `hosts` using directional path SNR matrix `path_snr[tx][rx]`
 /// (`None` = no propagation path). Returns detailed aggregate statistics.
 fn run_network(
-    hosts: &mut [Box<Sol950Host>],
+    hosts: &mut [Box<Rad950Host>],
     path_snr: &[Vec<Option<f64>>],
     start_slot: u32,
     n_slots: u32,
@@ -385,7 +385,7 @@ fn main() {
     );
     println!("{}", "-".repeat(78));
     for &n in &[4usize, 10, 25, 50, 100, 200] {
-        let mut hosts: Vec<Box<Sol950Host>> = (0..n).map(|i| make_host(i, 0, false)).collect();
+        let mut hosts: Vec<Box<Rad950Host>> = (0..n).map(|i| make_host(i, 0, false)).collect();
         for h in &mut hosts {
             h.auto_answer = AutoAnswer::AnyNeeded;
             h.rdv.follow_schedule = true;
@@ -427,7 +427,7 @@ fn main() {
         for &(prof_name, c_lo, c_hi) in &caller_profiles {
             for &k in &[5usize, 20, 60] {
                 let n = 1 + k;
-                let mut hosts: Vec<Box<Sol950Host>> = (0..n).map(|i| make_host(i, 0, false)).collect();
+                let mut hosts: Vec<Box<Rad950Host>> = (0..n).map(|i| make_host(i, 0, false)).collect();
                 hosts[0].engine.start_cq(0); // Runner calling Auto-CQ on even slots
                 for h in hosts.iter_mut().skip(1) {
                     h.auto_answer = AutoAnswer::AnyNeeded;
@@ -467,7 +467,7 @@ fn main() {
         let mut res = [0usize; 2];
         for (m_i, &m60) in [false, true].iter().enumerate() {
             let n = 11usize;
-            let mut hosts: Vec<Box<Sol950Host>> = (0..n).map(|i| make_host(i, 0, m60)).collect();
+            let mut hosts: Vec<Box<Rad950Host>> = (0..n).map(|i| make_host(i, 0, m60)).collect();
             hosts[0].engine.start_cq(0);
             for h in hosts.iter_mut().skip(1) {
                 h.auto_answer = AutoAnswer::AnyNeeded;
@@ -497,7 +497,7 @@ fn main() {
     println!("\n=== EXP 4: Asymmetric Paths (N=50: 10 Base/SDR +8 dB + 40 Handhelds, 5-min Rendezvous) ===");
     {
         let n = 50usize;
-        let mut hosts: Vec<Box<Sol950Host>> = (0..n).map(|i| make_host(i, 0, false)).collect();
+        let mut hosts: Vec<Box<Rad950Host>> = (0..n).map(|i| make_host(i, 0, false)).collect();
         for h in &mut hosts {
             h.auto_answer = AutoAnswer::AnyNeeded;
             h.rdv.follow_schedule = true;
@@ -540,7 +540,7 @@ fn main() {
         ("AnyNeeded", AutoAnswer::AnyNeeded),
     ] {
         let n = 60usize;
-        let mut hosts: Vec<Box<Sol950Host>> = (0..n).map(|i| make_host(i, 0, false)).collect();
+        let mut hosts: Vec<Box<Rad950Host>> = (0..n).map(|i| make_host(i, 0, false)).collect();
         for h in &mut hosts {
             h.auto_answer = mode;
             h.rdv.follow_schedule = true;
@@ -573,5 +573,5 @@ fn main() {
             one_pct
         );
     }
-    let _ = SOL950_DIALS;
+    let _ = RAD950_DIALS;
 }

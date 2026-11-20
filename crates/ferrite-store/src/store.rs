@@ -635,8 +635,8 @@ impl<N: Nor, D: Data> FlashStore<N, D> {
     }
 
     /// Borrow a `Nor` adapter over the underlying flash that drops its `RefMut` before every async pause.
-    pub fn sol950_nor(&self) -> crate::sol950::FlashNor<'_, N> {
-        crate::sol950::FlashNor(&self.f)
+    pub fn rad950_nor(&self) -> crate::rad950::FlashNor<'_, N> {
+        crate::rad950::FlashNor(&self.f)
     }
 
     /// HF-20: the SSB patch in SPI flash, if its header parses and its bytes hash to the header's SHA-256.

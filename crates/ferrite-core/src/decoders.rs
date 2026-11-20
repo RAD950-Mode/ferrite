@@ -8,8 +8,8 @@ use core::mem::ManuallyDrop;
 use udsc::Receiver as Dsc;
 use uafsk::Demodulator as Afsk;
 use upocsag::Receiver as Pocsag;
-use usol950::Receiver as Sol950;
-use usol950::Receiver60 as Sol950_60;
+use urad950::Receiver as Rad950;
+use urad950::Receiver60 as Rad950_60;
 
 /// Audio rate the DSP task feeds the decoders.
 pub const RATE_HZ: u32 = 24_000;
@@ -22,8 +22,8 @@ union DecoderInner {
     afsk: ManuallyDrop<Afsk>,
     pocsag: ManuallyDrop<Pocsag>,
     dsc: ManuallyDrop<Dsc>,
-    sol950: ManuallyDrop<Sol950>,
-    sol950_60: ManuallyDrop<Sol950_60>,
+    rad950: ManuallyDrop<Rad950>,
+    rad950_60: ManuallyDrop<Rad950_60>,
 }
 
 /// Shared decoder slot: holds one active decoder at a time inside a single `<= 13 KB` union,
@@ -68,9 +68,9 @@ impl Decoder {
         d
     }
 
-    pub fn sol950() -> Self {
+    pub fn rad950() -> Self {
         let mut d = Self::off();
-        d.switch(DecoderKind::Sol950);
+        d.switch(DecoderKind::Rad950);
         d
     }
 
@@ -113,28 +113,28 @@ impl Decoder {
                 }
                 self.kind = DecoderKind::Dsc;
             }
-            DecoderKind::Sol950 => {
+            DecoderKind::Rad950 => {
                 unsafe {
-                    Sol950::init_in_place(core::ptr::addr_of_mut!(self.inner.sol950) as *mut Sol950);
+                    Rad950::init_in_place(core::ptr::addr_of_mut!(self.inner.rad950) as *mut Rad950);
                 }
-                self.kind = DecoderKind::Sol950;
+                self.kind = DecoderKind::Rad950;
             }
-            DecoderKind::Sol950_60 => {
+            DecoderKind::Rad950_60 => {
                 unsafe {
-                    Sol950_60::init_in_place(core::ptr::addr_of_mut!(self.inner.sol950_60) as *mut Sol950_60);
+                    Rad950_60::init_in_place(core::ptr::addr_of_mut!(self.inner.rad950_60) as *mut Rad950_60);
                 }
-                self.kind = DecoderKind::Sol950_60;
+                self.kind = DecoderKind::Rad950_60;
             }
         }
     }
 
-    /// Diagnostic snapshot of the active SOL950 receiver: `(symbols, active_tracks, acquired)`.
-    pub fn sol950_diag(&self) -> (u16, u8, bool) {
-        if self.kind == DecoderKind::Sol950 {
-            let d = unsafe { &*self.inner.sol950 };
+    /// Diagnostic snapshot of the active RAD950 receiver: `(symbols, active_tracks, acquired)`.
+    pub fn rad950_diag(&self) -> (u16, u8, bool) {
+        if self.kind == DecoderKind::Rad950 {
+            let d = unsafe { &*self.inner.rad950 };
             d.diag()
-        } else if self.kind == DecoderKind::Sol950_60 {
-            let d = unsafe { &*self.inner.sol950_60 };
+        } else if self.kind == DecoderKind::Rad950_60 {
+            let d = unsafe { &*self.inner.rad950_60 };
             let (syms, sub) = d.diag();
             (syms, sub, false)
         } else {
@@ -142,34 +142,34 @@ impl Decoder {
         }
     }
 
-    /// Take the latest 24-bin packed 4-bit SOL950 panafall column (`200 ms` cadence).
-    pub fn sol950_take_wf(&mut self) -> Option<[u8; 12]> {
-        if self.kind == DecoderKind::Sol950 {
-            let d = unsafe { &mut *self.inner.sol950 };
+    /// Take the latest 24-bin packed 4-bit RAD950 panafall column (`200 ms` cadence).
+    pub fn rad950_take_wf(&mut self) -> Option<[u8; 12]> {
+        if self.kind == DecoderKind::Rad950 {
+            let d = unsafe { &mut *self.inner.rad950 };
             d.take_wf_col()
-        } else if self.kind == DecoderKind::Sol950_60 {
-            let d = unsafe { &mut *self.inner.sol950_60 };
+        } else if self.kind == DecoderKind::Rad950_60 {
+            let d = unsafe { &mut *self.inner.rad950_60 };
             d.take_waterfall_col()
         } else {
             None
         }
     }
 
-    /// Finish the current SOL950 slot (or 60 s minute), write decoded frames to `out`, optionally export the best
+    /// Finish the current RAD950 slot (or 60 s minute), write decoded frames to `out`, optionally export the best
     /// failed-CRC soft candidate for Cooperative RX, and reset for the next slot.
     #[inline(never)]
-    pub fn sol950_finish_with_soft(
+    pub fn rad950_finish_with_soft(
         &mut self,
-        out: &mut [usol950::Decoded; usol950::MAX_DECODED],
-        soft: Option<&mut Option<usol950::SoftCandidate>>,
+        out: &mut [urad950::Decoded; urad950::MAX_DECODED],
+        soft: Option<&mut Option<urad950::SoftCandidate>>,
     ) -> usize {
-        if self.kind == DecoderKind::Sol950 {
-            let d = unsafe { &mut *self.inner.sol950 };
+        if self.kind == DecoderKind::Rad950 {
+            let d = unsafe { &mut *self.inner.rad950 };
             let n = d.finish_slot_with_soft(out, soft);
             d.reset();
             n
-        } else if self.kind == DecoderKind::Sol950_60 {
-            let d = unsafe { &mut *self.inner.sol950_60 };
+        } else if self.kind == DecoderKind::Rad950_60 {
+            let d = unsafe { &mut *self.inner.rad950_60 };
             let n = d.finish_minute(out);
             d.reset();
             n
@@ -178,26 +178,26 @@ impl Decoder {
         }
     }
 
-    /// Reset the SOL950 receiver for a fresh RX slot/minute without running LDPC decode (used after a TX slot).
-    pub fn sol950_reset(&mut self) {
-        if self.kind == DecoderKind::Sol950 {
-            unsafe { (*self.inner.sol950).reset() };
-        } else if self.kind == DecoderKind::Sol950_60 {
-            unsafe { (*self.inner.sol950_60).reset() };
+    /// Reset the RAD950 receiver for a fresh RX slot/minute without running LDPC decode (used after a TX slot).
+    pub fn rad950_reset(&mut self) {
+        if self.kind == DecoderKind::Rad950 {
+            unsafe { (*self.inner.rad950).reset() };
+        } else if self.kind == DecoderKind::Rad950_60 {
+            unsafe { (*self.inner.rad950_60).reset() };
         }
     }
 
     /// Advance `RAD950-60` to the next 10-second sub-burst inside the active 60 s RX minute.
-    pub fn sol950_start_subslot(&mut self) {
-        if self.kind == DecoderKind::Sol950_60 {
-            unsafe { (*self.inner.sol950_60).start_subslot() };
+    pub fn rad950_start_subslot(&mut self) {
+        if self.kind == DecoderKind::Rad950_60 {
+            unsafe { (*self.inner.rad950_60).start_subslot() };
         }
     }
 
-    /// Finish the current 10 s SOL950 UTC slot, write decoded frames to `out`, and reset for the next slot.
+    /// Finish the current 10 s RAD950 UTC slot, write decoded frames to `out`, and reset for the next slot.
     #[inline(never)]
-    pub fn sol950_finish(&mut self, out: &mut [usol950::Decoded; usol950::MAX_DECODED]) -> usize {
-        self.sol950_finish_with_soft(out, None)
+    pub fn rad950_finish(&mut self, out: &mut [urad950::Decoded; urad950::MAX_DECODED]) -> usize {
+        self.rad950_finish_with_soft(out, None)
     }
 
     /// The AFSK demodulator's carrier detect: 1200-baud data heard now (APRS-56.4); false for the others.
@@ -230,12 +230,12 @@ impl Decoder {
                 let d = unsafe { &mut *self.inner.dsc };
                 block.iter().for_each(|&x| d.push(x, |c| found(Found::Call(c))));
             }
-            DecoderKind::Sol950 => {
-                let d = unsafe { &mut *self.inner.sol950 };
+            DecoderKind::Rad950 => {
+                let d = unsafe { &mut *self.inner.rad950 };
                 d.push_samples(block);
             }
-            DecoderKind::Sol950_60 => {
-                let d = unsafe { &mut *self.inner.sol950_60 };
+            DecoderKind::Rad950_60 => {
+                let d = unsafe { &mut *self.inner.rad950_60 };
                 d.push_samples(block);
             }
         }

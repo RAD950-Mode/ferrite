@@ -11,10 +11,10 @@
 //! refuses writes (a link's raw write there fails in the simulator).
 
 use crate::{Nor, NorError, Result, SECTOR};
-use ferrite_core::layout::{EVENT_LOG, SCRATCH_RING, SCREENS, SOL950_LOG, WRITABLE};
+use ferrite_core::layout::{EVENT_LOG, SCRATCH_RING, SCREENS, RAD950_LOG, WRITABLE};
 
-/// The low part: the chip from 0 to the end of the SOL950 contact log (`0x0D_0000`).
-pub const LOW: usize = SOL950_LOG.end as usize;
+/// The low part: the chip from 0 to the end of the RAD950 contact log (`0x0D_0000`).
+pub const LOW: usize = RAD950_LOG.end as usize;
 /// The high part, after it in `mem`: the event log, then the scratch ring.
 pub const HIGH: core::ops::Range<u32> = EVENT_LOG.start..SCRATCH_RING.end;
 /// The SPI parts' slots in the boot screens region (`ferrite_core::part`), after the high part in `mem`.

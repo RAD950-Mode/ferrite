@@ -156,13 +156,13 @@ pub enum RadioCmd {
     /// HF mode: the SI4732's own seek, up or down from the frequency it is on (AM, below 30 MHz; HF-31). The
     /// frequency it stops on comes back in [`ModeLive::Hf`].
     HfSeek { up: bool },
-    /// SOL950 10 m receive mode: enter/retune SI4732 USB at `dial` with `AVC ON` (`0x9012`) and signed BFO
+    /// RAD950 10 m receive mode: enter/retune SI4732 USB at `dial` with `AVC ON` (`0x9012`) and signed BFO
     /// offset `rx_corr_hz`, or leave (`on = false`) and restore prior radio state.
-    Sol950Rx { dial: Freq10, rx_corr_hz: i16, on: bool },
-    /// SOL950 10 m BK4829 PLL TX: key `freq` at `power` (0 low, 1 mid, 2 high) using the frame staged in `SOL950_TX`.
-    Sol950Tx { freq: Freq10, power: u8 },
-    /// Abort any active SOL950 transmission cleanly and return to SI4732 RX.
-    Sol950Abort,
+    Rad950Rx { dial: Freq10, rx_corr_hz: i16, on: bool },
+    /// RAD950 10 m BK4829 PLL TX: key `freq` at `power` (0 low, 1 mid, 2 high) using the frame staged in `RAD950_TX`.
+    Rad950Tx { freq: Freq10, power: u8 },
+    /// Abort any active RAD950 transmission cleanly and return to SI4732 RX.
+    Rad950Abort,
     /// A short tone from the BK4829's tone generator to the speaker (SND-11), e.g. a key refused at a limit
     /// (TEXT-5).
     Beep { hz: u16, ms: u16 },
@@ -307,17 +307,17 @@ pub enum DspCmd {
     /// PWR-26.9: the APRS slot's squelch (SQL-19) opened or closed: the AFSK decoder captures only while it is
     /// open and for [`SQ_TAIL_MS`] after, so the core rests at 24 MHz between packets.
     Squelch(bool),
-    /// SOL950 end-of-slot boundary: pause capture during the inter-slot guard, run `finish_slot`, deliver decoded
-    /// frames on `SOL950_RX`, reset the receiver, and resume capture for the next 10 s slot. `utc_slot` and
+    /// RAD950 end-of-slot boundary: pause capture during the inter-slot guard, run `finish_slot`, deliver decoded
+    /// frames on `RAD950_RX`, reset the receiver, and resume capture for the next 10 s slot. `utc_slot` and
     /// `dial_hz` were captured at the slot start. `coop_capture` keeps reports from slots before Capture was armed
     /// out of the browser Cooperative RX transport.
-    Sol950Finish { utc_slot: u32, dial_hz: u32, coop_capture: bool },
-    /// SOL950 post-TX slot reset: stop capture, reset the `usol950::Receiver` without running LDPC decode
+    Rad950Finish { utc_slot: u32, dial_hz: u32, coop_capture: bool },
+    /// RAD950 post-TX slot reset: stop capture, reset the `urad950::Receiver` without running LDPC decode
     /// (discarding muted TX-slot audio), and resume capture cleanly at the next 10 s RX slot boundary.
-    Sol950Reset,
+    Rad950Reset,
     /// `RAD950-60` sub-slot boundary (`:10, :20, :30, :40`): reset per-10 s sample counter inside `Receiver60`
     /// while preserving the accumulated 5-sub-burst folded spectrogram.
-    Sol950Subslot,
+    Rad950Subslot,
 }
 
 /// PWR-26.9: how long the AFSK capture runs on after the APRS slot's squelch closes (the frame's last flags).
@@ -332,8 +332,8 @@ pub enum DecoderKind {
     Afsk,
     Pocsag,
     Dsc,
-    Sol950,
-    Sol950_60,
+    Rad950,
+    Rad950_60,
 }
 
 /// Who announced it.
@@ -856,8 +856,8 @@ pub enum ModeLive {
     Xb(XbLive),
     /// Satellite mode: the downlink's level (dBm) and squelch.
     Sat { rssi: i16, open: bool },
-    /// SOL950 10 m digital mode: SI4732 RX readiness, active BK4829 PLL TX, signal level (dBm), and SSB patch load (255 = ready).
-    Sol950 { rx_ready: bool, tx_active: bool, rssi: i16, loading: u8 },
+    /// RAD950 10 m digital mode: SI4732 RX readiness, active BK4829 PLL TX, signal level (dBm), and SSB patch load (255 = ready).
+    Rad950 { rx_ready: bool, tx_active: bool, rssi: i16, loading: u8 },
 }
 
 /// The SI4732's receive settings from the UI (BCR-32, HF-35; decision 292), packed to keep [`RadioCmd`] small.

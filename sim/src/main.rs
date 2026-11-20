@@ -17,7 +17,7 @@ use ferrite_sim::fake;
 mod shots_aprs;
 mod shots_d;
 mod shots_sat;
-mod shots_sol950;
+mod shots_rad950;
 mod termport;
 mod window;
 
@@ -106,8 +106,8 @@ fn main() {
         return;
     }
     let scale = arg("--scale").and_then(|s| s.parse().ok()).unwrap_or(1);
-    if args.iter().any(|a| a == "--sol950") {
-        shots_sol950::run(scale);
+    if args.iter().any(|a| a == "--rad950") {
+        shots_rad950::run(scale);
         return;
     }
 
@@ -555,7 +555,7 @@ fn main() {
     shots_d::run(scale);
     shots_aprs::run(scale);
     shots_sat::run(scale);
-    shots_sol950::run(scale);
+    shots_rad950::run(scale);
     themed(scale);
 }
 

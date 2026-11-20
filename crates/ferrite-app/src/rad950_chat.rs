@@ -1,20 +1,20 @@
-//! RAD950 Conversation Extension runtime state (`docs/sol950-conversation-extension.md`).
+//! RAD950 Conversation Extension runtime state (`docs/rad950-conversation-extension.md`).
 //!
 //! Bounded, zero-heap session state for the first handheld trial:
 //! invite -> ask -> send station card -> exchange quick phrase -> short typed message -> end chat.
 //! Chat traffic never adds QSO or worked-grid credit.
 
-use ferrite_core::sol950::usol950::chat::{
+use ferrite_core::rad950::urad950::chat::{
     ant_name, chat_qsy_dial_hz10, chat_subch_hz, decode_chat_frame, encode_chat_frame, encode_literal_frags,
     estimate_airtime_s, literal_bursts, move_band_ref_hz10, normalize_literal, rig_name, session_ref_for,
     wind_dir_name, wx_cond_name, AboutCard, ChatBody, ChatCtrl, ChatPacket, LiteralReassembler, RendezvousAction,
     RendezvousCard, StationCard, WeatherCard, CHAT_LITERAL_MAX, CHAT_MAX_FRAGS, PHRASES, QUESTIONS,
 };
-use ferrite_core::sol950::usol950::distress::{
+use ferrite_core::rad950::urad950::distress::{
     decode_distress_frame, distress_assoc_cksum, encode_distress_frame, grid4_matches_coords, DistressAlert,
     DistressCategory, DistressFrame, DistressLocSource, DistressPosition, GRID4_UNKNOWN,
 };
-use ferrite_core::sol950::usol950::{Callsign, Frame};
+use ferrite_core::rad950::urad950::{Callsign, Frame};
 
 /// RX status of a received standalone distress incident.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -69,7 +69,7 @@ impl DistressState {
             tx_seq: 0,
             armed_alert: None,
             armed_pos: None,
-            armed_dial_hz10: crate::sol950::SOL950_DIALS[0],
+            armed_dial_hz10: crate::rad950::RAD950_DIALS[0],
             rx: None,
             ptt_hold_start_ms: None,
         }
@@ -416,10 +416,10 @@ pub fn format_rendezvous_card(rv: &RendezvousCard, out: &mut [u8]) -> usize {
             push_s(out, &mut n, b":");
             push_2d(out, &mut n, utc_min % 60);
             push_s(out, &mut n, b"Z ");
-            let dial = crate::sol950::SOL950_DIALS
+            let dial = crate::rad950::RAD950_DIALS
                 .get(dial_preset as usize)
                 .copied()
-                .unwrap_or(crate::sol950::SOL950_DIALS[0]);
+                .unwrap_or(crate::rad950::RAD950_DIALS[0]);
             fmt_dial_mhz(dial, out, &mut n);
         }
         RendezvousCard::MoveFreq { action, band_id, dial_offset_10hz, .. } => {
@@ -488,7 +488,7 @@ fn fmt_u8(mut v: u8, out: &mut [u8; 4]) -> usize {
     k
 }
 
-/// Complete bounded conversation state attached to `Sol950Host`.
+/// Complete bounded conversation state attached to `Rad950Host`.
 pub struct ChatState {
     pub phase: ChatPhase,
     pub peer: Callsign,
@@ -528,7 +528,7 @@ pub struct ChatState {
     pub saved_reminder: Option<SavedReminder>,
     /// Active near-term frequency move countdown + retune confirmation state.
     pub active_move: Option<ActiveMove>,
-    /// Dial preset index staged in More menu for Schedule/Move offers (`0..SOL950_DIALS.len()`).
+    /// Dial preset index staged in More menu for Schedule/Move offers (`0..RAD950_DIALS.len()`).
     pub offer_dial_idx: u8,
     /// Current session UTC day (for resolving Schedule days_ahead across midnight) and calling/chat QSY dials.
     pub session_utc_day: u32,
@@ -586,9 +586,9 @@ impl ChatState {
             active_move: None,
             offer_dial_idx: 1, // default secondary 10m preset (28.082 MHz)
             session_utc_day: 0,
-            source_dial_hz10: crate::sol950::SOL950_DIALS[0],
-            calling_dial_hz10: crate::sol950::SOL950_DIALS[0],
-            chat_dial_hz10: chat_qsy_dial_hz10(crate::sol950::SOL950_DIALS[0], 1),
+            source_dial_hz10: crate::rad950::RAD950_DIALS[0],
+            calling_dial_hz10: crate::rad950::RAD950_DIALS[0],
+            chat_dial_hz10: chat_qsy_dial_hz10(crate::rad950::RAD950_DIALS[0], 1),
             qsy_step: 1,
             chat_subch: 2,
             pending_retune: false,
@@ -1294,7 +1294,7 @@ mod tests {
         let mut tx = ChatState::new();
         let mut rx = ChatState::new();
         let sender = Callsign::encode(b"KF8QE").unwrap();
-        let grid = ferrite_core::sol950::usol950::frame::encode_grid4(b"CM87").unwrap();
+        let grid = ferrite_core::rad950::urad950::frame::encode_grid4(b"CM87").unwrap();
         tx.distress.category = DistressCategory::Medical;
         tx.distress.loc_src = DistressLocSource::FreshGps;
         tx.distress.lat_e4 = 377_749;

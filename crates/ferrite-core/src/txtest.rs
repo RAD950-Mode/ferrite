@@ -89,45 +89,45 @@ pub enum Signal {
     Gmsk,
     /// TERM-33.17: 9600 Bd G3RUH (scrambled PRBS9).
     G3ruh,
-    /// SOL950 110-symbol `CQ NQ6N FN31` reference burst via BK4829 PLL stepping (`REG_38/39` + VCO toggle, TMR5).
-    Sol950,
-    /// SOL950 BK4829 PLL calibration staircase (`+500 Hz`/step every 500 ms, TMR5).
-    Sol950Cal,
+    /// RAD950 110-symbol `CQ NQ6N FN31` reference burst via BK4829 PLL stepping (`REG_38/39` + VCO toggle, TMR5).
+    Rad950,
+    /// RAD950 BK4829 PLL calibration staircase (`+500 Hz`/step every 500 ms, TMR5).
+    Rad950Cal,
 }
 
-/// Default `REG_40` 12-bit deviation scale for `txtest sol950` / `sol950-cal`.
-pub const SOL950_DEV_DEFAULT: u16 = 180;
+/// Default `REG_40` 12-bit deviation scale for `txtest rad950` / `rad950-cal`.
+pub const RAD950_DEV_DEFAULT: u16 = 180;
 
-/// Locked 110-symbol `CQ NQ6N FN31` (`tx_pwr = 10`) tone sequence (`docs/sol950-design-v2.md` §3).
+/// Locked 110-symbol `CQ NQ6N FN31` (`tx_pwr = 10`) tone sequence (`docs/rad950-design-v2.md` §3).
 /// Kept as a named `static` so the Radio task reads it from zero-wait fast flash (`firmware/memory.x`).
-pub static SOL950_REF_TONES: [u8; 110] = [
+pub static RAD950_REF_TONES: [u8; 110] = [
     0, 3, 0, 1, 3, 2, 0, 1, 0, 3, 3, 0, 0, 0, 3, 3, 2, 1, 3, 0, 3, 2, 0, 1, 1, 0, 0, 0, 1, 2, 0, 1, 3, 0, 0, 3, 0, 1,
     0, 0, 3, 1, 3, 2, 1, 3, 0, 3, 3, 3, 2, 0, 2, 3, 0, 1, 0, 3, 2, 2, 1, 3, 2, 2, 2, 0, 3, 1, 2, 1, 0, 1, 0, 0, 3, 0,
     1, 2, 1, 2, 2, 2, 1, 0, 3, 3, 1, 0, 0, 1, 3, 0, 0, 3, 2, 2, 0, 3, 1, 0, 1, 1, 1, 0, 3, 1, 0, 2, 3, 0,
 ];
 
-/// SOL950 `REG_70` tone-1 gains (`0..=127`) for tones `0..=3`, scaled by `level` (`100 %` -> `[16, 48, 80, 112]`).
-pub fn sol950_gains(level: u8) -> [u8; 4] {
+/// RAD950 `REG_70` tone-1 gains (`0..=127`) for tones `0..=3`, scaled by `level` (`100 %` -> `[16, 48, 80, 112]`).
+pub fn rad950_gains(level: u8) -> [u8; 4] {
     [0u32, 1, 2, 3].map(|t| (((16 + 32 * t) * level as u32 + 50) / 100).min(127) as u8)
 }
 
-/// Non-blocking `1.25 ms` (`800 Hz`) substep schedule for `txtest sol950` and `txtest sol950-cal`.
+/// Non-blocking `1.25 ms` (`800 Hz`) substep schedule for `txtest rad950` and `txtest rad950-cal`.
 #[derive(Clone, Copy, Debug)]
-pub struct Sol950Bk {
+pub struct Rad950Bk {
     cal: bool,
     gains: [u8; 4],
 }
 
-impl Sol950Bk {
+impl Rad950Bk {
     /// Substep period in Hz (`64` substeps per `80 ms` symbol = `800 Hz`, i.e., `1,500` `TMR5` ticks at `1.2 MHz`).
     pub const STEP_HZ: u32 = 800;
     /// `0.20 s` (`160` substeps) lead-in on tone 0 after key-up before symbol 0 begins.
     pub const LEAD_STEPS: u32 = 160;
-    /// `500 ms` (`400` substeps) per level in `sol950-cal`.
+    /// `500 ms` (`400` substeps) per level in `rad950-cal`.
     pub const CAL_HOLD_STEPS: u32 = 400;
 
     pub fn new(cal: bool, level: u8) -> Self {
-        Self { cal, gains: sol950_gains(level) }
+        Self { cal, gains: rad950_gains(level) }
     }
 
     /// Desired `REG_70` gain (`0..=127`) at `1.25 ms` substep `step` from start.
@@ -138,14 +138,14 @@ impl Sol950Bk {
             return CAL[i];
         }
         if step < Self::LEAD_STEPS {
-            return self.gains[SOL950_REF_TONES[0] as usize];
+            return self.gains[RAD950_REF_TONES[0] as usize];
         }
         let body = step - Self::LEAD_STEPS;
         let sym = (body / 64) as usize;
-        if sym < SOL950_REF_TONES.len() {
-            usol950::phy::reg70_gain_at(&SOL950_REF_TONES, sym, (body % 64) as usize, self.gains)
+        if sym < RAD950_REF_TONES.len() {
+            urad950::phy::reg70_gain_at(&RAD950_REF_TONES, sym, (body % 64) as usize, self.gains)
         } else {
-            self.gains[SOL950_REF_TONES[SOL950_REF_TONES.len() - 1] as usize]
+            self.gains[RAD950_REF_TONES[RAD950_REF_TONES.len() - 1] as usize]
         }
     }
 }
@@ -160,8 +160,8 @@ impl Signal {
         Signal::Fsk,
         Signal::Gmsk,
         Signal::G3ruh,
-        Signal::Sol950,
-        Signal::Sol950Cal,
+        Signal::Rad950,
+        Signal::Rad950Cal,
     ];
 
     /// The terminal's word for it.
@@ -175,8 +175,8 @@ impl Signal {
             Signal::Fsk => "fsk",
             Signal::Gmsk => "gmsk",
             Signal::G3ruh => "g3ruh",
-            Signal::Sol950 => "sol950",
-            Signal::Sol950Cal => "sol950-cal",
+            Signal::Rad950 => "rad950",
+            Signal::Rad950Cal => "rad950-cal",
         }
     }
 
@@ -185,31 +185,31 @@ impl Signal {
         matches!(self, Signal::Fsk | Signal::Gmsk)
     }
 
-    /// Whether this is one of the BK4829 frozen-tone SOL950 signals (`Arm.baud` carries `REG_40` `dev`).
-    pub fn is_sol950(self) -> bool {
-        matches!(self, Signal::Sol950 | Signal::Sol950Cal)
+    /// Whether this is one of the BK4829 frozen-tone RAD950 signals (`Arm.baud` carries `REG_40` `dev`).
+    pub fn is_rad950(self) -> bool {
+        matches!(self, Signal::Rad950 | Signal::Rad950Cal)
     }
 
-    /// The baud (or `REG_40` `dev` for `sol950*`) an arming without one gets.
+    /// The baud (or `REG_40` `dev` for `rad950*`) an arming without one gets.
     pub fn default_baud(self) -> u16 {
         match self {
             Signal::Fsk => 1200,
             Signal::Gmsk => 4800,
             Signal::G3ruh => G3RUH_BAUD,
-            Signal::Sol950 | Signal::Sol950Cal => SOL950_DEV_DEFAULT,
+            Signal::Rad950 | Signal::Rad950Cal => RAD950_DEV_DEFAULT,
             _ => 0,
         }
     }
 
-    /// Played from DAC1 by the DSP task as one signal from the key-up to the release (all but `afsk-bk` / `sol950*`,
+    /// Played from DAC1 by the DSP task as one signal from the key-up to the release (all but `afsk-bk` / `rad950*`,
     /// which use the BK4829's tone generator on the Radio task, and `suite`).
     pub fn dac(self) -> bool {
-        !matches!(self, Signal::AfskBk | Signal::Suite | Signal::Sol950 | Signal::Sol950Cal)
+        !matches!(self, Signal::AfskBk | Signal::Suite | Signal::Rad950 | Signal::Rad950Cal)
     }
 
-    /// Takes a FILTERS word and a LEVEL (the DAC signals and `afsk-bk` / `sol950`'s LEVEL; `suite` and `sol950-cal` do not).
+    /// Takes a FILTERS word and a LEVEL (the DAC signals and `afsk-bk` / `rad950`'s LEVEL; `suite` and `rad950-cal` do not).
     pub fn takes_level(self) -> bool {
-        !matches!(self, Signal::Suite | Signal::Sol950Cal)
+        !matches!(self, Signal::Suite | Signal::Rad950Cal)
     }
 
     /// A word as typed, any case.
@@ -217,10 +217,10 @@ impl Signal {
         Signal::ALL.into_iter().find(|s| s.name().as_bytes().eq_ignore_ascii_case(w))
     }
 
-    /// The filters when none are named: `data` for the DAC signals; `afsk-bk` and `sol950*` leave the key-up's
-    /// voice settings (`sol950*` saves and restores its own BK4829 TX registers).
+    /// The filters when none are named: `data` for the DAC signals; `afsk-bk` and `rad950*` leave the key-up's
+    /// voice settings (`rad950*` saves and restores its own BK4829 TX registers).
     pub fn default_filters(self) -> Filters {
-        if matches!(self, Signal::AfskBk | Signal::Sol950 | Signal::Sol950Cal) {
+        if matches!(self, Signal::AfskBk | Signal::Rad950 | Signal::Rad950Cal) {
             Filters::Voice
         } else {
             Filters::Data
@@ -864,7 +864,7 @@ impl Gen {
             Signal::Fsk => Gen::Nrz(Nrz::new(Bits::new(false), baud, rc, scaled(dev_amp(FSK2_DEV_HZ), level))),
             Signal::Gmsk => Gen::Nrz(Nrz::new(Bits::new(false), baud, Shape::Gauss, scaled(dev_amp(baud as i32 / 4), level))),
             Signal::G3ruh => Gen::Nrz(Nrz::new(Bits::new(true), G3RUH_BAUD, Shape::RaisedCosine, scaled(dev_amp(FSK2_DEV_HZ), level))),
-            Signal::AfskBk | Signal::Suite | Signal::Sol950 | Signal::Sol950Cal => return None,
+            Signal::AfskBk | Signal::Suite | Signal::Rad950 | Signal::Rad950Cal => return None,
         })
     }
 
@@ -1024,25 +1024,25 @@ mod tests {
         assert_eq!(Signal::ALL.map(Signal::default_filters)[..5], [Filters::Data, Filters::Data, Filters::Data, Filters::Voice, Filters::Data]);
         assert!(Signal::ALL[5..8].iter().all(|s| s.default_filters() == Filters::Data && s.dac() && s.takes_level()));
         assert_eq!(Signal::ALL.map(Signal::takes_baud)[5..8], [true, true, false]);
-        assert!(Signal::ALL[8..].iter().all(|s| s.is_sol950() && !s.dac() && s.default_filters() == Filters::Voice));
+        assert!(Signal::ALL[8..].iter().all(|s| s.is_rad950() && !s.dac() && s.default_filters() == Filters::Voice));
         assert_eq!(Signal::parse(b"AFSK-BK"), Some(Signal::AfskBk));
-        assert_eq!(Signal::parse(b"SOL950"), Some(Signal::Sol950));
-        assert_eq!(Signal::parse(b"sol950-cal"), Some(Signal::Sol950Cal));
+        assert_eq!(Signal::parse(b"RAD950"), Some(Signal::Rad950));
+        assert_eq!(Signal::parse(b"rad950-cal"), Some(Signal::Rad950Cal));
         assert_eq!(Signal::parse(b"Suite"), Some(Signal::Suite));
         assert_eq!(Signal::ALL.map(Signal::dac)[..5], [true, true, true, false, false]);
         assert_eq!(Signal::ALL.map(Signal::takes_level)[..5], [true, true, true, true, false]);
         assert!(Gen::new(Signal::AfskBk, 100).is_none(), "the DSP task never plays afsk-bk");
-        assert!(Gen::new(Signal::Sol950, 100).is_none(), "the DSP task never plays sol950");
+        assert!(Gen::new(Signal::Rad950, 100).is_none(), "the DSP task never plays rad950");
         assert!(Gen::new(Signal::Suite, 100).is_none(), "the suite's DAC parts come step by step");
 
-        // Verify SOL950_REF_TONES matches `CQ NQ6N FN31 (tx_pwr = 10)` from `usol950::encode_tones`.
-        let nq6n = usol950::Callsign::encode(b"NQ6N").unwrap();
-        let fn31 = usol950::frame::encode_grid4(b"FN31").unwrap();
-        let want = usol950::encode_tones(usol950::Frame::Cq { sender: nq6n, grid4: fn31, tx_pwr: 10, reserved: 0 });
-        assert_eq!(SOL950_REF_TONES, want);
-        let sched = Sol950Bk::new(false, 100);
+        // Verify RAD950_REF_TONES matches `CQ NQ6N FN31 (tx_pwr = 10)` from `urad950::encode_tones`.
+        let nq6n = urad950::Callsign::encode(b"NQ6N").unwrap();
+        let fn31 = urad950::frame::encode_grid4(b"FN31").unwrap();
+        let want = urad950::encode_tones(urad950::Frame::Cq { sender: nq6n, grid4: fn31, tx_pwr: 10, reserved: 0 });
+        assert_eq!(RAD950_REF_TONES, want);
+        let sched = Rad950Bk::new(false, 100);
         assert_eq!(sched.gain_at(0), 16);
-        assert_eq!(sched.gain_at(Sol950Bk::LEAD_STEPS + 64 + 8), 112); // symbol 1 (`S0[1] = 3`), after 8-step ramp
+        assert_eq!(sched.gain_at(Rad950Bk::LEAD_STEPS + 64 + 8), 112); // symbol 1 (`S0[1] = 3`), after 8-step ramp
     }
 
     /// TERM-33.2: 4FSK polarity. The DAC-to-air chain inverts, so the generator sends +3 as a negative swing: the

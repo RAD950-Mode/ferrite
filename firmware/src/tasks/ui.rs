@@ -450,9 +450,9 @@ pub async fn task() {
     lcd.0.fill(0, 0, 240, 320, BG);
     let mut app = init_app(set);
     app.sat_attach(crate::sat::data(store)); // chapter 28a: the satellites (the store's, SAT-2) and their passes
-    app.sol950_attach(sol950_host()); // SOL950 10 m weak-signal mode host
-    let mut sol950_journal = sol950_mount_flash(store, app);
-    let mut sol950_dec_on = false;
+    app.rad950_attach(rad950_host()); // RAD950 10 m weak-signal mode host
+    let mut rad950_journal = rad950_mount_flash(store, app);
+    let mut rad950_dec_on = false;
     // The slots as they were saved (frequencies, VFO settings, the channel each is on, watch, Battery Save).
     store.restore(app);
     // After the self-test: setup on first boot (BOOT-12); MENU held: the settings reset (PIN-6, BOOT-14), which
@@ -967,7 +967,7 @@ pub async fn task() {
         if house {
             gps.step(&mut app, store, &mut dev); // PWR-26.15: fixes come once a second
         }
-        sol950_step(&mut app, store, &mut sol950_dec_on, &mut sol950_journal).await;
+        rad950_step(&mut app, store, &mut rad950_dec_on, &mut rad950_journal).await;
         sec!(4); // gps
         // LINK-38: a redraw for live changes alone at most every FRAME_MIN_MS. During a scan the Radio task reports
         // every step and each scan page redraw is ~14 KB (12-17 ms): back to back they left the Link task (same
@@ -1010,8 +1010,8 @@ pub async fn task() {
         let since_input = now.wrapping_sub(app.last_input());
         // RAD950's 512-pt FFT + 8-track receiver requires full MCU speed; never throttle to 24 MHz while open,
         // or the higher-priority DSP task starves thread-mode `ui::task` and trips the watchdog.
-        let sol950_on = app.sol950_open();
-        let lpm_wait = if sol950_on {
+        let rad950_on = app.rad950_open();
+        let lpm_wait = if rad950_on {
             None
         } else {
             lpm_since.map(|t| ferrite_core::clocktree::lpm_low_in(now.wrapping_sub(t), since_input, panel_asleep, LPM_CLOCK_MS, LPM_BOOST_MS))
@@ -1022,7 +1022,7 @@ pub async fn task() {
         if ports.live(&app, now) {
             why |= ferrite_core::clocktree::why::LINK;
         }
-        if audio || sol950_on || crate::hal::clock::AUDIO_WAITING.load(Relaxed) != 0 {
+        if audio || rad950_on || crate::hal::clock::AUDIO_WAITING.load(Relaxed) != 0 {
             why |= ferrite_core::clocktree::why::AUDIO;
         }
         // PWR-26.1: the panel just woke (a key, or a signal with 0 7 4 4's wake on receive): its whole redraw at full
@@ -1155,7 +1155,7 @@ pub async fn task() {
         if !draw && !asleep {
             period = period.min(frame_min.saturating_sub(since).max(1) as u64); // the frame held back, drawn on time
         }
-        if let Some(w) = app.sol950_next_wake_ms() {
+        if let Some(w) = app.rad950_next_wake_ms() {
             period = period.min(w as u64);
         }
         if leds.next_ms != 0 {
@@ -1460,25 +1460,25 @@ fn init_app(set: &'static mut ferrite_app::settings::Settings) -> &'static mut A
     unsafe { (*core::ptr::addr_of_mut!(APP)).write(App::new(set, store::last_alert())) }
 }
 
-/// Static storage for the SOL950 runtime host (initialized once at boot by `ui::task`).
+/// Static storage for the RAD950 runtime host (initialized once at boot by `ui::task`).
 #[inline(never)]
-fn sol950_host() -> &'static mut ferrite_app::sol950::Sol950Host {
+fn rad950_host() -> &'static mut ferrite_app::rad950::Rad950Host {
     use core::mem::MaybeUninit;
     use core::sync::atomic::AtomicBool;
     static TAKEN: AtomicBool = AtomicBool::new(false);
-    static mut HOST: MaybeUninit<ferrite_app::sol950::Sol950Host> = MaybeUninit::uninit();
+    static mut HOST: MaybeUninit<ferrite_app::rad950::Rad950Host> = MaybeUninit::uninit();
     assert!(!TAKEN.swap(true, Relaxed));
-    unsafe { (*core::ptr::addr_of_mut!(HOST)).write(ferrite_app::sol950::Sol950Host::new()) }
+    unsafe { (*core::ptr::addr_of_mut!(HOST)).write(ferrite_app::rad950::Rad950Host::new()) }
 }
 
-/// Mount `SOL950_CFG` (A/B profile) and `SOL950_LOG` (64 KiB durable contact journal) at boot.
+/// Mount `RAD950_CFG` (A/B profile) and `RAD950_LOG` (64 KiB durable contact journal) at boot.
 #[inline(never)]
-fn sol950_mount_flash(store: &crate::store::Store, app: &mut App) -> ferrite_store::sol950::Sol950Journal {
-    use ferrite_app::sol950::{GridSource, SavedContact, Sol950Store, MEM_LOG_CAP};
-    use ferrite_store::sol950::{load_cfg, Sol950Journal};
+fn rad950_mount_flash(store: &crate::store::Store, app: &mut App) -> ferrite_store::rad950::Rad950Journal {
+    use ferrite_app::rad950::{GridSource, SavedContact, Rad950Store, MEM_LOG_CAP};
+    use ferrite_store::rad950::{load_cfg, Rad950Journal};
     let mut nor = store.nor();
     if let Ok(Some(cfg)) = load_cfg(&mut *nor) {
-        if let Some(h) = app.sol950_host_mut() {
+        if let Some(h) = app.rad950_host_mut() {
             h.profile.base_call = cfg.base_call;
             h.profile.call_len = cfg.call_len;
             h.profile.prefix = cfg.prefix;
@@ -1489,8 +1489,8 @@ fn sol950_mount_flash(store: &crate::store::Store, app: &mut App) -> ferrite_sto
             h.profile.dial_idx = cfg.dial_idx;
             h.profile.rx_corr_hz = cfg.rx_corr_hz;
             h.profile.tx_power = cfg.tx_power;
-            h.profile.coop_rx = ferrite_app::sol950::CoopRxMode::from_u8(cfg.coop_rx);
-            h.profile.coop_link = ferrite_app::sol950::CoopLink::from_u8(cfg.coop_link);
+            h.profile.coop_rx = ferrite_app::rad950::CoopRxMode::from_u8(cfg.coop_rx);
+            h.profile.coop_link = ferrite_app::rad950::CoopLink::from_u8(cfg.coop_link);
             h.chat.station_card.rig = cfg.card_rig;
             h.chat.station_card.ant = cfg.card_ant;
             h.chat.station_card.height_m = cfg.card_height_m;
@@ -1505,11 +1505,11 @@ fn sol950_mount_flash(store: &crate::store::Store, app: &mut App) -> ferrite_sto
             h.sync_engine_config();
         }
     }
-    let journal = Sol950Journal::mount(&mut *nor).unwrap_or_default();
+    let journal = Rad950Journal::mount(&mut *nor).unwrap_or_default();
     if journal.count > 0 {
         let mut recent = [None; MEM_LOG_CAP];
         if let Ok(n) = journal.read_newest(&mut *nor, 0, None, &mut recent) {
-            if let Some(h) = app.sol950_host_mut() {
+            if let Some(h) = app.rad950_host_mut() {
                 for rec in recent[..n].iter().rev().flatten() {
                     let src = match rec.my_grid_src {
                         1 => GridSource::Gps,
@@ -1538,19 +1538,19 @@ fn sol950_mount_flash(store: &crate::store::Store, app: &mut App) -> ferrite_sto
     journal
 }
 
-/// Drive SOL950 DSP decoder switching, GPS sub-second UTC slot timing, RX frames, TX dispatch,
-/// and durable SPI flash persistence (`SOL950_CFG` / `SOL950_LOG`).
-async fn sol950_step(
+/// Drive RAD950 DSP decoder switching, GPS sub-second UTC slot timing, RX frames, TX dispatch,
+/// and durable SPI flash persistence (`RAD950_CFG` / `RAD950_LOG`).
+async fn rad950_step(
     app: &mut App,
     store: &crate::store::Store,
     dec_on: &mut bool,
-    journal: &mut ferrite_store::sol950::Sol950Journal,
+    journal: &mut ferrite_store::rad950::Rad950Journal,
 ) {
     use ferrite_core::msg::{DecoderKind, DspCmd};
 
     // Persist profile changes and completed contacts to SPI flash whenever the store queue is idle.
     if store.idle() && !cfg!(feature = "bringup") {
-        let dirty_prof = app.sol950_host_mut().and_then(|h| {
+        let dirty_prof = app.rad950_host_mut().and_then(|h| {
             if h.profile_dirty {
                 h.profile_dirty = false;
                 Some((h.profile, h.chat.station_card, h.rdv.band_mask, h.rdv.follow_schedule))
@@ -1559,7 +1559,7 @@ async fn sol950_step(
             }
         });
         if let Some((p, sc, rdv_mask, rdv_follow)) = dirty_prof {
-            let mut rec = ferrite_store::sol950::Sol950CfgRecord {
+            let mut rec = ferrite_store::rad950::Rad950CfgRecord {
                 gen: 0,
                 base_call: p.base_call,
                 call_len: p.call_len,
@@ -1580,12 +1580,12 @@ async fn sol950_step(
                 rdv_band_mask: rdv_mask,
                 rdv_follow,
             };
-            let mut nor = store.sol950_nor();
-            let _ = ferrite_store::sol950::save_cfg(&mut nor, &mut rec).await;
+            let mut nor = store.rad950_nor();
+            let _ = ferrite_store::rad950::save_cfg(&mut nor, &mut rec).await;
         }
-        let pending_c = app.sol950_host_mut().and_then(|h| h.pending_save.take());
+        let pending_c = app.rad950_host_mut().and_then(|h| h.pending_save.take());
         if let Some(c) = pending_c {
-            let fc = ferrite_store::sol950::Sol950Contact {
+            let fc = ferrite_store::rad950::Rad950Contact {
                 utc_sec: c.utc_sec,
                 dial_hz10: c.dial_hz10,
                 peer_id: c.peer_id,
@@ -1595,25 +1595,25 @@ async fn sol950_step(
                 rx_snr_db: c.rx_snr_db,
                 tx_snr_db: c.tx_snr_db,
                 my_grid_src: match c.my_grid_src {
-                    ferrite_app::sol950::GridSource::Gps => 1,
-                    ferrite_app::sol950::GridSource::Manual => 2,
-                    ferrite_app::sol950::GridSource::Unset => 0,
+                    ferrite_app::rad950::GridSource::Gps => 1,
+                    ferrite_app::rad950::GridSource::Manual => 2,
+                    ferrite_app::rad950::GridSource::Unset => 0,
                 },
                 flags: 0,
                 slot: c.slot,
                 seq: 0,
             };
             let outcome = {
-                let mut nor = store.sol950_nor();
+                let mut nor = store.rad950_nor();
                 journal.append(&mut nor, &fc).await
             };
-            if let Some(h) = app.sol950_host_mut() {
+            if let Some(h) = app.rad950_host_mut() {
                 match outcome {
-                    Ok(ferrite_store::sol950::AppendOutcome::Saved(_) | ferrite_store::sol950::AppendOutcome::Duplicate) => {
+                    Ok(ferrite_store::rad950::AppendOutcome::Saved(_) | ferrite_store::rad950::AppendOutcome::Duplicate) => {
                         h.saved_ack = true;
                         h.log_full = journal.is_full();
                     }
-                    Ok(ferrite_store::sol950::AppendOutcome::LogFull) => {
+                    Ok(ferrite_store::rad950::AppendOutcome::LogFull) => {
                         h.saved_ack = false;
                         h.log_full = true;
                         h.set_notice(b"Log full - not saved");
@@ -1627,8 +1627,8 @@ async fn sol950_step(
         }
     }
 
-    let open = app.sol950_open();
-    let mode60 = app.sol950_mode60();
+    let open = app.rad950_open();
+    let mode60 = app.rad950_mode60();
     static LAST_MODE60: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
     let mode_changed = open && *dec_on && LAST_MODE60.load(Relaxed) != mode60;
     if open != *dec_on || mode_changed {
@@ -1640,7 +1640,7 @@ async fn sol950_step(
             }
         }
         let cmd = if open {
-            DspCmd::Decoder(if mode60 { DecoderKind::Sol950_60 } else { DecoderKind::Sol950 })
+            DspCmd::Decoder(if mode60 { DecoderKind::Rad950_60 } else { DecoderKind::Rad950 })
         } else if app.aprs_on() {
             DspCmd::Decoder(DecoderKind::Afsk)
         } else {
@@ -1655,44 +1655,44 @@ async fn sol950_step(
         return;
     }
 
-    // Drain any decoded SOL950 frames from the DSP task.
-    while let Ok(d) = crate::chan::SOL950_RX.try_receive() {
-        if let Some(h) = app.sol950_host_mut() {
+    // Drain any decoded RAD950 frames from the DSP task.
+    while let Ok(d) = crate::chan::RAD950_RX.try_receive() {
+        if let Some(h) = app.rad950_host_mut() {
             h.on_rx_frame(d);
         }
     }
-    if let Some(wf_col) = crate::chan::SOL950_WF.try_take() {
-        if let Some(h) = app.sol950_host_mut() {
+    if let Some(wf_col) = crate::chan::RAD950_WF.try_take() {
+        if let Some(h) = app.rad950_host_mut() {
             if !h.tx_in_flight {
                 let slot_edge = h.utc_sec != 0 && (h.utc_sec % 10 == 0) && h.utc_ms_in_sec < 250;
                 h.wf.push(wf_col, slot_edge, false);
             }
         }
     }
-    if let Some(sc) = crate::chan::SOL950_SOFT.try_take() {
-        if let Some(h) = app.sol950_host_mut() {
+    if let Some(sc) = crate::chan::RAD950_SOFT.try_take() {
+        if let Some(h) = app.rad950_host_mut() {
             let slot = if h.last_slot == u32::MAX { 0 } else { h.last_slot };
             h.last_soft = Some((slot, sc));
         }
     }
-    if let Some(report) = crate::chan::SOL950_COOP.try_take() {
-        if let Some(h) = app.sol950_host_mut() {
+    if let Some(report) = crate::chan::RAD950_COOP.try_take() {
+        if let Some(h) = app.rad950_host_mut() {
             h.last_coop = Some(report);
         }
     }
     // Check live TX completion from the Radio task.
     #[cfg(feature = "tx")]
-    if let Some(ok) = crate::chan::SOL950_TX_DONE.try_take() {
-        if let Some(h) = app.sol950_host_mut() {
+    if let Some(ok) = crate::chan::RAD950_TX_DONE.try_take() {
+        if let Some(h) = app.rad950_host_mut() {
             h.on_tx_done(ok);
         }
     }
 
     // Update sub-second UTC & onboard GPS grid + Distress position from `store.extra.gps.onboard_fix()` + NMEA `$` burst tick.
-    // Once locked, keep the last GPS anchor in RAM so the 8 MHz `HEXT` quartz crystal holds valid SOL950 time
+    // Once locked, keep the last GPS anchor in RAM so the 8 MHz `HEXT` quartz crystal holds valid RAD950 time
     // (~50 ppm = 1 ms per 20 s -> ~33 min within `MAX_TX_UNCERT_MS = 150 ms`) if GPS signal drops indoors or sleeps.
     use core::sync::atomic::AtomicU32;
-    use ferrite_app::sol950::{ClockSource, MAX_TX_UNCERT_MS};
+    use ferrite_app::rad950::{ClockSource, MAX_TX_UNCERT_MS};
     static GPS_ANCHOR_UNIX: AtomicU32 = AtomicU32::new(0);
     static GPS_ANCHOR_TICK: AtomicU32 = AtomicU32::new(0);
     static GPS_ANCHOR_GRID: AtomicU32 = AtomicU32::new(0);
@@ -1702,7 +1702,7 @@ async fn sol950_step(
     let (utc_sec, ms_in_sec, uncert_ms, clock_src, gps_grid) = if let Some(fix) = g.onboard_fix() {
         let grid_bytes = ferrite_app::gpsdata::pos_to_grid4(fix.lat, fix.lon);
         let grid = Some(grid_bytes);
-        if let Some(h) = app.sol950_host_mut() {
+        if let Some(h) = app.rad950_host_mut() {
             h.chat.distress.update_gps_pos(fix.lat, fix.lon, true);
         }
         if fix.unix != 0 {
@@ -1746,7 +1746,7 @@ async fn sol950_step(
             h
         } else {
             // Bench builds only: provide a monotonic UTC fallback indoors when no GPS fix or holdover is present,
-            // enabling on-MCU `DspCmd::Sol950Finish` and conducted `Sol950Tx` testing.
+            // enabling on-MCU `DspCmd::Rad950Finish` and conducted `Rad950Tx` testing.
             #[cfg(feature = "bench")]
             {
                 let ms_total = Instant::now().as_millis();
@@ -1760,33 +1760,33 @@ async fn sol950_step(
             }
         }
     };
-    if let Some(h) = app.sol950_host_mut() {
+    if let Some(h) = app.rad950_host_mut() {
         h.update_clock(utc_sec, ms_in_sec, uncert_ms, clock_src, gps_grid);
         #[cfg(feature = "bench")]
         {
-            for (dst, src) in h.diag.iter_mut().zip(&crate::tasks::dsp::SOL950_DIAG) {
+            for (dst, src) in h.diag.iter_mut().zip(&crate::tasks::dsp::RAD950_DIAG) {
                 *dst = src.load(Relaxed);
             }
         }
     }
 
-    if app.sol950_take_reset() {
-        let _ = crate::chan::DSP.try_send(DspCmd::Sol950Reset);
+    if app.rad950_take_reset() {
+        let _ = crate::chan::DSP.try_send(DspCmd::Rad950Reset);
     }
-    if app.sol950_take_subslot() {
-        let _ = crate::chan::DSP.try_send(DspCmd::Sol950Subslot);
+    if app.rad950_take_subslot() {
+        let _ = crate::chan::DSP.try_send(DspCmd::Rad950Subslot);
     }
 
-    if let Some((utc_slot, dial_hz, coop_capture)) = app.sol950_take_finish() {
-        let _ = crate::chan::DSP.try_send(DspCmd::Sol950Finish { utc_slot, dial_hz, coop_capture });
+    if let Some((utc_slot, dial_hz, coop_capture)) = app.rad950_take_finish() {
+        let _ = crate::chan::DSP.try_send(DspCmd::Rad950Finish { utc_slot, dial_hz, coop_capture });
     }
 
     #[cfg(feature = "tx")]
-    if let Some((rf_freq, power, frame)) = app.sol950_take_tx() {
+    if let Some((rf_freq, power, frame)) = app.rad950_take_tx() {
         let region = app.settings().region;
         let extend = app.settings().extend_tx;
-        crate::chan::SOL950_TX.signal(frame);
+        crate::chan::RAD950_TX.signal(frame);
         let _ = crate::chan::RADIO.try_send(RadioCmd::TxPlan { tx: rf_freq, region, extend, confirmed: false });
-        let _ = crate::chan::RADIO.try_send(RadioCmd::Sol950Tx { freq: rf_freq, power });
+        let _ = crate::chan::RADIO.try_send(RadioCmd::Rad950Tx { freq: rf_freq, power });
     }
 }

@@ -90,7 +90,7 @@ mod dtmf;
 mod bcast;
 mod hf;
 mod sat;
-mod sol950;
+mod rad950;
 mod beep;
 mod counter;
 mod scope;
@@ -306,8 +306,8 @@ struct Radio {
     hf: Option<HfOn>,
     /// Satellite mode (SAT-1), while the satellite screen is open.
     sat: Option<sat::SatRun>,
-    /// SOL950 10 m weak-signal mode, while the SOL950 screen is open.
-    sol950: Option<sol950::Sol950Run>,
+    /// RAD950 10 m weak-signal mode, while the RAD950 screen is open.
+    rad950: Option<rad950::Rad950Run>,
     /// HF-31, BCR-18: an SI4732 seek running (HF mode's or FM broadcast's), polled by the tick (MODE-7: no command
     /// waits for it).
     seek: Option<SiSeek>,
@@ -509,7 +509,7 @@ struct Tx {
     test_extra: Option<(u8, radio_chip::ExtraRegs)>,
     #[cfg(feature = "bench")]
     test_playing: bool,
-    /// TMR5 BK4829 tone/PLL step run (`afsk-bk` in bench builds, SOL950 live TX in `tx` builds).
+    /// TMR5 BK4829 tone/PLL step run (`afsk-bk` in bench builds, RAD950 live TX in `tx` builds).
     bk: Option<afskbk::BkRun>,
     /// TERM-34 `txtest suite` while it runs (`suite`).
     #[cfg(feature = "bench")]
@@ -526,7 +526,7 @@ struct Dial {
     at: u32,
 }
 
-/// What woke the main loop for a timed BK4829 TX run (`afsk-bk`/SOL950 TMR5 edge, or bench `txtest suite`).
+/// What woke the main loop for a timed BK4829 TX run (`afsk-bk`/RAD950 TMR5 edge, or bench `txtest suite`).
 #[cfg_attr(not(feature = "tx"), allow(dead_code))]
 enum TestEv {
     /// TMR5 made a tone/symbol step.
@@ -815,7 +815,7 @@ pub async fn task() {
         beep_level: 7,
         hf: None,
         sat: None,
-        sol950: None,
+        rad950: None,
         seek: None,
         counter: None,
         tsearch: None,
@@ -911,12 +911,12 @@ pub async fn task() {
         // Wake for the next command, the next Battery Save phase change, or (awake) the next tick. HF mode's tick
         // never steps Battery Save, so its deadline isn't waited on there (decision 163: a deadline the tick doesn't
         // move goes past and the wait fires every 1 ms, starving the UI and the link).
-        let mut at = r.save.deadline().filter(|_| r.hf.is_none() && r.sol950.is_none()).unwrap_or(u64::MAX); // satellite mode steps it (busy)
+        let mut at = r.save.deadline().filter(|_| r.hf.is_none() && r.rad950.is_none()).unwrap_or(u64::MAX); // satellite mode steps it (busy)
         // Broadcast FM's report (fm_poll) runs on the tick, also while Battery Save has the BK4829s asleep (BCR-19).
         // SCAN-21: a fast scan step's end ticks on time too (on the 10 ms tick alone a step waited for the next), but
         // only a due time still ahead of the last tick's start, and never within MIN_GAP_MS of its end
         // (`scan::tick_wake`, decision 165: a due time the tick didn't move woke it every 1 ms and hung the radio).
-        let tick_at = (!r.save.asleep() || r.kept() != 0 || r.hf.is_some() || r.sat.is_some() || r.sol950.is_some() || r.fm.is_some() || r.seek.is_some()).then(|| {
+        let tick_at = (!r.save.asleep() || r.kept() != 0 || r.hf.is_some() || r.sat.is_some() || r.rad950.is_some() || r.fm.is_some() || r.seek.is_some()).then(|| {
             let period = if r.busy() { TICK_MS } else { POLL_MS };
             crate::tasks::dsp::TICK_PERIOD_MS.store(period as u32, core::sync::atomic::Ordering::Relaxed); // APRS-56.4
             ferrite_core::scan::tick_wake(started, ticked, period, r.scan_due(now_ms()))
@@ -951,7 +951,7 @@ pub async fn task() {
             },
             _ => Instant::from_millis(at),
         };
-        // TMR5 BK4829 tone/PLL stepping (`afsk-bk` in bench, SOL950 live TX in `tx` builds) and bench `suite`.
+        // TMR5 BK4829 tone/PLL stepping (`afsk-bk` in bench, RAD950 live TX in `tx` builds) and bench `suite`.
         #[cfg(feature = "tx")]
         let bk_on = r.afsk_bk_on();
         #[cfg(all(feature = "tx", feature = "bench"))]
@@ -994,7 +994,7 @@ pub async fn task() {
                 match _ev {
                     TestEv::Edge => {
                         if r.afsk_bk_edge() {
-                            r.sol950_tx_finish(true).await;
+                            r.rad950_tx_finish(true).await;
                         }
                     }
                     #[cfg(feature = "bench")]
@@ -1053,7 +1053,7 @@ pub async fn task() {
         // LINK-13.4, decision 290: what the receive audio carries, for the DSP task: the first slot heard, else the
         // broadcast while it plays (its audio reaches PA2 too), else HF mode's.
         let open = core::array::from_fn(|i| snap.slots[i].squelch_open);
-        crate::chan::heard_now(open, r.bcast_slot.filter(|_| r.si_heard), r.hf.is_some() || r.sol950.is_some());
+        crate::chan::heard_now(open, r.bcast_slot.filter(|_| r.si_heard), r.hf.is_some() || r.rad950.is_some());
         live.send_if_modified(|v| {
             let changed = *v != Some(snap);
             if changed {

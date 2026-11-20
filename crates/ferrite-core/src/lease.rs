@@ -22,11 +22,11 @@ pub enum Held {
     ToneSearch,
     /// Satellite mode (SAT-1).
     Sat,
-    /// SOL950 10 m weak-signal mode.
-    Sol950,
+    /// RAD950 10 m weak-signal mode.
+    Rad950,
 }
 
-const HELD: [Held; 8] = [Held::Scope, Held::Counter, Held::Broadcast, Held::Hf, Held::Crossband, Held::ToneSearch, Held::Sat, Held::Sol950];
+const HELD: [Held; 8] = [Held::Scope, Held::Counter, Held::Broadcast, Held::Hf, Held::Crossband, Held::ToneSearch, Held::Sat, Held::Rad950];
 
 impl Held {
     /// The command that stops it, as the UI would send it.
@@ -39,7 +39,7 @@ impl Held {
             Held::Crossband => RadioCmd::Crossband(None),
             Held::ToneSearch => RadioCmd::ToneSearch { slot: 0, on: false },
             Held::Sat => RadioCmd::SatRx(0),
-            Held::Sol950 => RadioCmd::Sol950Rx { dial: 0, rx_corr_hz: 0, on: false },
+            Held::Rad950 => RadioCmd::Rad950Rx { dial: 0, rx_corr_hz: 0, on: false },
         }
     }
 }
@@ -90,8 +90,8 @@ impl Lease {
             RadioCmd::ToneSearch { on: false, .. } => self.stop(Held::ToneSearch),
             RadioCmd::SatRx(0) => self.stop(Held::Sat),
             RadioCmd::SatRx(_) => self.start(Held::Sat, now),
-            RadioCmd::Sol950Rx { on: true, .. } => self.start(Held::Sol950, now),
-            RadioCmd::Sol950Rx { on: false, .. } => self.stop(Held::Sol950),
+            RadioCmd::Rad950Rx { on: true, .. } => self.start(Held::Rad950, now),
+            RadioCmd::Rad950Rx { on: false, .. } => self.stop(Held::Rad950),
             // The input task's, not the UI's: no sign the UI is running.
             RadioCmd::Accessory(_) => {}
             _ => self.renew(now),

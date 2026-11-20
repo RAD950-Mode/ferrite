@@ -2176,7 +2176,7 @@ fn txtest(t: &mut Toks) -> Result<Done, No> {
         Some(Tok::Word(w)) => {
             let signal = Signal::parse(w).ok_or_else(|| t.say_t(USAGE))?;
             let mut arm = Arm::new(signal);
-            if signal.is_sol950() {
+            if signal.is_rad950() {
                 if let Some(tok) = t.next()? {
                     let Tok::Word(d) = tok else { return Err(t.say_t(USAGE)) };
                     arm.baud = number(d).filter(|n| (1..=4095).contains(n)).ok_or_else(|| t.say_t(USAGE))? as u16;

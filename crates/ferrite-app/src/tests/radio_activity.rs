@@ -1541,7 +1541,7 @@ fn stops(m: Mode, c: &RadioCmd) -> bool {
         Mode::Hf => matches!(c, RadioCmd::Hf { on: false, .. }),
         Mode::Xb => matches!(c, RadioCmd::Crossband(None)),
         Mode::Sat => matches!(c, RadioCmd::SatRx(0)),
-        Mode::Sol950 => matches!(c, RadioCmd::Sol950Rx { on: false, .. }),
+        Mode::Rad950 => matches!(c, RadioCmd::Rad950Rx { on: false, .. }),
         Mode::Off => false,
     }
 }
@@ -1567,7 +1567,7 @@ fn start(t: &mut T, m: Mode) {
             t.tap(Key::Hash);
         }
         Mode::Sat => t.open(Dest::Satellites),
-        Mode::Sol950 => t.open(Dest::Sol950),
+        Mode::Rad950 => t.open(Dest::Rad950),
         Mode::Off => {}
     }
     assert_eq!(t.app.radio.mode, m, "{m:?} runs");
@@ -1850,7 +1850,7 @@ fn random_use_keeps_modes_in_step() {
         Hf,
         Xb,
         Sat,
-        Sol950,
+        Rad950,
     }
     // the exclusive part (the broadcast is tracked apart: it may play beside the strip)
     fn kind(m: Mode) -> Option<Kind> {
@@ -1862,7 +1862,7 @@ fn random_use_keeps_modes_in_step() {
             Mode::Hf => Some(Kind::Hf),
             Mode::Xb => Some(Kind::Xb),
             Mode::Sat => Some(Kind::Sat),
-            Mode::Sol950 => Some(Kind::Sol950),
+            Mode::Rad950 => Some(Kind::Rad950),
         }
     }
     // the Radio task's view: what a command starts (Some) or stops (None)

@@ -119,7 +119,7 @@ extern "C" fn stray() {
 extern "C" fn tmr3() {
     hal::time_driver::on_interrupt()
 }
-/// TMR5 bit/symbol timer (`afsk-bk` in bench builds; SOL950 PLL symbol stepping in `tx` builds).
+/// TMR5 bit/symbol timer (`afsk-bk` in bench builds; RAD950 PLL symbol stepping in `tx` builds).
 #[cfg(feature = "tx")]
 extern "C" fn tmr5() {
     tasks::radio::afskbk::on_interrupt()

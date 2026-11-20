@@ -63,15 +63,15 @@ pub struct Needs {
     pub alarm: bool,
     /// (d) The clock from GPS (0 6 6): one fix after power-on ([`GpsAuto`] drops it once taken).
     pub clock: bool,
-    /// (e) SOL950 needs GPS UTC time discipline while active.
-    pub sol950_time: bool,
-    /// (f) SOL950 needs an onboard GPS position fix while active with GPS grid enabled.
-    pub sol950_pos: bool,
+    /// (e) RAD950 needs GPS UTC time discipline while active.
+    pub rad950_time: bool,
+    /// (f) RAD950 needs an onboard GPS position fix while active with GPS grid enabled.
+    pub rad950_pos: bool,
 }
 
 impl Needs {
     pub fn any(&self) -> bool {
-        self.aprs || self.screen || self.alarm || self.clock || self.sol950_time || self.sol950_pos
+        self.aprs || self.screen || self.alarm || self.clock || self.rad950_time || self.rad950_pos
     }
 }
 
@@ -79,14 +79,14 @@ impl Needs {
 pub fn needs(app: &crate::App, alarm: bool) -> Needs {
     let set = app.settings();
     let c = app.aprs_cfg();
-    let sol950 = app.sol950_open();
+    let rad950 = app.rad950_open();
     Needs {
         aprs: app.aprs_on() && (c.mode() != 0 || c.after_voice) && !set.fixed_on,
         screen: matches!(app.screen(), crate::Screen::Gps(_)),
         alarm,
         clock: set.clock_gps,
-        sol950_time: sol950,
-        sol950_pos: sol950 && app.sol950_wants_gps_grid(),
+        rad950_time: rad950,
+        rad950_pos: rad950 && app.rad950_wants_gps_grid(),
     }
 }
 
@@ -147,7 +147,7 @@ pub fn auto_step(app: &mut crate::App, data: &dyn Data, alarm: bool, now: u32) {
 /// satellites page is open, the two that show satellites in view (from GSV and GSA).
 pub fn demand(app: &crate::App, data: &dyn Data, alarm: bool, now_ms: u32) -> GpsDemand {
     use crate::screens::gps::Page;
-    let watch = alarm || matches!(app.screen(), crate::Screen::Gps(_)) || app.sol950_open();
+    let watch = alarm || matches!(app.screen(), crate::Screen::Gps(_)) || app.rad950_open();
     let sky = matches!(app.screen(), crate::Screen::Gps(g) if matches!(g.page, Page::Position | Page::Satellites));
     let (mut track, mut beacon_at) = (false, None);
     if app.aprs_on() {
@@ -293,7 +293,7 @@ impl GpsData {
     }
 
     /// Explicit onboard GPS fix only (never returns the fixed position `0 6 9` or phone position).
-    /// Used by SOL950 for `GPS` grid source and UTC discipline.
+    /// Used by RAD950 for `GPS` grid source and UTC discipline.
     pub fn onboard_fix(&self) -> Option<GpsFix> {
         self.recent()
     }

@@ -1,10 +1,10 @@
-//! RAD950 Ad-Hoc Rendezvous (`docs/sol950-rendezvous-addendum.md`).
+//! RAD950 Ad-Hoc Rendezvous (`docs/rad950-rendezvous-addendum.md`).
 //!
 //! Hourly 5-minute UTC meetup windows across 10 m (:00), 12 m (:15), 15 m (:30), and 17 m (:45),
 //! with independent 50/50 call-or-listen draws on even 10-second slots (`:00`, `:20`, `:40`)
 //! and clear-subchannel selection.
 
-use crate::sol950::SOL950_DIALS;
+use crate::rad950::RAD950_DIALS;
 
 /// One scheduled hourly rendezvous band entry.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -12,7 +12,7 @@ pub struct RdvBand {
     pub label: &'static str,
     /// Starting UTC minute within the hour (`0, 15, 30, 45`).
     pub start_min: u8,
-    /// Index into `SOL950_DIALS` for this band's shared calling dial.
+    /// Index into `RAD950_DIALS` for this band's shared calling dial.
     pub dial_idx: u8,
 }
 
@@ -27,7 +27,7 @@ pub const RDV_BANDS: [RdvBand; 4] = [
 /// Window duration in minutes (`5` minutes = `30` ten-second turns).
 pub const RDV_WINDOW_MIN: u8 = 5;
 
-/// Eight 225 Hz audio subchannels inside the RAD950 passband (`600..2175 Hz`, matching `usol950::SUBCHANNELS_HZ`).
+/// Eight 225 Hz audio subchannels inside the RAD950 passband (`600..2175 Hz`, matching `urad950::SUBCHANNELS_HZ`).
 pub const RDV_SUBCH_HZ: [u16; 8] = [600, 825, 1050, 1275, 1500, 1725, 1950, 2175];
 
 /// Current or next scheduled rendezvous window relative to `utc_sec`.
@@ -124,7 +124,7 @@ impl RdvState {
                     band_idx: i as u8,
                     is_now: true,
                     countdown_s: end - sec_in_hour,
-                    dial_hz10: SOL950_DIALS[b.dial_idx as usize],
+                    dial_hz10: RAD950_DIALS[b.dial_idx as usize],
                 });
             }
         }
@@ -145,7 +145,7 @@ impl RdvState {
                     band_idx: i as u8,
                     is_now: false,
                     countdown_s: wait,
-                    dial_hz10: SOL950_DIALS[b.dial_idx as usize],
+                    dial_hz10: RAD950_DIALS[b.dial_idx as usize],
                 });
             }
         }

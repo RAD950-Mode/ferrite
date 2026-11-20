@@ -359,9 +359,9 @@ fn feed(slot: &mut Decoder, x: &[i16], level: u16, heard: &mut bool, since_cap: 
     }
     *heard = busy;
 }
-/// Bench diagnostic counters for `DspCmd::Sol950Finish`: `[finishes, last_syms, last_tracks, total_decoded]`.
+/// Bench diagnostic counters for `DspCmd::Rad950Finish`: `[finishes, last_syms, last_tracks, total_decoded]`.
 #[cfg(feature = "bench")]
-pub static SOL950_DIAG: [AtomicU32; 4] = [AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0)];
+pub static RAD950_DIAG: [AtomicU32; 4] = [AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0)];
 #[cfg(feature = "bench")]
 pub static WORK_MAX_US: AtomicU32 = AtomicU32::new(0);
 
@@ -459,23 +459,23 @@ pub async fn task() {
                 }
                 capturing = want;
             }
-            Either4::First(DspCmd::Sol950Finish { utc_slot, dial_hz, coop_capture }) => {
-                if matches!(running, DecoderKind::Sol950 | DecoderKind::Sol950_60) {
+            Either4::First(DspCmd::Rad950Finish { utc_slot, dial_hz, coop_capture }) => {
+                if matches!(running, DecoderKind::Rad950 | DecoderKind::Rad950_60) {
                     let captured = capturing;
                     if capturing {
                         audio::capture_stop();
                     }
-                    use ferrite_core::sol950::usol950::{Decoded, SoftCandidate, MAX_DECODED};
+                    use ferrite_core::rad950::urad950::{Decoded, SoftCandidate, MAX_DECODED};
                     #[cfg(feature = "bench")]
-                    let (d_syms, d_trk, _d_acq) = slot.sol950_diag();
+                    let (d_syms, d_trk, _d_acq) = slot.rad950_diag();
                     let mut out = [Decoded::EMPTY; MAX_DECODED];
                     let mut soft: Option<SoftCandidate> = None;
-                    let n = slot.sol950_finish_with_soft(&mut out, Some(&mut soft));
+                    let n = slot.rad950_finish_with_soft(&mut out, Some(&mut soft));
                     if let Some(sc) = soft {
-                        crate::chan::SOL950_SOFT.signal(sc);
+                        crate::chan::RAD950_SOFT.signal(sc);
                     }
                     if coop_capture && captured {
-                        crate::chan::SOL950_COOP.signal(ferrite_core::sol950::CoopRxReport {
+                        crate::chan::RAD950_COOP.signal(ferrite_core::rad950::CoopRxReport {
                             utc_slot,
                             dial_hz,
                             decoded: out,
@@ -485,13 +485,13 @@ pub async fn task() {
                     }
                     #[cfg(feature = "bench")]
                     {
-                        SOL950_DIAG[0].fetch_add(1, Relaxed);
-                        SOL950_DIAG[1].store(d_syms as u32, Relaxed);
-                        SOL950_DIAG[2].store(d_trk as u32, Relaxed);
-                        SOL950_DIAG[3].fetch_add(n as u32, Relaxed);
+                        RAD950_DIAG[0].fetch_add(1, Relaxed);
+                        RAD950_DIAG[1].store(d_syms as u32, Relaxed);
+                        RAD950_DIAG[2].store(d_trk as u32, Relaxed);
+                        RAD950_DIAG[3].fetch_add(n as u32, Relaxed);
                     }
                     for d in &out[..n] {
-                        if crate::chan::SOL950_RX.try_send(*d).is_err() {
+                        if crate::chan::RAD950_RX.try_send(*d).is_err() {
                             DROPPED.fetch_add(1, Relaxed);
                         }
                     }
@@ -505,12 +505,12 @@ pub async fn task() {
                     }
                 }
             }
-            Either4::First(DspCmd::Sol950Reset) => {
-                if matches!(running, DecoderKind::Sol950 | DecoderKind::Sol950_60) {
+            Either4::First(DspCmd::Rad950Reset) => {
+                if matches!(running, DecoderKind::Rad950 | DecoderKind::Rad950_60) {
                     if capturing {
                         audio::capture_stop();
                     }
-                    slot.sol950_reset();
+                    slot.rad950_reset();
                     if capturing {
                         clock::for_audio().await;
                         dec = decim(listen);
@@ -518,9 +518,9 @@ pub async fn task() {
                     }
                 }
             }
-            Either4::First(DspCmd::Sol950Subslot) => {
-                if running == DecoderKind::Sol950_60 {
-                    slot.sol950_start_subslot();
+            Either4::First(DspCmd::Rad950Subslot) => {
+                if running == DecoderKind::Rad950_60 {
+                    slot.rad950_start_subslot();
                 }
             }
             Either4::First(DspCmd::Beep { .. }) => {} // beeps are the BK4829's (SND-11)
@@ -612,8 +612,8 @@ pub async fn task() {
                     Stream::Raw(r) => r.chunk(&out[..n]),
                 }
                 feed(&mut slot, &out[..n], lvl.0.max(lvl.1), &mut heard, &mut since_cap);
-                if let Some(wf_col) = slot.sol950_take_wf() {
-                    crate::chan::SOL950_WF.signal(wf_col);
+                if let Some(wf_col) = slot.rad950_take_wf() {
+                    crate::chan::RAD950_WF.signal(wf_col);
                 }
                 #[cfg(feature = "bench")]
                 WORK_MAX_US.fetch_max(crate::hal::time::cycles().wrapping_sub(t0) / mhz, Relaxed);

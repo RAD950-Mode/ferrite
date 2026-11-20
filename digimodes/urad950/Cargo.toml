@@ -1,0 +1,15 @@
+[package]
+name = "urad950"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+repository.workspace = true
+description = "RAD950 10m weak-signal 4-FSK digital mode for microcontrollers: 64-bit CQ/RX codec, (184, 78) LDPC, 6+6+6 sync, reference TX modulator, and 13 KB streaming receiver"
+keywords = ["fsk", "ldpc", "weak-signal", "ham-radio", "no-std"]
+categories = ["embedded", "no-std"]
+
+[dependencies]
+udsp = { path = "../udsp", version = "0.1" }
+
+[lints]
+workspace = true

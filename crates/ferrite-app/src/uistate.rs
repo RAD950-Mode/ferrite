@@ -339,7 +339,7 @@ fn keyed_remote_mode(app: &App, live: &LiveAll, l: &mut Line) {
         Mode::Hf => b"hf",
         Mode::Xb => b"xb",
         Mode::Sat => b"sat",
-        Mode::Sol950 => b"sol950",
+        Mode::Rad950 => b"rad950",
     });
 }
 
@@ -768,10 +768,10 @@ fn body<S: ChannelStore>(app: &App, cx: &Cx<S>, d: &mut Desc) {
         }
         Screen::Hf(h) => hf_lines(app, cx, h, d),
         Screen::Sat(s) => sat_lines(app, &s, d),
-        Screen::Sol950(s) => {
-            use crate::sol950::Sol950Store;
-            use ferrite_core::sol950::usol950::{frame::decode_grid4, Callsign, GRID_UNKNOWN};
-            use ferrite_core::sol950::{ActivityRow, MAX_PEERS};
+        Screen::Rad950(s) => {
+            use crate::rad950::Rad950Store;
+            use ferrite_core::rad950::urad950::{frame::decode_grid4, Callsign, GRID_UNKNOWN};
+            use ferrite_core::rad950::{ActivityRow, MAX_PEERS};
             let mut rows = [ActivityRow {
                 peer: Callsign::from_raw(0).unwrap(),
                 suffix: 0,
@@ -782,19 +782,19 @@ fn body<S: ChannelStore>(app: &App, cx: &Cx<S>, d: &mut Desc) {
                 owed_reply: None,
                 logged: false,
             }; MAX_PEERS];
-            let n = app.sol950_host().map_or(0, |h| h.engine.activity_rows(&mut rows));
+            let n = app.rad950_host().map_or(0, |h| h.engine.activity_rows(&mut rows));
             if let Some(l) = d.ln() {
-                l.push(b"sol950 ");
-                l.push(screens::sol950::page_id(&s).as_bytes());
-                if let Some(h) = app.sol950_host() {
+                l.push(b"rad950 ");
+                l.push(screens::rad950::page_id(&s).as_bytes());
+                if let Some(h) = app.rad950_host() {
                     let slot_ms = (h.utc_sec % 10) * 1000 + h.utc_ms_in_sec as u32;
                     let coop_s = match h.profile.coop_rx {
-                        crate::sol950::CoopRxMode::Off => "off",
-                        crate::sol950::CoopRxMode::Capture => "capture",
+                        crate::rad950::CoopRxMode::Off => "off",
+                        crate::rad950::CoopRxMode::Capture => "capture",
                     };
                     let link_s = match h.profile.coop_link {
-                        crate::sol950::CoopLink::Usb => "usb",
-                        crate::sol950::CoopLink::Bluetooth => "bt",
+                        crate::rad950::CoopLink::Usb => "usb",
+                        crate::rad950::CoopLink::Bluetooth => "bt",
                     };
                     let _ = ufmt::uwrite!(
                         l,
@@ -813,8 +813,8 @@ fn body<S: ChannelStore>(app: &App, cx: &Cx<S>, d: &mut Desc) {
                     );
                 }
             }
-            if let Some((soft_slot, sc)) = app.sol950_host().and_then(|h| {
-                (h.profile.coop_rx == crate::sol950::CoopRxMode::Capture).then_some(h.last_soft).flatten()
+            if let Some((soft_slot, sc)) = app.rad950_host().and_then(|h| {
+                (h.profile.coop_rx == crate::rad950::CoopRxMode::Capture).then_some(h.last_soft).flatten()
             }) {
                 if let Some(sl) = d.ln() {
                     let _ = ufmt::uwrite!(
@@ -839,7 +839,7 @@ fn body<S: ChannelStore>(app: &App, cx: &Cx<S>, d: &mut Desc) {
                     let cs = core::str::from_utf8(&cb[..cn]).unwrap_or("?");
                     let gb = decode_grid4(r.grid4).unwrap_or(*b"----");
                     let gs = core::str::from_utf8(&gb).unwrap_or("----");
-                    let _ = ufmt::uwrite!(pl, "sol950_peer {} {} {}dB", cs, gs, r.snr_db);
+                    let _ = ufmt::uwrite!(pl, "rad950_peer {} {} {}dB", cs, gs, r.snr_db);
                 }
             }
         }
@@ -1490,7 +1490,7 @@ pub fn id(s: Screen) -> &'static str {
         Screen::AutoReply(_) => "AutoReply",
         Screen::Dtmf(_) => "Dtmf",
         Screen::Sat(s) => screens::sat::page_id(&s),
-        Screen::Sol950(s) => screens::sol950::page_id(&s),
+        Screen::Rad950(s) => screens::rad950::page_id(&s),
     }
 }
 

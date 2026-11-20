@@ -1865,25 +1865,25 @@ fn debug_txtest_suite() {
 
 #[cfg(feature = "bench")]
 #[test]
-fn debug_txtest_sol950() {
-    use ferrite_core::txtest::{Arm, Ask, Signal, SOL950_DEV_DEFAULT};
+fn debug_txtest_rad950() {
+    use ferrite_core::txtest::{Arm, Ask, Signal, RAD950_DEV_DEFAULT};
     let mut r = Rig::main();
-    r.cmd("txtest sol950");
-    assert_eq!(r.serve(4, regs), vec![DebugReq::TxTest(Ask::Set(Some(Arm::new(Signal::Sol950))))]);
-    assert!(r.raw().contains(&std::format!("txtest: sol950 (dev {SOL950_DEV_DEFAULT}) at 100 % armed")), "{}", r.raw());
-    assert!(r.raw().contains("sol950: BK4829 PLL REG_38/39 (50 Hz/tone; cal +500 Hz steps), REG_30 VCO toggle"), "{}", r.raw());
+    r.cmd("txtest rad950");
+    assert_eq!(r.serve(4, regs), vec![DebugReq::TxTest(Ask::Set(Some(Arm::new(Signal::Rad950))))]);
+    assert!(r.raw().contains(&std::format!("txtest: rad950 (dev {RAD950_DEV_DEFAULT}) at 100 % armed")), "{}", r.raw());
+    assert!(r.raw().contains("rad950: BK4829 PLL REG_38/39 (50 Hz/tone; cal +500 Hz steps), REG_30 VCO toggle"), "{}", r.raw());
     r.send(b"\r");
 
-    r.cmd("txtest sol950 220 50");
-    assert_eq!(r.serve(4, regs), vec![DebugReq::TxTest(Ask::Set(Some(Arm { baud: 220, level: 50, ..Arm::new(Signal::Sol950) })))]);
-    assert!(r.raw().contains("txtest: sol950 (dev 220) at 50 % armed"), "{}", r.raw());
+    r.cmd("txtest rad950 220 50");
+    assert_eq!(r.serve(4, regs), vec![DebugReq::TxTest(Ask::Set(Some(Arm { baud: 220, level: 50, ..Arm::new(Signal::Rad950) })))]);
+    assert!(r.raw().contains("txtest: rad950 (dev 220) at 50 % armed"), "{}", r.raw());
     r.send(b"\r");
 
-    r.cmd("txtest sol950-cal 150");
-    assert_eq!(r.serve(4, regs), vec![DebugReq::TxTest(Ask::Set(Some(Arm { baud: 150, ..Arm::new(Signal::Sol950Cal) })))]);
+    r.cmd("txtest rad950-cal 150");
+    assert_eq!(r.serve(4, regs), vec![DebugReq::TxTest(Ask::Set(Some(Arm { baud: 150, ..Arm::new(Signal::Rad950Cal) })))]);
     r.send(b"\r");
 
-    for bad in ["txtest sol950 0", "txtest sol950 4096", "txtest sol950 180 9", "txtest sol950-cal 180 100"] {
+    for bad in ["txtest rad950 0", "txtest rad950 4096", "txtest rad950 180 9", "txtest rad950-cal 180 100"] {
         r.cmd(bad);
         assert!(r.bottom().contains("txtest 4fsk|sweep|afsk"), "{bad}: {}", r.bottom());
         assert_eq!(r.term.debug_req(), None, "{bad}: nothing sent");

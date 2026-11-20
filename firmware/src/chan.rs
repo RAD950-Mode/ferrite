@@ -38,21 +38,21 @@ pub static EVENTS: PubSubChannel<M, Event, 16, 4, 6> = PubSubChannel::new();
 /// Two deep: a second header (SAME repeats each three times) waits while the first is shown.
 pub static ALERTS: Channel<M, SameDecoded, 2> = Channel::new();
 
-/// SOL950 decoded frames from the DSP task (`DspCmd::Sol950Finish`) to the UI task.
-pub static SOL950_RX: Channel<M, ferrite_core::sol950::usol950::Decoded, 8> = Channel::new();
-/// Latest 24-bin packed 4-bit SOL950 waterfall slice (`200 ms` cadence) from DSP to UI.
-pub static SOL950_WF: Signal<M, [u8; 12]> = Signal::new();
+/// RAD950 decoded frames from the DSP task (`DspCmd::Rad950Finish`) to the UI task.
+pub static RAD950_RX: Channel<M, ferrite_core::rad950::urad950::Decoded, 8> = Channel::new();
+/// Latest 24-bin packed 4-bit RAD950 waterfall slice (`200 ms` cadence) from DSP to UI.
+pub static RAD950_WF: Signal<M, [u8; 12]> = Signal::new();
 /// Latest failed-CRC 92-byte soft candidate exported at end of slot for Cooperative RX capture.
-pub static SOL950_SOFT: Signal<M, ferrite_core::sol950::usol950::SoftCandidate> = Signal::new();
-/// A complete SOL950 receive slot, kept together so an external Cooperative RX host never joins a candidate to
+pub static RAD950_SOFT: Signal<M, ferrite_core::rad950::urad950::SoftCandidate> = Signal::new();
+/// A complete RAD950 receive slot, kept together so an external Cooperative RX host never joins a candidate to
 /// decoded frames from another UTC slot.
-pub static SOL950_COOP: Signal<M, ferrite_core::sol950::CoopRxReport> = Signal::new();
-/// SOL950 frame staged by the UI task before sending `RadioCmd::Sol950Tx` (keeps `RadioCmd <= 8 B`).
+pub static RAD950_COOP: Signal<M, ferrite_core::rad950::CoopRxReport> = Signal::new();
+/// RAD950 frame staged by the UI task before sending `RadioCmd::Rad950Tx` (keeps `RadioCmd <= 8 B`).
 #[cfg(feature = "tx")]
-pub static SOL950_TX: Signal<M, ferrite_core::sol950::usol950::Frame> = Signal::new();
-/// SOL950 transmit completion from the Radio task to the UI task (`true` = all 110 symbols sent, `false` = aborted/refused).
+pub static RAD950_TX: Signal<M, ferrite_core::rad950::urad950::Frame> = Signal::new();
+/// RAD950 transmit completion from the Radio task to the UI task (`true` = all 110 symbols sent, `false` = aborted/refused).
 #[cfg(feature = "tx")]
-pub static SOL950_TX_DONE: Signal<M, bool> = Signal::new();
+pub static RAD950_TX_DONE: Signal<M, bool> = Signal::new();
 
 /// The Radio task's snapshot of all three slots (one copy, 308 B: the UI keeps its own).
 pub static LIVE: Watch<M, LiveAll, 2> = Watch::new();

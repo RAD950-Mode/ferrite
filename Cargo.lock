@@ -429,7 +429,7 @@ dependencies = [
  "udsc",
  "udsp",
  "upocsag",
- "usol950",
+ "urad950",
 ]
 
 [[package]]
@@ -1390,15 +1390,15 @@ name = "upocsag"
 version = "0.1.0"
 
 [[package]]
-name = "uradio-bus"
-version = "0.1.0"
-
-[[package]]
-name = "usol950"
+name = "urad950"
 version = "0.1.0"
 dependencies = [
  "udsp",
 ]
+
+[[package]]
+name = "uradio-bus"
+version = "0.1.0"
 
 [[package]]
 name = "valuable"
