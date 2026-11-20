@@ -655,7 +655,7 @@ impl SimCore {
             let sol_open = app.sol950_open();
             if let Some(h) = app.sol950_host_mut() {
                 let gps_grid = here.map(|(lat, lon, _)| ferrite_app::gpsdata::pos_to_grid4(lat, lon));
-                h.update_clock(sat_t, (now % 1000) as u16, 40, gps_grid);
+                h.update_clock(sat_t, (now % 1000) as u16, 40, ferrite_app::sol950::ClockSource::Gps, gps_grid);
                 let wf_tick = now / 200;
                 if sol_open && !h.tx_in_flight && wf_tick != self.sol950_wf_tick {
                     self.sol950_wf_tick = wf_tick;
