@@ -550,13 +550,9 @@ impl Engine {
                 *p = PeerSession::empty();
                 continue;
             }
-            // Drop unanswered session once `MAX_TRIES` is exhausted and peer's reply slot has passed.
-            if p.tries >= MAX_TRIES
-                && p.owed_reply.is_none()
-                && p.last_tx_slot.is_some_and(|t| slot >= t + 2)
-            {
-                *p = PeerSession::empty();
-            }
+            // Note: once `p.tries >= MAX_TRIES`, `pick_peer_to_answer` stops sending further retries,
+            // but we intentionally keep `p` (and `tx_r0_done_at`) alive until `EXPIRY_SLOTS` so a Runner
+            // working through a multi-station pileup can still deliver `R+RX(ACK=1)` without causing a 1-sided log.
         }
     }
 
