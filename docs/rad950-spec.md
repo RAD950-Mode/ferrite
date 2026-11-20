@@ -115,9 +115,9 @@ All transmissions are **Upper Sideband (USB)** (or equivalent direct-PLL 4-FSK c
    - **Caller (CQer):** `Slot N`: TX `CQ` → `Slot N+1`: RX `RX(ACK=0)` from responder → `Slot N+2`: TX `R+RX(ACK=1)` → **log QSO upon confirmed clean TX completion** (`confirm_tx_completed`).
    - **Responder:** `Slot N`: RX `CQ` → `Slot N+1`: TX `RX(ACK=0)` → `Slot N+2`: RX `R+RX(ACK=1)` → **log QSO only if `ACK=1` causally follows a completed `RX(ACK=0)` sent to that peer within `EXPIRY_SLOTS = 30` (5 min)**. Cold/unsolicited `ACK=1` frames are ignored.
    - **3-slot tradeoff:** Skipping a 4th `73` slot keeps clean QSOs to 30 s, and the 2-slot linger gives a faded `ACK=1` another chance if the responder retries `RX(ACK=0)`. However, because the caller logs after clean TX of `ACK=1`, a one-sided log is still possible if `ACK=1` never decodes at the responder before the linger expires.
-5. **Post-Completion Linger & Cooldown:**
+5. **Post-Completion Linger, Pileup Retention & Cooldown:**
    - After sending `ACK=1`, linger on the window for `LINGER_SLOTS = 2` slots (20 s) so a faded `ACK=1` can be retried (up to `MAX_COOL_RETRIES = 2` within `COOLDOWN_SLOTS = 30`, never writing a duplicate log entry).
-   - Unanswered attempts stop after `MAX_TRIES = 4`.
+   - Unanswered TX retries stop after `MAX_TRIES = 4`, **but the peer session (`tx_r0_done_at`) MUST remain alive until `EXPIRY_SLOTS = 30` (5 min)** so a Runner working through a multi-station pileup can still deliver a valid `R+RX(ACK=1)` after the caller stops retrying without causing a one-sided log.
 6. **Hardware relay guard (`SAFE-22`):** On handheld hardware where TX/RX switches an RF relay, at most `MAX_TX_PER_MIN = 3` TX slots per rolling `6`-slot (`60 s`) window are permitted.
 7. **Busy-subchannel avoidance:** Any subchannel decoded during an RX slot is marked occupied; `pick_subchannel()` chooses an unoccupied subchannel out of the 8 for the next TX.
 
@@ -149,8 +149,10 @@ Published 5-minute (`30`-slot) meetup windows every hour so low-power portable s
 2. **Independent 50/50 Call & Listen (`call_listen_armed`):**
    - Only **even slots** (`slot % 2 == 0`) are eligible for Rendezvous CQs; **odd slots** are always `Listen` (reserved for initial `RX(ACK=0)` replies; the caller's final `R+RX(ACK=1)` lands on the following even slot). Multiple hunters may still answer the same CQ in the same odd slot (typically separated across the 8 subchannels, or colliding if they pick the same subchannel).
    - Seed: `seed = (call.raw() ^ ((suffix as u32) << 24)).wrapping_mul(0x9E37_79B1) ^ 0x5A3C_9E37` (or `0x1357_9BDF` if 0).
-   - Turn draw: `r = mix32(seed ^ slot.wrapping_mul(0x9E37_79B1))`; transmit CQ iff `(r & 1) == 1`.
-   - Subchannel pick: `mix32(r ^ 0x85EB_CA6B) % clear_count` over unoccupied subchannels.
+   - Turn draw (`busy_cnt = occupied_subch_mask.count_ones()` from previous RX slot):
+     - `r = mix32(seed ^ slot.wrapping_mul(0x9E37_79B1))`
+     - Adaptive congestion backoff: transmit CQ iff `(r & mask_p) == 1`, where `mask_p = 1` (`50%`) for `busy_cnt < 4`, `mask_p = 3` (`25%`) for `4 <= busy_cnt <= 5`, and `mask_p = 7` (`12.5%`) for `busy_cnt >= 6`.
+   - Subchannel pick: `mix32(r ^ 0x85EB_CA6B) % clear_count` over unoccupied subchannels (`!occupied_subch_mask`).
    - `mix32(x)`: `x ^= x >> 16; x *= 0x7FEB_352D; x ^= x >> 15; x *= 0x846C_A68B; x ^ (x >> 16)`.
    - `call_listen_armed` automatically clears when the 5-minute window closes.
 3. **Answering Rendezvous CQs:** When a Rendezvous station in `Monitor` receives an incoming `RX(ACK=0)` addressed to `my_call`, it promotes out of `Monitor` to transmit `R+RX(ACK=1)`, logs the QSO, and returns to `Monitor` so it can answer subsequent callers or resume Rendezvous turns.
@@ -205,4 +207,14 @@ Verified against `usol950::tests::golden_spec_test_vectors`:
 - **`ldpc184` (46 hex nibbles, MSB-first):** `0xB0DDC1000F2C50B295D059FB32E01537E56358A0C06E80`
 - **`tones110` (`0..3`, 110 symbols):**
   `03013231001001021130320112103301303131110303001033201302313312123031210303113301223010100121202231100313310230`
+
+---
+
+## 8. `RAD950-60` 1-Minute Weak-Signal Cycle (v1-Compatible)
+
+Optional 60-second UTC minute cycle (`utc_sec / 60`, alternating even/odd minutes) using the **exact same v1 wire format**:
+- **Sub-slots `0..=4` (`:00, :10, :20, :30, :40`):** TX repeats the identical `8.80 s` v1 burst 5 times; RX stacks all 5 sub-slots into a folded passband spectrogram (`usol950::Receiver60`, `116 × 150` 5-bit cells = `10,875 B`, fitting inside Ferrite's shared `13 KB` `Decoder` union slot).
+- **Sub-slot `5` (`:50–:59`):** 10-second PA cooldown and decode turnaround guard (no TX; RX runs blind `S0+S1+S2` stacked-sync acquisition and `(184, 78)` LDPC decode).
+- **Compatibility & crossover:** Standard 10 s v1 receivers decode strong `RAD950-60` transmissions on the first 10 s burst; below `~−18.5 dB` (2,500 Hz ref) where 10 s v1 drops to 0 QSOs/hr, `RAD950-60` extends blind decode down to `−19..−20 dB` (`4–18` QSOs/hr).
+
 
