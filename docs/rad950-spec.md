@@ -1,6 +1,6 @@
 # RAD950 Protocol & Operating Specification (v1)
 
-Normative specification of the **RAD950** (`usol950` / `SOL950`) HF weak-signal protocol, Run / Hunter operating modes, Hourly UTC Rendezvous, and Spots API as implemented and over-the-air verified across two independent reference implementations:
+Normative specification of the **RAD950** (`usol950` / `SOL950`) HF weak-signal protocol, Run / Hunter operating modes, Hourly UTC Rendezvous, and Spots API as implemented and over-the-air verified across two radio paths (sharing the `usol950` codec crate):
 - **Embedded handheld firmware:** Ferrite on Radtel RT-950 Pro (`digimodes/usol950`, `crates/ferrite-core/src/sol950.rs`, `crates/ferrite-app/src/sol950.rs`, `crates/ferrite-app/src/rad950_rdv.rs`, `firmware/src/tasks/ui.rs`).
 - **Host SDR transceiver / skimmer:** `digimodes/usol950/examples/rad950_hackrf.rs` (HackRF One, 2.4 MS/s USB DDC).
 - **Web Spots API:** `rad950-web/src/spots.ts`.
@@ -31,10 +31,10 @@ All transmissions are **Upper Sideband (USB)** (or equivalent direct-PLL 4-FSK c
   - Duration: **`8.80 s`** (`110` symbols × `80 ms`), ending at `+9.20 s`.
   - RX search window: `start_sym ∈ [1, 9]` (`+80 ms` to `+720 ms`, i.e. **`±320 ms`** around nominal).
   - RX slot decode flush: **`+9.55 s`** (`finish_slot()`). After any TX slot, the DSP receiver MUST be reset at `0.00 s` of the following RX slot so muted TX audio cannot lock out RX acquisition.
-- **TX clock gate (`MAX_TX_UNCERT_MS = 150 ms`):**
-  - Scheduled TX is permitted only when `utc_sec != 0` and estimated timing uncertainty `<= 150 ms`.
-  - **Live GPS (`GPS PNT` / `GPS CLK`):** Disciplined to the NMEA `$` burst edge (`50 ms` base jitter).
-  - **Crystal holdover (`GPS HOLD`):** After any valid onboard GPS fix, the MCU's external `HEXT` quartz crystal holds UTC with a conservative `50 ppm` (`1 ms / 20 s`) drift budget, remaining valid (`<= 150 ms`) for **33.3 minutes** (`2,000 s`) if GPS signal drops or GPS sleeps.
+- **TX clock gate (`MAX_TX_UNCERT_MS = 150 ms`) & holdover budget:**
+  - Scheduled TX is permitted only when `utc_sec != 0` and the implementation's estimated timing uncertainty `uncert_ms <= 150 ms`.
+  - **Live GPS (`GPS PNT` / `GPS CLK`):** Disciplined to the NMEA `$` burst edge, budgeted at `50 ms` base timestamp uncertainty.
+  - **Crystal holdover (`GPS HOLD`):** After a valid onboard GPS fix, the RT-950 Pro firmware budgets `uncert_ms = 50 + elapsed_secs / 20` (`50 ms` starting error + `100 ms` drift allowance at `50 ppm` = `2,000 s` / `33.3 min` before crossing `150 ms`). Actual holdover accuracy depends on the initial NMEA timestamp error and oscillator drift staying within those bounds; other radios should parameterize the same `150 ms` TX gate for their own clock source.
   - **Bench fallback (`BENCH CLK`):** Compile-time `bench` builds only; release builds require GPS lock or active holdover (`NO GPS` otherwise).
 
 ### 2.2 Modulation & Passband Layout
@@ -50,15 +50,39 @@ All transmissions are **Upper Sideband (USB)** (or equivalent direct-PLL 4-FSK c
   - `S0` at symbols `0..6`: `[0, 3, 0, 1, 3, 2]`
   - `S1` at symbols `18..24`: `[3, 0, 3, 2, 0, 1]`
   - `S2` at symbols `104..110`: `[3, 1, 0, 2, 3, 0]`
-- **Interleaver:** Stride-`37` bit permutation across the `184` coded bits (`gcd(37, 184) = 1`), spreading adjacent codeword bits `~3 s` apart against fading.
+- **Interleaver:** Stride-`37` bit permutation across the `184` coded bits (`gcd(37, 184) = 1`), spreading adjacent codeword bits `~3 s` apart against fading:
+  - Direction: `inter[(37 * i) % 184] = codeword[i]` for `i in 0..184`.
+  - Data symbol `d in 0..92` maps to frame symbol `6 + d` (for `d < 12`) or `24 + (d - 12)` (for `d >= 12`), carrying dibit `(inter[2*d] << 1) | inter[2*d + 1]` through `GRAY_ENCODE`.
 
 ---
 
 ## 3. FEC & 64-Bit Wire Frame Format
 
 ### 3.1 CRC-14 & LDPC(184, 78)
-- **CRC-14:** Computed over the 64-bit payload (`CRC14_POLY = 0x2757`, FT8/FT4 family) → `K = 64 + 14 = 78` systematic message bits.
-- **LDPC:** Systematic `(184, 78)` PEG LDPC code (`M = 106` parity checks, girth 6, zero 4-cycles, bridged dual-diagonal parity with `MID_ROW = 53`; decoded with integer normalized min-sum BP, `scale = 3/4`, up to `35` iterations).
+- **CRC-14:** Computed MSB-first over the 64-bit payload:
+  - Polynomial: `0x2757` (`x^14 + x^13 + x^10 + x^8 + x^6 + x^4 + x^2 + x + 1`, FT8/FT4 family).
+  - Initial register: **`0x3FFF`** (prevents all-zero codewords from validating as frames).
+  - Final XOR: **`0x0000`** (none).
+  - Systematic message `msg[0..78]`: `msg[0..64]` = payload MSB-first, `msg[64..78]` = CRC-14 MSB-first.
+- **LDPC `(184, 78)`:** Systematic PEG LDPC code (`K = 78` message bits, `M = 106` parity checks, `N = 184` coded bits, girth 6, zero 4-cycles, bridged dual-diagonal parity):
+  - Parity column `78` (`p_0`) connects to check rows `0`, `53`, and `105` (degree 3); parity columns `78 + c` (`c = 1..105`) connect to check rows `c - 1` and `c` (degree 2).
+  - Linear-time systematic encoding: compute message syndrome `s[r] = XOR_{j: r in MSG_ROWS[j]} msg[j]` for `r in 0..106`; then `p_0 = XOR_{r=0..106} s[r]`, `p_1 = s[0] ^ p_0`, and `p_c = p_{c-1} ^ s[c-1] ^ (p_0 if c - 1 == 53 else 0)` for `c = 2..105`.
+  - Reference decoder: integer normalized min-sum BP (`scale = 3/4`, up to `35` iterations).
+  - **Normative `MSG_ROWS[0..78]`** (the 4 check rows per systematic message bit `0..77`):
+    ```text
+    0..12:  [17,44,79,97] [6,31,66,89]  [28,48,59,73] [11,38,56,84] [24,40,91,102] [4,14,22,50]
+            [61,69,81,92] [2,36,64,77]  [8,41,52,75]  [13,33,70,99] [27,87,96,105] [3,10,46,93]  [19,74,83,100]
+    13..25: [34,42,58,94] [16,29,39,68] [21,32,62,86] [23,54,65,72] [49,67,78,103] [7,12,63,104]
+            [47,55,90,98] [5,37,95,101] [15,35,82,88] [1,25,30,57]  [43,51,71,85]  [20,57,76,80] [0,9,18,60]
+    26..38: [26,45,49,70] [20,46,53,102][62,67,83,94] [0,33,39,101] [4,27,34,55]   [13,28,66,76]
+            [12,17,54,92] [30,37,47,51] [11,15,32,52] [7,24,35,48]  [64,68,71,90]  [2,6,60,85]   [40,65,79,86]
+    39..51: [10,23,29,99] [21,41,81,96] [3,58,91,97]  [16,25,42,61] [8,26,84,98]   [1,72,88,103]
+            [5,44,77,105] [19,22,38,59] [9,31,45,63]  [18,56,75,93] [43,74,80,104] [50,69,73,95] [14,78,87,100]
+    52..64: [36,53,89,97] [25,38,44,82] [12,30,73,86] [9,27,68,82]  [59,63,88,98]  [2,47,70,75]
+            [4,29,36,62]  [33,43,65,96] [14,26,58,72] [17,52,67,101][32,48,92,105] [7,18,42,50]  [16,37,66,104]
+    65..77: [21,60,78,90] [31,41,54,100][11,34,45,80] [10,69,79,83] [1,13,55,81]   [8,28,71,102]
+            [5,23,61,74]  [39,51,77,94] [24,76,84,87] [40,56,89,99] [15,49,57,64]  [3,19,95,103] [0,22,66,91]
+    ```
 
 ### 3.2 Field Encodings
 - **28-bit amateur callsign (`0 ..= 262,177,559`):** Standard 6-slot `[C0, C1, C2, C3, C4, C5]` with call-area digit at `C2`:
@@ -83,12 +107,14 @@ All transmissions are **Upper Sideband (USB)** (or equivalent direct-PLL 4-FSK c
 ### 4.1 Core QSO Invariants
 1. **Strict alternating TX/RX turns:** After any TX slot `s`, the station MUST listen during slot `s + 1` (`next_tx >= s + 2`).
 2. **Opposite-parity reply rule:** When answering a station last heard in slot `s_heard`, the reply MUST be transmitted on parity `(s_heard + 1) % 2` so replies never collide with an Auto-CQ caller's TX slots.
-3. **Self-base-call suppression:**
-   - CQs with the same base callsign and a *different* `-1..-15` suffix (`sender == my_call && suffix != my_suffix`) are decoded and shown in Heard.
+3. **CQ-only suffix scope & self-base-call suppression:**
+   - Numeric suffixes (`-1..-15` in `Frame::Cq.reserved & 0x0F`) identify individual rigs/antennas in `CQ` decodes and `POST /api/spots`. CQs sharing a base callsign with a *different* suffix (`sender == my_call && suffix != my_suffix`) are decoded and shown in Heard.
+   - `Frame::Rx` carries base 28-bit callsigns only (no suffix). Consequently, if two rigs sharing a base callsign (e.g., `NQ6N-1` and `NQ6N-7`) operate on the same dial, a hunter can distinguish their CQs, but a directed reply addresses `NQ6N` and **both rigs recognize it as addressed to them**.
    - Directed QSOs and auto-answers strictly require `sender != my_call` (a station never works its own base callsign).
-4. **3-slot QSO completion & causal `ACK=1`:**
+4. **3-slot QSO completion, causal `ACK=1`, and asymmetry tradeoff:**
    - **Caller (CQer):** `Slot N`: TX `CQ` → `Slot N+1`: RX `RX(ACK=0)` from responder → `Slot N+2`: TX `R+RX(ACK=1)` → **log QSO upon confirmed clean TX completion** (`confirm_tx_completed`).
    - **Responder:** `Slot N`: RX `CQ` → `Slot N+1`: TX `RX(ACK=0)` → `Slot N+2`: RX `R+RX(ACK=1)` → **log QSO only if `ACK=1` causally follows a completed `RX(ACK=0)` sent to that peer within `EXPIRY_SLOTS = 30` (5 min)**. Cold/unsolicited `ACK=1` frames are ignored.
+   - **3-slot tradeoff:** Skipping a 4th `73` slot keeps clean QSOs to 30 s, and the 2-slot linger gives a faded `ACK=1` another chance if the responder retries `RX(ACK=0)`. However, because the caller logs after clean TX of `ACK=1`, a one-sided log is still possible if `ACK=1` never decodes at the responder before the linger expires.
 5. **Post-Completion Linger & Cooldown:**
    - After sending `ACK=1`, linger on the window for `LINGER_SLOTS = 2` slots (20 s) so a faded `ACK=1` can be retried (up to `MAX_COOL_RETRIES = 2` within `COOLDOWN_SLOTS = 30`, never writing a duplicate log entry).
    - Unanswered attempts stop after `MAX_TRIES = 4`.
@@ -121,7 +147,7 @@ Published 5-minute (`30`-slot) meetup windows every hour so low-power portable s
 ### 5.1 Rendezvous Rules
 1. **Schedule following (`follow_schedule`):** Automatically retunes to the active enabled band when its 5-minute window opens. Retuning is **deferred while a directed QSO is in progress** (`has_active_qso == true`).
 2. **Independent 50/50 Call & Listen (`call_listen_armed`):**
-   - Only **even slots** (`slot % 2 == 0`) are eligible for Rendezvous CQs; **odd slots** are always `Listen` (reserved for directed replies).
+   - Only **even slots** (`slot % 2 == 0`) are eligible for Rendezvous CQs; **odd slots** are always `Listen` (reserved for initial `RX(ACK=0)` replies; the caller's final `R+RX(ACK=1)` lands on the following even slot). Multiple hunters may still answer the same CQ in the same odd slot (typically separated across the 8 subchannels, or colliding if they pick the same subchannel).
    - Seed: `seed = (call.raw() ^ ((suffix as u32) << 24)).wrapping_mul(0x9E37_79B1) ^ 0x5A3C_9E37` (or `0x1357_9BDF` if 0).
    - Turn draw: `r = mix32(seed ^ slot.wrapping_mul(0x9E37_79B1))`; transmit CQ iff `(r & 1) == 1`.
    - Subchannel pick: `mix32(r ^ 0x85EB_CA6B) % clear_count` over unoccupied subchannels.
