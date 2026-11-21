@@ -262,3 +262,29 @@ RT-950 Pro RF out ──► IN [directional coupler] THRU ──► rated 50 Ω 
 Once 10 m produces a repeatable baseline, repeat the envelope, harmonic survey, and close-in capture on **12 m, 15 m, and 17 m** wherever the firmware has a supported, calibrated TX path. Start at Low power on each band. Record a refusal or unavailable calibration directly in the test log. The current live 12 m result establishes handheld RX, while the conducted measurements will establish handheld TX behavior there. [Live OTA results](#live-over-the-air-two-way-verification-nq6n-rt-950-pro--nq6na-hackrf-one-2026-11-19)
 
 For each run, log **firmware revision, UTC, band, USB dial, subchannel, power setting, battery or supply voltage, coupler and pad IDs, loss calibration, analyzer settings, and trace filenames**. Save a CSV trace where available and a screenshot of the instrument settings. Use the same signal and settings when comparing firmware, bands, or power levels.
+
+## Handheld RAD950-60 compact decode replay
+
+Ferrite keeps the full 10,875-byte primary fold. During the same FFT pass it also accumulates the positive difference between percentile- and peak-quantized tone powers on the eight published channels. Four three-bit saturating corrections per channel and data-bearing symbol window use 1,236 bytes. The primary search admits half-bin 271, the closest hypothesis for 2175 Hz. All primary decodes take priority. The alternate pass uses the two strongest sync timings per nominal channel and can make up to 16 additional LDPC attempts per minute. CRC-valid additions share the existing eight-frame output limit. Off-grid callers still use the continuous primary search.
+
+In an initial paired run at 2175 Hz and −20 dB, extending the acquisition bound alone raised isolated recovery from 0/8 to 8/8 and recovery beside a +18 dB neighbor from 0/8 to 6/8. All subsequent baseline counts include that fix.
+
+At −21 dB nominal target SNR in 2500 Hz, the following counts come from 48 held-out seeds (12001–12048). The target starts at +400 ms and the neighbor starts at +440 ms, 225 Hz lower. Each trial passes the same five independent synthetic noise segments through the production Ferrite DSP. Counts refer to correct, distinct decoded payloads.
+
+| Target | Primary weak → combined weak | Primary neighbor → combined neighbor |
+| --- | ---: | ---: |
+| 1275 Hz | 31 → 36 | 24 → 24 |
+| 2175 Hz | 15 → 30 | 21 → 23 |
+
+On development seeds 1001–1064 with the same neighbor and five SNR points (−23 through −19 dB), four-bit dibit confidence storage plus per-channel sync recovered 141/320 upper-channel targets. The per-tone design recovered 188/320, versus 118/320 for the primary alone. Giving the alternate decoder the same nominal search and confidence clipping while suppressing all stored corrections recovered 170/320. Both the extra search and the retained tone information contributed. The dibit design recovered more strong neighbors, so the selected design favors weak-target reception. Across the final development, aligned-neighbor and held-out sweeps there were zero unexpected payloads in 2,880 signal-bearing trials and 656 noise-only minutes, including 512 additional noise-only seeds. The trials use fixed frequencies, payloads and simulated noise.
+
+Reproduce on the host with the release example. CSV columns ending in `_primary` identify frames recovered by the primary fold in the same run. The second argument sets the first noise seed and the third sets the neighbor's start time in milliseconds.
+
+```sh
+cargo run --release -p urad950 --example rx60_sweep -- 64 1001 440
+cargo run --release -p urad950 --example rx60_sweep -- 32 2001 400
+cargo run --release -p urad950 --example rx60_sweep -- 48 12001 440
+cargo run --release -p urad950 --example rx60_sweep -- 512 15001 400 noise-only
+```
+
+The Cortex-M4F release layout uses 13,164 bytes for `Receiver60`, leaving 132 bytes after Ferrite's 16-byte decoder allowance. This is a static size check. Real-time processing margin, stack high-water mark and sensitivity on a physical RT-950 Pro remain unmeasured.
