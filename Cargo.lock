@@ -1391,10 +1391,7 @@ version = "0.1.0"
 
 [[package]]
 name = "urad950"
-version = "0.1.0"
-dependencies = [
- "udsp",
-]
+version = "0.1.1"
 
 [[package]]
 name = "uradio-bus"

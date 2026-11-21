@@ -9,7 +9,7 @@ use udsc::Receiver as Dsc;
 use uafsk::Demodulator as Afsk;
 use upocsag::Receiver as Pocsag;
 use urad950::Receiver as Rad950;
-use urad950::Receiver60 as Rad950_60;
+use urad950::CompactReceiver60 as Rad950_60;
 
 /// Audio rate the DSP task feeds the decoders.
 pub const RATE_HZ: u32 = 24_000;
