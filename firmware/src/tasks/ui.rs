@@ -1502,6 +1502,7 @@ fn rad950_mount_flash(store: &crate::store::Store, app: &mut App) -> ferrite_sto
             };
             h.rdv.band_mask = cfg.rdv_band_mask;
             h.rdv.follow_schedule = cfg.rdv_follow;
+            h.profile.alert_tones = cfg.alert_tones;
             h.sync_engine_config();
         }
     }
@@ -1579,6 +1580,7 @@ async fn rad950_step(
                 card_amp: sc.amp,
                 rdv_band_mask: rdv_mask,
                 rdv_follow,
+                alert_tones: p.alert_tones,
             };
             let mut nor = store.rad950_nor();
             let _ = ferrite_store::rad950::save_cfg(&mut nor, &mut rec).await;

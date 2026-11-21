@@ -45,9 +45,24 @@ pub const PAGE_RENDEZVOUS: u8 = 15;
 
 const OPERATE_ROWS: usize = 4;
 const LOG_ROWS: usize = 6;
-const SETUP_ROWS: usize = 15;
+const SETUP_ROWS: usize = 16;
 const SETUP_VISIBLE: usize = 8;
 const TOP_Y: i32 = w::SBAR_H;
+/// Primary RAD950 band calling dials in ascending frequency order (`17m`, `15m`, `12m`, `10m`)
+/// for top-encoder band switching on Operate / Active screens.
+const BAND_DIAL_INDICES: [u8; 4] = [8, 6, 4, 0];
+
+fn dial_band_slot(dial: Freq10) -> i32 {
+    if dial < 2_000_000 {
+        0 // 17m
+    } else if dial < 2_300_000 {
+        1 // 15m
+    } else if dial < 2_650_000 {
+        2 // 12m
+    } else {
+        3 // 10m
+    }
+}
 
 /// RAD950 screen state (`8` bytes, fits inside `Screen` without growing it).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -326,6 +341,33 @@ impl View for Rad950Scr {
         if delta == 0 {
             return;
         }
+        // On Operate / Active, turning the top encoder switches between the 4 RAD-950 bands (17m / 15m / 12m / 10m).
+        if matches!(self.page, PAGE_OPERATE | PAGE_ACTIVE) {
+            let switched = if let Some(h) = app.rad950_host_mut() {
+                let cur = dial_band_slot(h.profile.dial());
+                let next = (cur + delta).rem_euclid(BAND_DIAL_INDICES.len() as i32) as usize;
+                let new_idx = BAND_DIAL_INDICES[next];
+                if h.profile.dial_idx != new_idx {
+                    h.profile.dial_idx = new_idx;
+                    h.profile_dirty = true;
+                    h.sync_engine_config();
+                    Some(h.profile.dial())
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            if let Some(dial) = switched {
+                app.rad950_retune();
+                let mut sub = Buf::<20>::new();
+                let _ = uwrite!(sub, "{} ", band_label(dial));
+                push_khz3(&mut sub, dial);
+                let _ = uwrite!(sub, " MHz");
+                app.show_toast(b"RAD950 band", sub.as_bytes(), false);
+            }
+            return;
+        }
         let k = if delta > 0 { Key::Down } else { Key::Up };
         for _ in 0..delta.unsigned_abs().min(8) {
             self.key(app, KeyEvent { key: k, press: Press::Short }, store);
@@ -367,6 +409,11 @@ impl View for Rad950Scr {
 
     fn tick(self, app: &mut App, _live: &LiveAll) {
         use ferrite_core::rad950::urad950::frame::encode_grid4;
+        // Play optional new-one heard (`1`) or new-one worked (`2`) chime.
+        let chime = app.rad950_host_mut().map_or(0, |h| core::mem::replace(&mut h.pending_chime, 0));
+        if chime != 0 {
+            app.out.push(RadioCmd::Chime { sound: chime, level: app.set.msg_level() });
+        }
         // Apply pending Chat auto-QSY (on Accept), auto-return (on End), or Rendezvous band hop.
         if app.rad950_host_mut().is_some_and(|h| h.chat.take_retune() || h.rdv.take_retune()) {
             app.rad950_retune();
@@ -648,7 +695,7 @@ impl Rad950Scr {
                     self.top = (self.sel as usize + 1 - SETUP_VISIBLE) as u8;
                 }
             }
-            Key::Menu if self.sel == 14 => {
+            Key::Menu if self.sel == 15 => {
                 app.screen = Screen::Rad950(Rad950Scr { page: PAGE_DISTRESS, sel: 0, top: 0, field: 0, sub: 0 });
                 return;
             }
@@ -663,6 +710,7 @@ impl Rad950Scr {
             }
             Key::Left | Key::Right | Key::Menu => {
                 let dir: i32 = if k == Key::Left { -1 } else { 1 };
+                let mut preview_chime = false;
                 if let Some(h) = app.rad950_host_mut() {
                     match self.sel {
                         2 => {
@@ -689,6 +737,10 @@ impl Rad950Scr {
                             };
                         }
                         8 => {
+                            h.profile.alert_tones = !h.profile.alert_tones;
+                            preview_chime = h.profile.alert_tones;
+                        }
+                        9 => {
                             h.profile.coop_rx = match h.profile.coop_rx {
                                 CoopRxMode::Off => CoopRxMode::Capture,
                                 CoopRxMode::Capture => CoopRxMode::Off,
@@ -698,30 +750,33 @@ impl Rad950Scr {
                                 h.pending_tx = None;
                             }
                         }
-                        9 => {
+                        10 => {
                             h.profile.coop_link = match h.profile.coop_link {
                                 CoopLink::Usb => CoopLink::Bluetooth,
                                 CoopLink::Bluetooth => CoopLink::Usb,
                             };
                         }
-                        10 => {
+                        11 => {
                             h.chat.station_card.rig = ((h.chat.station_card.rig as i32 + dir).rem_euclid(4)) as u16;
                         }
-                        11 => {
+                        12 => {
                             h.chat.station_card.ant = ((h.chat.station_card.ant as i32 + dir).rem_euclid(6)) as u8;
                         }
-                        12 => {
+                        13 => {
                             let cur = if h.chat.station_card.height_m == 127 { 0 } else { h.chat.station_card.height_m as i32 };
                             let next = (cur + dir * 2).clamp(0, 40);
                             h.chat.station_card.height_m = if next == 0 { 127 } else { next as u8 };
                         }
-                        13 => {
+                        14 => {
                             h.chat.station_card.amp = !h.chat.station_card.amp;
                         }
                         _ => {}
                     }
                     h.profile_dirty = true;
                     h.sync_engine_config();
+                }
+                if preview_chime {
+                    app.out.push(RadioCmd::Chime { sound: 1, level: app.set.msg_level() });
                 }
                 if retune {
                     app.rad950_retune();
@@ -1184,6 +1239,10 @@ impl Rad950Scr {
                     b"TX power"
                 }
                 8 => {
+                    let _ = uwrite!(val, "{}", if prof.alert_tones { "On" } else { "Off" });
+                    b"Alert tones"
+                }
+                9 => {
                     let c = match prof.coop_rx {
                         CoopRxMode::Off => "Off",
                         CoopRxMode::Capture => "Capture",
@@ -1191,7 +1250,7 @@ impl Rad950Scr {
                     let _ = uwrite!(val, "{}", c);
                     b"Coop RX"
                 }
-                9 => {
+                10 => {
                     let l = match prof.coop_link {
                         CoopLink::Usb => "USB",
                         CoopLink::Bluetooth => "Bluetooth",
@@ -1199,17 +1258,17 @@ impl Rad950Scr {
                     let _ = uwrite!(val, "{}", l);
                     b"Coop link"
                 }
-                10 => {
+                11 => {
                     use ferrite_core::rad950::urad950::chat::rig_name;
                     let _ = uwrite!(val, "{}", rig_name(sc.rig));
                     b"Card rig"
                 }
-                11 => {
+                12 => {
                     use ferrite_core::rad950::urad950::chat::ant_name;
                     let _ = uwrite!(val, "{}", ant_name(sc.ant));
                     b"Card ant"
                 }
-                12 => {
+                13 => {
                     if sc.height_m == 127 {
                         let _ = uwrite!(val, "Unset");
                     } else {
@@ -1217,7 +1276,7 @@ impl Rad950Scr {
                     }
                     b"Ant height"
                 }
-                13 => {
+                14 => {
                     let _ = uwrite!(val, "{}", if sc.amp { "Ext amp" } else { "Barefoot" });
                     b"Card amp"
                 }

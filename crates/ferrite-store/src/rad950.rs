@@ -470,6 +470,8 @@ pub struct Rad950CfgRecord {
     pub rdv_band_mask: u8,
     /// Ad-hoc Rendezvous `Follow schedule` toggle.
     pub rdv_follow: bool,
+    /// Play optional alert chimes when a new station/grid is heard or worked.
+    pub alert_tones: bool,
 }
 
 impl Rad950CfgRecord {
@@ -493,7 +495,9 @@ impl Rad950CfgRecord {
         b[28..30].copy_from_slice(&self.card_rig.to_le_bytes());
         b[30] = self.card_ant;
         b[31] = self.card_height_m;
-        b[32] = (self.card_amp as u8) | ((self.rdv_follow as u8) << 1);
+        b[32] = (self.card_amp as u8)
+            | ((self.rdv_follow as u8) << 1)
+            | (((!self.alert_tones) as u8) << 2);
         b[33] = self.rdv_band_mask & 0x0F;
         let mut c = Crc32::new();
         c.update(&b[..36]);
@@ -529,7 +533,7 @@ impl Rad950CfgRecord {
         base_call.copy_from_slice(&b[8..14]);
         prefix.copy_from_slice(&b[16..20]);
         manual_grid.copy_from_slice(&b[22..26]);
-        let (card_rig, card_ant, card_height_m, card_amp, rdv_band_mask, rdv_follow) = if ver >= CFG_VERSION {
+        let (card_rig, card_ant, card_height_m, card_amp, rdv_band_mask, rdv_follow, alert_tones) = if ver >= CFG_VERSION {
             (
                 u16::from_le_bytes([b[28], b[29]]) & 0x3FF,
                 b[30] & 0x1F,
@@ -537,9 +541,10 @@ impl Rad950CfgRecord {
                 (b[32] & 1) != 0,
                 b[33] & 0x0F,
                 (b[32] & 2) != 0,
+                (b[32] & 4) == 0,
             )
         } else {
-            (1, 1, 8, false, 0b1111, false)
+            (1, 1, 8, false, 0b1111, false, true)
         };
         Some(Self {
             gen: u32::from_le_bytes([b[4], b[5], b[6], b[7]]),
@@ -561,6 +566,7 @@ impl Rad950CfgRecord {
             card_amp,
             rdv_band_mask,
             rdv_follow,
+            alert_tones,
         })
     }
 }
@@ -755,6 +761,7 @@ mod tests {
             card_amp: true,
             rdv_band_mask: 0b1001,
             rdv_follow: true,
+            alert_tones: false,
         };
         block(save_cfg(&mut flash, &mut cfg)).unwrap();
         assert_eq!(cfg.gen, 1);

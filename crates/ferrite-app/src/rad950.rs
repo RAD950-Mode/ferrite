@@ -590,6 +590,8 @@ pub struct Rad950Profile {
     pub coop_link: CoopLink,
     /// `RAD950-60` 1-minute weak-signal cycle (`5 × 10 s` v1 bursts in `:00..:49`, `:50..:59` cooldown/decode).
     pub mode60: bool,
+    /// Play optional chimes when a new station/grid is heard (`Ding`) or worked (`Mail` rising fifth).
+    pub alert_tones: bool,
 }
 
 impl Default for Rad950Profile {
@@ -614,6 +616,7 @@ impl Rad950Profile {
             coop_rx: CoopRxMode::Off,
             coop_link: CoopLink::Usb,
             mode60: false,
+            alert_tones: true,
         }
     }
 
@@ -857,6 +860,8 @@ pub struct Rad950Host {
     pub chat: crate::rad950_chat::ChatState,
     /// Ad-hoc hourly UTC rendezvous state (`docs/rad950-rendezvous-addendum.md`).
     pub rdv: crate::rad950_rdv::RdvState,
+    /// Pending optional alert chime index into `tonegen::CHIMES` (`0` = none, `1` = new heard, `2` = new worked).
+    pub pending_chime: u8,
 }
 
 impl Default for Rad950Host {
@@ -922,6 +927,7 @@ impl Rad950Host {
             last_coop: None,
             chat: crate::rad950_chat::ChatState::new(),
             rdv: crate::rad950_rdv::RdvState::new(),
+            pending_chime: 0,
         }
     }
 
@@ -1176,6 +1182,10 @@ impl Rad950Host {
         // Classify award BEFORE saving so we know whether this QSO earned a New Grid / New Band Grid.
         let pre = self.store.classify_peer(&cb[..cn], peer_grid, rec.window, false);
         self.last_qso_award = pre.award;
+        if self.profile.alert_tones && (!pre.worked || pre.award != GridAward::None) {
+            // Celebratory rising-fifth chime (`CHIMES[2]`) when a new station or grid is worked.
+            self.pending_chime = 2;
+        }
         let contact = SavedContact {
             utc_sec: self.utc_sec,
             dial_hz10: rec.window,
@@ -1252,23 +1262,27 @@ impl Rad950Host {
                 }
             }
         }
-        // Attended Auto-Answer (Hunter / Pounce): when armed and idle, auto-answer needed CQs.
-        if self.auto_answer != AutoAnswer::Off
-            && self.profile.coop_rx != CoopRxMode::Capture
-            && matches!(self.engine.mode(), OpMode::Monitor)
-            && self.target_peer.is_none()
-        {
-            if let Frame::Cq { sender, grid4, .. } = d.frame {
-                let my_call = self.engine.config().my_call;
-                if sender != my_call {
-                    let mut cb = [0u8; 6];
-                    let cn = sender.decode(&mut cb);
-                    let peer_grid = ferrite_core::rad950::urad950::frame::decode_grid4(grid4).unwrap_or(*b"----");
-                    let st = self.store.classify_peer(&cb[..cn], peer_grid, w, false);
-                    if self.auto_answer.matches(st) && self.engine.answer_peer(sender, slot) {
-                        self.saved_ack = false;
-                        self.target_peer = Some(sender);
-                    }
+        // Optional alert tone when a new station/grid CQ is heard (`CHIMES[1]`, lower priority than worked chime).
+        if let Frame::Cq { sender, grid4, .. } = d.frame {
+            let my_call = self.engine.config().my_call;
+            if sender != my_call {
+                let mut cb = [0u8; 6];
+                let cn = sender.decode(&mut cb);
+                let peer_grid = ferrite_core::rad950::urad950::frame::decode_grid4(grid4).unwrap_or(*b"----");
+                let st = self.store.classify_peer(&cb[..cn], peer_grid, w, false);
+                if self.profile.alert_tones && self.pending_chime == 0 && (!st.worked || st.award != GridAward::None) {
+                    self.pending_chime = 1;
+                }
+                // Attended Auto-Answer (Hunter / Pounce): when armed and idle, auto-answer needed CQs.
+                if self.auto_answer != AutoAnswer::Off
+                    && self.profile.coop_rx != CoopRxMode::Capture
+                    && matches!(self.engine.mode(), OpMode::Monitor)
+                    && self.target_peer.is_none()
+                    && self.auto_answer.matches(st)
+                    && self.engine.answer_peer(sender, slot)
+                {
+                    self.saved_ack = false;
+                    self.target_peer = Some(sender);
                 }
             }
         }
