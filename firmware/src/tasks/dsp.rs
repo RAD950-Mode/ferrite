@@ -447,6 +447,9 @@ fn feed(slot: &mut Decoder, x: &[i16], level: u16, heard: &mut bool, since_cap: 
             }
         }
         Found::Call(_) => {} // DSC: roadmap 6c
+        Found::Wwv(st) => {
+            crate::chan::WWV_STATUS.signal(st);
+        }
     });
     let at = since_cap.map(|s| s * 1_000 / ferrite_core::decoders::RATE_HZ);
     if let Some(s) = since_cap {
@@ -462,8 +465,7 @@ fn feed(slot: &mut Decoder, x: &[i16], level: u16, heard: &mut bool, since_cap: 
     }
     *heard = busy;
 }
-/// Bench diagnostic counters for `DspCmd::Rad950Finish`: `[finishes, last_syms, last_tracks, total_decoded]`.
-#[cfg(feature = "bench")]
+/// Diagnostic counters for `DspCmd::Rad950Finish`: `[finishes, last_syms, last_tracks, total_decoded]`.
 pub static RAD950_DIAG: [AtomicU32; 4] = [AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0)];
 /// Step 1 RAD950-60 timing, overrun, and LDPC instrumentation (bench builds only).
 #[cfg(feature = "bench")]
@@ -555,7 +557,7 @@ pub async fn task() {
                     (DecoderKind::Off, true) => DecoderKind::Pocsag,
                     (k, _) => k,
                 };
-                if kind != running {
+                if kind != running || kind == DecoderKind::Wwv {
                     running = kind;
                     slot.switch(kind);
                 }
@@ -595,7 +597,6 @@ pub async fn task() {
                         audio::capture_stop();
                     }
                     use ferrite_core::rad950::urad950::{Decoded, SoftCandidate, MAX_DECODED};
-                    #[cfg(feature = "bench")]
                     let (d_syms, d_trk, _d_acq) = slot.rad950_diag();
                     let mut out = [Decoded::EMPTY; MAX_DECODED];
                     let mut soft: Option<SoftCandidate> = None;
@@ -612,6 +613,10 @@ pub async fn task() {
                             soft,
                         });
                     }
+                    RAD950_DIAG[0].fetch_add(1, Relaxed);
+                    RAD950_DIAG[1].store(d_syms as u32, Relaxed);
+                    RAD950_DIAG[2].store(d_trk as u32, Relaxed);
+                    RAD950_DIAG[3].fetch_add(n as u32, Relaxed);
                     #[cfg(feature = "bench")]
                     {
                         let fin_us = fin_t0.elapsed().as_micros().min(u32::MAX as u64) as u32;
@@ -626,10 +631,6 @@ pub async fn task() {
                             RAD950_STATS[4].store(st.compact_iters as u32, Relaxed);
                             RAD950_STATS[5].store(st.compact_decoded as u32, Relaxed);
                         }
-                        RAD950_DIAG[0].fetch_add(1, Relaxed);
-                        RAD950_DIAG[1].store(d_syms as u32, Relaxed);
-                        RAD950_DIAG[2].store(d_trk as u32, Relaxed);
-                        RAD950_DIAG[3].fetch_add(n as u32, Relaxed);
                     }
                     #[cfg(not(feature = "bench"))]
                     let _ = fin_stats;

@@ -472,6 +472,10 @@ pub struct Rad950CfgRecord {
     pub rdv_follow: bool,
     /// Play optional alert chimes when a new station/grid is heard or worked.
     pub alert_tones: bool,
+    /// Calibrated HEXT crystal offset in tenths of ppm (positive = crystal runs fast).
+    pub hext_ppm_x10: i16,
+    /// True once `hext_ppm_x10` has been measured against GPS.
+    pub hext_cal_valid: bool,
 }
 
 impl Rad950CfgRecord {
@@ -497,8 +501,10 @@ impl Rad950CfgRecord {
         b[31] = self.card_height_m;
         b[32] = (self.card_amp as u8)
             | ((self.rdv_follow as u8) << 1)
-            | (((!self.alert_tones) as u8) << 2);
+            | (((!self.alert_tones) as u8) << 2)
+            | ((self.hext_cal_valid as u8) << 3);
         b[33] = self.rdv_band_mask & 0x0F;
+        b[34..36].copy_from_slice(&self.hext_ppm_x10.clamp(-2000, 2000).to_le_bytes());
         let mut c = Crc32::new();
         c.update(&b[..36]);
         b[36..40].copy_from_slice(&c.get().to_le_bytes());
@@ -533,7 +539,7 @@ impl Rad950CfgRecord {
         base_call.copy_from_slice(&b[8..14]);
         prefix.copy_from_slice(&b[16..20]);
         manual_grid.copy_from_slice(&b[22..26]);
-        let (card_rig, card_ant, card_height_m, card_amp, rdv_band_mask, rdv_follow, alert_tones) = if ver >= CFG_VERSION {
+        let (card_rig, card_ant, card_height_m, card_amp, rdv_band_mask, rdv_follow, alert_tones, hext_cal_valid, hext_ppm_x10) = if ver >= CFG_VERSION {
             (
                 u16::from_le_bytes([b[28], b[29]]) & 0x3FF,
                 b[30] & 0x1F,
@@ -542,9 +548,11 @@ impl Rad950CfgRecord {
                 b[33] & 0x0F,
                 (b[32] & 2) != 0,
                 (b[32] & 4) == 0,
+                (b[32] & 8) != 0,
+                i16::from_le_bytes([b[34], b[35]]).clamp(-2000, 2000),
             )
         } else {
-            (1, 1, 8, false, 0b1111, false, true)
+            (1, 1, 8, false, 0b1111, false, true, false, 0)
         };
         Some(Self {
             gen: u32::from_le_bytes([b[4], b[5], b[6], b[7]]),
@@ -567,6 +575,8 @@ impl Rad950CfgRecord {
             rdv_band_mask,
             rdv_follow,
             alert_tones,
+            hext_ppm_x10,
+            hext_cal_valid,
         })
     }
 }
@@ -762,6 +772,8 @@ mod tests {
             rdv_band_mask: 0b1001,
             rdv_follow: true,
             alert_tones: false,
+            hext_ppm_x10: -145,
+            hext_cal_valid: true,
         };
         block(save_cfg(&mut flash, &mut cfg)).unwrap();
         assert_eq!(cfg.gen, 1);

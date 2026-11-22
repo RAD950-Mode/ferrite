@@ -593,6 +593,10 @@ pub struct Rad950Profile {
     pub mode60: bool,
     /// Play optional chimes when a new station/grid is heard (`Ding`) or worked (`Mail` rising fifth).
     pub alert_tones: bool,
+    /// Calibrated HEXT crystal offset in tenths of ppm (positive = crystal runs fast).
+    pub hext_ppm_x10: i16,
+    /// True once `hext_ppm_x10` has been measured against GPS.
+    pub hext_cal_valid: bool,
 }
 
 impl Default for Rad950Profile {
@@ -618,6 +622,8 @@ impl Rad950Profile {
             coop_link: CoopLink::Usb,
             mode60: false,
             alert_tones: true,
+            hext_ppm_x10: 0,
+            hext_cal_valid: false,
         }
     }
 
@@ -777,10 +783,228 @@ pub enum ClockSource {
     None,
     /// `bench`-feature indoor monotonic fallback (not GPS-disciplined, no PNT).
     Bench,
+    /// Slot phase locked over-the-air from decoded RAD950 signals on the band.
+    Ota,
+    /// Disciplined by WWV / WWVH / CHU shortwave time signal (coasting on HEXT).
+    Wwv,
     /// Disciplined by a prior onboard GPS fix, currently coasting on the `HEXT` crystal within `MAX_TX_UNCERT_MS`.
     GpsHoldover,
     /// Live onboard GPS-disciplined UTC clock.
     Gps,
+}
+
+/// Crystal frequency calibration tracker for `HEXT` (2 kHz tick driver = 0.5 ms/tick).
+///
+/// Measures crystal ppm offset against sustained GPS UTC fixes (≥60 s) so holdover
+/// compensates for crystal error and extends TX-grade holdover from ~33 min (50 ppm)
+/// to ~2.8 hours (10 ppm residual drift budget).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct CrystalClockCal {
+    /// Calibrated offset in tenths of ppm (`+100` = crystal runs +10.0 ppm fast).
+    pub ppm_x10: i16,
+    /// True once at least one valid ≥60 s GPS calibration window has completed.
+    pub valid: bool,
+    ref_unix: u32,
+    ref_tick: u32,
+}
+
+impl CrystalClockCal {
+    pub const TICKS_PER_SEC: i64 = 2_000;
+    pub const CAL_MIN_SECS: u32 = 60;
+    pub const MAX_PPM_X10: i16 = 2_000; // ±200.0 ppm
+
+    pub const fn new() -> Self {
+        Self {
+            ppm_x10: 0,
+            valid: false,
+            ref_unix: 0,
+            ref_tick: 0,
+        }
+    }
+
+    pub const fn from_saved(ppm_x10: i16, valid: bool) -> Self {
+        Self {
+            ppm_x10: if ppm_x10 > Self::MAX_PPM_X10 {
+                Self::MAX_PPM_X10
+            } else if ppm_x10 < -Self::MAX_PPM_X10 {
+                -Self::MAX_PPM_X10
+            } else {
+                ppm_x10
+            },
+            valid,
+            ref_unix: 0,
+            ref_tick: 0,
+        }
+    }
+
+    /// Feed a fresh GPS UTC burst `(unix_sec, burst_tick)`.
+    /// Returns `true` when calibration updated meaningfully (caller may persist to flash).
+    pub fn observe_gps(&mut self, unix: u32, burst_tick: u32) -> bool {
+        if unix == 0 || burst_tick == 0 {
+            return false;
+        }
+        if self.ref_unix == 0 || unix < self.ref_unix || unix.saturating_sub(self.ref_unix) > 3_600 {
+            self.ref_unix = unix;
+            self.ref_tick = burst_tick;
+            return false;
+        }
+        let dt_s = unix - self.ref_unix;
+        if dt_s < Self::CAL_MIN_SECS {
+            return false;
+        }
+        let dt_ticks = burst_tick.wrapping_sub(self.ref_tick);
+        if dt_ticks >= u32::MAX / 2 {
+            self.ref_unix = unix;
+            self.ref_tick = burst_tick;
+            return false;
+        }
+        let expected = (dt_s as i64) * Self::TICKS_PER_SEC;
+        let err = (dt_ticks as i64) - expected;
+        let raw_ppm_x10 = (err * 10_000_000) / expected;
+        self.ref_unix = unix;
+        self.ref_tick = burst_tick;
+        if raw_ppm_x10.abs() > Self::MAX_PPM_X10 as i64 {
+            return false;
+        }
+        let measured = raw_ppm_x10 as i16;
+        let was_valid = self.valid;
+        let prev = self.ppm_x10;
+        self.ppm_x10 = if was_valid {
+            ((prev as i32 * 3 + measured as i32) / 4) as i16
+        } else {
+            measured
+        };
+        self.valid = true;
+        !was_valid || (self.ppm_x10 - prev).abs() >= 5
+    }
+
+    /// Convert raw 2 kHz tick delta since anchor into `(compensated_elapsed_ms, uncertainty_ms)`.
+    pub fn holdover_elapsed_ms(&self, diff_ticks: u32) -> (u32, u16) {
+        let raw_ms = (diff_ticks / 2) as i64;
+        let corr_ms = if self.valid {
+            raw_ms - (raw_ms * self.ppm_x10 as i64) / 10_000_000
+        } else {
+            raw_ms
+        };
+        let elapsed_ms = corr_ms.max(0) as u32;
+        let secs = elapsed_ms / 1000;
+        // 50 ms base NMEA burst jitter + 10 ppm residual drift when calibrated (~2.8 h) vs 50 ppm uncalibrated (~33 min)
+        let drift_ms = if self.valid { secs / 100 } else { secs / 20 };
+        let unc = 50u16.saturating_add(drift_ms.min(u16::MAX as u32) as u16);
+        (elapsed_ms, unc)
+    }
+}
+
+/// Over-the-Air (OTA) 10 s slot-edge synchronizer driven by decoded RAD950 signals.
+///
+/// When no GPS/WWV clock is available, runs a free-running `10.60 s` RX search cycle
+/// (a full `9.55 s` capture window + `1.05 s` finish/step gap) so every search slot
+/// captures all `110` symbols (`8.80 s`) without truncation while sweeping `+600 ms`
+/// per slot across the full `10.0 s` UTC cycle. Once any valid LDPC+CRC frame decodes,
+/// snaps the local 10 s slot edge to `time_offset_ms` and tracks it via `ClockSource::Ota`.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct OtaSlotSync {
+    pub locked: bool,
+    anchor_tick: u32,
+    anchor_sec: u32,
+    search_origin_tick: u32,
+}
+
+impl OtaSlotSync {
+    /// Synthetic non-zero epoch base (multiple of 10, clearly below Unix timestamps `> 1e9`).
+    pub const SYNTH_EPOCH: u32 = 10_000;
+    /// Search slot period (`10.60 s` = full `9.55 s` RX capture + `+600 ms` phase step per slot).
+    pub const SEARCH_PERIOD_MS: u32 = 10_600;
+    /// Ticks per `10.60 s` search slot at 2 kHz.
+    const SEARCH_PERIOD_TICKS: u32 = Self::SEARCH_PERIOD_MS * 2;
+    /// Ticks per `10.00 s` locked slot at 2 kHz.
+    const SLOT_TICKS: u32 = 20_000;
+
+    pub const fn new() -> Self {
+        Self {
+            locked: false,
+            anchor_tick: 0,
+            anchor_sec: Self::SYNTH_EPOCH,
+            search_origin_tick: 0,
+        }
+    }
+
+    /// Record a valid decoded frame's `time_offset_ms` (`[-320, +360]`) at `now_tick` (2 kHz).
+    /// Returns `true` on initial lock transition.
+    pub fn on_decode(&mut self, time_offset_ms: i16, now_tick: u32, cal: &CrystalClockCal) -> bool {
+        if time_offset_ms.abs() > 400 {
+            return false;
+        }
+        if !self.locked {
+            if self.search_origin_tick == 0 {
+                self.search_origin_tick = now_tick;
+            }
+            let diff = now_tick.wrapping_sub(self.search_origin_tick);
+            let (elapsed_ms, _) = cal.holdover_elapsed_ms(diff);
+            let cur_slot = elapsed_ms / Self::SEARCH_PERIOD_MS;
+            // Exact start tick of the `10.60 s` search slot that just decoded
+            let slot_start_tick = self
+                .search_origin_tick
+                .wrapping_add(cur_slot.wrapping_mul(Self::SEARCH_PERIOD_TICKS));
+            // Positive time_offset_ms means the burst arrived late -> our slot started early -> retard anchor
+            let corr_ticks = (time_offset_ms as i32) * 2;
+            self.anchor_tick = slot_start_tick.wrapping_add(corr_ticks as u32);
+            self.anchor_sec = Self::SYNTH_EPOCH.wrapping_add(cur_slot.wrapping_mul(10));
+            self.locked = true;
+            return true;
+        }
+
+        // Already locked: re-anchor to the current slot and gently slew by 50% of time_offset_ms.
+        let diff = now_tick.wrapping_sub(self.anchor_tick);
+        let (elapsed_ms, _) = cal.holdover_elapsed_ms(diff);
+        let cur_slot = elapsed_ms / 10_000;
+        let slot_start_tick = self
+            .anchor_tick
+            .wrapping_add(cur_slot.wrapping_mul(Self::SLOT_TICKS));
+        let slew_ticks = (time_offset_ms as i32) / 2 * 2;
+        self.anchor_tick = slot_start_tick.wrapping_add(slew_ticks as u32);
+        self.anchor_sec = self.anchor_sec.wrapping_add(cur_slot.wrapping_mul(10));
+        false
+    }
+
+    /// Compute `(utc_sec, ms_in_sec, uncert_ms, clock_src)` for the current 2 kHz `now_tick`.
+    /// When unlocked, returns a free-running `10.60 s` search clock with `uncert_ms = u16::MAX`
+    /// so every RX slot gets a full `9.55 s` capture window while TX remains safely blocked.
+    pub fn clock(&mut self, now_tick: u32, cal: &CrystalClockCal) -> (u32, u16, u16, ClockSource) {
+        if self.locked {
+            let diff = now_tick.wrapping_sub(self.anchor_tick);
+            if diff < u32::MAX / 2 {
+                let (elapsed_ms, unc) = cal.holdover_elapsed_ms(diff);
+                if unc <= MAX_TX_UNCERT_MS {
+                    return (
+                        self.anchor_sec.wrapping_add(elapsed_ms / 1000),
+                        (elapsed_ms % 1000) as u16,
+                        unc,
+                        ClockSource::Ota,
+                    );
+                }
+            }
+            // Holdover expired after extended band silence -> resume search
+            self.locked = false;
+            self.search_origin_tick = now_tick;
+        }
+
+        if self.search_origin_tick == 0 {
+            self.search_origin_tick = now_tick;
+        }
+        let diff = now_tick.wrapping_sub(self.search_origin_tick);
+        let (elapsed_ms, _) = cal.holdover_elapsed_ms(diff);
+        let search_slot = elapsed_ms / Self::SEARCH_PERIOD_MS;
+        let in_slot_ms = (elapsed_ms % Self::SEARCH_PERIOD_MS).min(9_999);
+        (
+            Self::SYNTH_EPOCH
+                .wrapping_add(search_slot.wrapping_mul(10))
+                .wrapping_add(in_slot_ms / 1000),
+            (in_slot_ms % 1000) as u16,
+            u16::MAX,
+            ClockSource::None,
+        )
+    }
 }
 
 /// Platform-owned RAD950 runtime state attached to [`App`] via [`App::rad950_attach`].
@@ -794,6 +1018,20 @@ pub struct Rad950Host {
     pub utc_uncert_ms: u16,
     /// Discipline source for the current UTC slot clock (GPS vs bench fallback vs none).
     pub clock_src: ClockSource,
+    /// Calibrated HEXT crystal offset & holdover estimator.
+    pub clock_cal: CrystalClockCal,
+    /// Over-the-air 10 s slot-edge synchronizer (when GPS/WWV are unavailable).
+    pub ota_sync: OtaSlotSync,
+    /// True while the user is on the WWV / CHU shortwave time sync screen.
+    pub wwv_active: bool,
+    /// Selected index into `ferrite_core::wwv::WWV_PRESETS`.
+    pub wwv_preset: u8,
+    /// Latest 1 Hz status from `WwvReceiver`.
+    pub wwv_status: Option<ferrite_core::wwv::WwvStatus>,
+    /// 2 kHz HEXT tick of the locked WWV/CHU `:00` minute edge (`0` = unlocked).
+    pub wwv_anchor_tick: u32,
+    /// Minute-aligned UTC second at `wwv_anchor_tick`.
+    pub wwv_anchor_sec: u32,
     /// Latest onboard GPS 4-char grid (never from fixed position `0 6 9`).
     pub gps_grid: Option<[u8; 4]>,
     pub last_slot: u32,
@@ -894,6 +1132,13 @@ impl Rad950Host {
             utc_ms_in_sec: 0,
             utc_uncert_ms: u16::MAX,
             clock_src: ClockSource::None,
+            clock_cal: CrystalClockCal::new(),
+            ota_sync: OtaSlotSync::new(),
+            wwv_active: false,
+            wwv_preset: 0,
+            wwv_status: None,
+            wwv_anchor_tick: 0,
+            wwv_anchor_sec: 60_000,
             gps_grid: None,
             last_slot: u32::MAX,
             rx_slot_start: 0,
@@ -972,9 +1217,31 @@ impl Rad950Host {
         self.engine.set_config(cfg);
     }
 
-    /// Active USB dial (10 Hz units): the negotiated chat QSY dial while a chat is Active, otherwise the calling dial.
+    /// Active USB dial (10 Hz units): WWV preset while syncing WWV, negotiated chat QSY dial while a chat is Active,
+    /// otherwise the calling dial.
     pub fn active_dial(&self) -> Freq10 {
+        if self.wwv_active {
+            let presets = &ferrite_core::wwv::WWV_PRESETS;
+            return presets[self.wwv_preset as usize % presets.len()].0;
+        }
         self.chat.active_chat_dial().unwrap_or_else(|| self.profile.dial())
+    }
+
+    /// Compute `(utc_sec, ms_in_sec, uncert_ms)` from a locked WWV/CHU `:00` minute anchor if within `MAX_TX_UNCERT_MS`.
+    pub fn wwv_clock(&self, now_tick: u32) -> Option<(u32, u16, u16)> {
+        if self.wwv_anchor_tick == 0 {
+            return None;
+        }
+        let diff = now_tick.wrapping_sub(self.wwv_anchor_tick);
+        if diff >= u32::MAX / 2 {
+            return None;
+        }
+        let (elapsed_ms, unc) = self.clock_cal.holdover_elapsed_ms(diff);
+        if unc <= MAX_TX_UNCERT_MS {
+            Some((self.wwv_anchor_sec.wrapping_add(elapsed_ms / 1000), (elapsed_ms % 1000) as u16, unc))
+        } else {
+            None
+        }
     }
 
     /// True when the radio has full GPS PNT (live GPS-disciplined UTC clock + onboard GPS grid).
@@ -1084,7 +1351,8 @@ impl Rad950Host {
         }
         // Finish the RX slot decoder at `+9.55 s` (after the latest valid burst at `start_sym=9` ends at `+9.52 s`).
         // On the 120 MHz M4, 8-track x 3-branch LDPC `finish_slot()` takes ~420 ms, so `Receiver::reset()` +
-        // `audio::capture_start()` land right at `+9.97..10.00 s` (aligned with the `0.00 s` UTC slot edge).
+        // `audio::capture_start()` land right at `+9.97..10.00 s` (aligned with the `0.00 s` UTC slot edge,
+        // centering `urad950`'s `start_sym = 1..=9` window around the `+400 ms` nominal burst start).
         if sec_in_slot == 9 && ms_in_sec >= 550 && self.finish_sent_slot != slot {
             self.finish_sent_slot = slot;
             if !self.tx_in_flight {
@@ -1127,8 +1395,16 @@ impl Rad950Host {
             let plan = self.engine.begin_slot(slot, utc_ok);
             let has_active_qso =
                 matches!(plan, SlotPlan::Tx { .. }) || !matches!(self.engine.mode(), OpMode::Monitor);
-            let (new_dial, rdv_cq_hz) =
-                self.rdv.on_slot_start(utc_sec, slot, has_active_qso, self.profile.dial_idx, clear_mask);
+            let real_wall_utc = utc_ok
+                && matches!(
+                    self.clock_src,
+                    ClockSource::Gps | ClockSource::GpsHoldover | ClockSource::Bench
+                );
+            let (new_dial, rdv_cq_hz) = if real_wall_utc {
+                self.rdv.on_slot_start(utc_sec, slot, has_active_qso, self.profile.dial_idx, clear_mask)
+            } else {
+                (None, None)
+            };
             if let Some(di) = new_dial {
                 self.profile.dial_idx = di;
                 self.sync_engine_config();
@@ -1145,7 +1421,7 @@ impl Rad950Host {
                 } else {
                     self.engine.on_tx_missed_deadline(slot);
                     if !self.utc_ready() {
-                        self.set_notice(b"Waiting for GPS UTC");
+                        self.set_notice(b"Need UTC: GPS / RX / WWV");
                     } else if self.profile.callsign().is_none() {
                         self.set_notice(b"Set callsign in Setup");
                     }
@@ -1435,6 +1711,12 @@ impl App {
         self.rad950d.as_ref().is_some_and(|h| h.profile.mode60)
     }
 
+    /// Return from WWV/CHU Sync to Operate and display a lock confirmation toast.
+    pub fn rad950_wwv_locked(&mut self) {
+        self.screen = Screen::Rad950(crate::screens::rad950::Rad950Scr::OPERATE);
+        self.show_toast(b"WWV/CHU Locked", b"UTC minute aligned", false);
+    }
+
     /// Maximum sleep duration (ms) for the UI task while RAD950 is active, so `DspCmd::Rad950Finish`
     /// (`+9.94 s`) and `Rad950Tx` (`0.00 s`) fire within `<= 10 ms` even when the display is dark.
     pub fn rad950_next_wake_ms(&self) -> Option<u32> {
@@ -1592,5 +1874,68 @@ mod tests {
             std::eprintln!("Scenario 4 (3x Rendezvous + HUNT:ALL, 30 slots): logged counts = {:?}", counts);
             assert_eq!(counts, [2, 2, 2], "All 3 distinct stations should complete all 3 unique pairs (2 QSOs each)");
         }
+    }
+
+    #[test]
+    fn crystal_cal_and_holdover_duration() {
+        let mut cal = CrystalClockCal::new();
+        // Uncalibrated: 2,000 s (33.3 min) hits 150 ms limit; 3,600 s (1 h) exceeds it.
+        let (_, unc_30m) = cal.holdover_elapsed_ms(1_800 * 2_000);
+        assert!(unc_30m <= MAX_TX_UNCERT_MS);
+        let (_, unc_1h) = cal.holdover_elapsed_ms(3_600 * 2_000);
+        assert!(unc_1h > MAX_TX_UNCERT_MS);
+
+        // Simulate a crystal running +25.0 ppm fast over 100 s (200,005 ticks instead of 200,000).
+        assert!(!cal.observe_gps(1_700_000_000, 10_000));
+        assert!(cal.observe_gps(1_700_000_100, 10_000 + 200_005));
+        assert!(cal.valid);
+        assert!((cal.ppm_x10 - 250).abs() <= 5, "ppm_x10={}", cal.ppm_x10);
+
+        // Calibrated: 2 hours (7,200 s) stays well within 150 ms, and compensates +25 ppm (~180 ms).
+        let (elapsed_2h, unc_2h) = cal.holdover_elapsed_ms(7_200 * 2_000 + 360);
+        assert!(unc_2h <= MAX_TX_UNCERT_MS, "unc_2h={unc_2h}");
+        assert!((elapsed_2h as i64 - 7_200_000).abs() <= 5, "elapsed_2h={elapsed_2h}");
+    }
+
+    #[test]
+    fn ota_slot_sync_search_snap_and_holdover() {
+        let cal = CrystalClockCal::new();
+        let mut ota = OtaSlotSync::new();
+
+        // Unlocked: free-running RX search runs (utc_sec != 0) but uncert is MAX (TX blocked).
+        let (sec0, _ms0, unc0, src0) = ota.clock(100_000, &cal);
+        assert!(sec0 >= OtaSlotSync::SYNTH_EPOCH);
+        assert_eq!(unc0, u16::MAX);
+        assert_eq!(src0, ClockSource::None);
+
+        // Search slots advance every 10.60 s (full 9.55 s capture + 1.05 s gap -> +600 ms phase step per slot).
+        let mut prev_slot = sec0 / 10;
+        for i in 1..=18u32 {
+            let slot_start = 100_000 + i * OtaSlotSync::SEARCH_PERIOD_MS * 2;
+            let (s, ms, unc, src) = ota.clock(slot_start, &cal);
+            let slot = s / 10;
+            assert_eq!(slot, prev_slot + 1, "slot must advance by 1 every 10.60 s");
+            assert_eq!(ms, 0, "new search slot must start at 0 ms");
+            assert_eq!(unc, u16::MAX);
+            assert_eq!(src, ClockSource::None);
+            // Full 9.55 s later, we must still be inside the same slot at sec_in_slot=9, ms=550
+            let (s_fin, ms_fin, _, _) = ota.clock(slot_start + 9_550 * 2, &cal);
+            assert_eq!(s_fin / 10, slot);
+            assert_eq!(s_fin % 10, 9);
+            assert_eq!(ms_fin, 550);
+            prev_slot = slot;
+        }
+        assert!(!ota.locked);
+
+        // First decode arrives +140 ms late -> snaps anchor forward by 140 ms (280 ticks) and locks OTA.
+        let decode_tick = 100_000 + 19 * OtaSlotSync::SEARCH_PERIOD_MS * 2 + 9_550 * 2;
+        assert!(ota.on_decode(140, decode_tick, &cal));
+        assert!(ota.locked);
+
+        let (_sec1, ms1, unc1, src1) = ota.clock(decode_tick + 900, &cal);
+        assert_eq!(src1, ClockSource::Ota);
+        assert!(unc1 <= MAX_TX_UNCERT_MS);
+        // Should be ~140 ms earlier than unshifted slot edge
+        assert!(ms1 < 1000);
     }
 }

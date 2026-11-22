@@ -59,6 +59,14 @@ const PUBLISH_MS: u32 = 500;
 static GPS_BURST_TICK: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 static GPS_LAST_RX_TICK: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
+/// Matched `(unix_sec, pps_tick)` pair latched atomically by `gps::task` only when `f.unix` advances
+/// after `$GNRMC` parses — prevents pairing `fix.unix = N-1` with `GPS_BURST_TICK` from burst `N`!
+/// `ATGM336H_NMEA_LAG_TICKS = 300` (`150 ms` at 2 kHz) compensates typical PPS-to-first-byte NMEA delay.
+const ATGM336H_NMEA_LAG_TICKS: u32 = 300;
+static GPS_SYNC_GEN: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static GPS_SYNC_UNIX: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static GPS_SYNC_TICK: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
 #[inline(always)] // called from `usart3` ISR (fast flash)
 pub fn on_rx_isr() {
     let t = Instant::now().as_ticks() as u32;
@@ -68,11 +76,35 @@ pub fn on_rx_isr() {
     }
 }
 
-/// Most recent NMEA burst-start timestamp in 2 kHz (`0.5 ms`) ticks (`0` until first burst).
-#[allow(dead_code)]
-#[inline(always)]
-pub fn last_burst_tick() -> u32 {
-    GPS_BURST_TICK.load(Relaxed)
+/// Latch a matched `(unix_sec, pps_tick)` pair when `$GNRMC` advances `unix`.
+fn latch_sync_pair(unix: u32) {
+    let burst = GPS_BURST_TICK.load(Relaxed);
+    if unix == 0 || burst == 0 {
+        return;
+    }
+    let pps_tick = burst.wrapping_sub(ATGM336H_NMEA_LAG_TICKS);
+    let g = GPS_SYNC_GEN.load(Relaxed).wrapping_add(1) | 1; // odd = writing
+    GPS_SYNC_GEN.store(g, core::sync::atomic::Ordering::Release);
+    GPS_SYNC_UNIX.store(unix, Relaxed);
+    GPS_SYNC_TICK.store(pps_tick, Relaxed);
+    GPS_SYNC_GEN.store(g.wrapping_add(1), core::sync::atomic::Ordering::Release); // even = stable
+}
+
+/// Read the latest matched `(unix_sec, pps_tick)` pair (`None` until first valid `$GNRMC` fix).
+pub fn latest_utc_sync() -> Option<(u32, u32)> {
+    for _ in 0..3 {
+        let g1 = GPS_SYNC_GEN.load(core::sync::atomic::Ordering::Acquire);
+        if (g1 & 1) != 0 {
+            continue;
+        }
+        let u = GPS_SYNC_UNIX.load(Relaxed);
+        let t = GPS_SYNC_TICK.load(Relaxed);
+        let g2 = GPS_SYNC_GEN.load(core::sync::atomic::Ordering::Acquire);
+        if g1 == g2 && u != 0 && t != 0 {
+            return Some((u, t));
+        }
+    }
+    None
 }
 
 /// GPS-22 (TX audit F15): PB10 driven low now, by the Radio task just before a key-up, as stock's PTT press does
@@ -384,6 +416,9 @@ pub async fn task() {
         }
         if powered && fresh {
             let f = nmea.fix(now);
+            if f.unix != 0 && f.unix != GPS_SYNC_UNIX.load(Relaxed) {
+                latch_sync_pair(f.unix);
+            }
             let ignored = if held {
                 false
             } else if f.has_fix() {

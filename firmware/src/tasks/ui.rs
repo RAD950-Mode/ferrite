@@ -1600,6 +1600,9 @@ fn rad950_mount_flash(store: &crate::store::Store, app: &mut App) -> ferrite_sto
             h.rdv.band_mask = cfg.rdv_band_mask;
             h.rdv.follow_schedule = cfg.rdv_follow;
             h.profile.alert_tones = cfg.alert_tones;
+            h.profile.hext_ppm_x10 = cfg.hext_ppm_x10;
+            h.profile.hext_cal_valid = cfg.hext_cal_valid;
+            h.clock_cal = ferrite_app::rad950::CrystalClockCal::from_saved(cfg.hext_ppm_x10, cfg.hext_cal_valid);
             h.sync_engine_config();
         }
     }
@@ -1678,6 +1681,8 @@ async fn rad950_step(
                 rdv_band_mask: rdv_mask,
                 rdv_follow,
                 alert_tones: p.alert_tones,
+                hext_ppm_x10: p.hext_ppm_x10,
+                hext_cal_valid: p.hext_cal_valid,
             };
             let mut nor = store.rad950_nor();
             let _ = ferrite_store::rad950::save_cfg(&mut nor, &mut rec).await;
@@ -1728,8 +1733,20 @@ async fn rad950_step(
 
     let open = app.rad950_open();
     let mode60 = app.rad950_mode60();
-    static LAST_MODE60: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
-    let mode_changed = open && *dec_on && LAST_MODE60.load(Relaxed) != mode60;
+    let (wwv_on, wwv_preset) = app
+        .rad950_host()
+        .map_or((false, 0u8), |h| (h.wwv_active, h.wwv_preset));
+    let dec_tag: u8 = if !open {
+        0
+    } else if wwv_on {
+        10 + wwv_preset
+    } else if mode60 {
+        2
+    } else {
+        1
+    };
+    static LAST_DEC_TAG: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+    let mode_changed = open && *dec_on && LAST_DEC_TAG.load(Relaxed) != dec_tag;
     if open != *dec_on || mode_changed {
         if open {
             // Raise MCU clock to full speed BEFORE waking the higher-priority DSP task, even if LPM is active.
@@ -1739,7 +1756,13 @@ async fn rad950_step(
             }
         }
         let cmd = if open {
-            DspCmd::Decoder(if mode60 { DecoderKind::Rad950_60 } else { DecoderKind::Rad950 })
+            DspCmd::Decoder(if wwv_on {
+                DecoderKind::Wwv
+            } else if mode60 {
+                DecoderKind::Rad950_60
+            } else {
+                DecoderKind::Rad950
+            })
         } else if app.aprs_on() {
             DspCmd::Decoder(DecoderKind::Afsk)
         } else {
@@ -1747,16 +1770,53 @@ async fn rad950_step(
         };
         if crate::chan::DSP.try_send(cmd).is_ok() {
             *dec_on = open;
-            LAST_MODE60.store(mode60, Relaxed);
+            LAST_DEC_TAG.store(dec_tag, Relaxed);
         }
     }
     if !open {
         return;
     }
 
+    // Drain WWV/CHU time-sync status from the DSP task when active.
+    if let Some(st) = crate::chan::WWV_STATUS.try_take() {
+        let mut locked_now = false;
+        let mut retune: Option<(ferrite_core::freq::Freq10, i16)> = None;
+        if let Some(h) = app.rad950_host_mut() {
+            if h.wwv_active {
+                h.wwv_status = Some(st);
+                if st.minute_locked {
+                    let now_tick = Instant::now().as_ticks() as u32;
+                    h.wwv_anchor_tick = now_tick.wrapping_sub((st.minute_age_ms as u32) * 2);
+                    h.wwv_anchor_sec = 60_000;
+                    h.wwv_active = false;
+                    h.set_notice(b"WWV clock locked");
+                    retune = Some((h.active_dial(), h.profile.rx_corr_hz));
+                    locked_now = true;
+                }
+            }
+        }
+        if locked_now {
+            if let Some((dial, rx_corr_hz)) = retune {
+                let _ = crate::chan::RADIO.try_send(ferrite_core::msg::RadioCmd::Rad950Rx {
+                    dial,
+                    rx_corr_hz,
+                    on: true,
+                });
+            }
+            app.rad950_wwv_locked();
+        }
+    }
+
     // Drain any decoded RAD950 frames from the DSP task.
+    let rx_now_tick = Instant::now().as_ticks() as u32;
     while let Ok(d) = crate::chan::RAD950_RX.try_receive() {
         if let Some(h) = app.rad950_host_mut() {
+            if matches!(h.clock_src, ferrite_app::rad950::ClockSource::None | ferrite_app::rad950::ClockSource::Ota) {
+                let cal = h.clock_cal;
+                if h.ota_sync.on_decode(d.time_offset_ms, rx_now_tick, &cal) {
+                    h.set_notice(b"OTA clock locked");
+                }
+            }
             h.on_rx_frame(d);
         }
     }
@@ -1804,21 +1864,28 @@ async fn rad950_step(
         if let Some(h) = app.rad950_host_mut() {
             h.chat.distress.update_gps_pos(fix.lat, fix.lon, true);
         }
-        if fix.unix != 0 {
-            let burst_tick = crate::tasks::gps::last_burst_tick();
-            let diff = now_tick.wrapping_sub(burst_tick);
-            if burst_tick != 0 && diff < u32::MAX / 2 {
-                GPS_ANCHOR_UNIX.store(fix.unix, Relaxed);
-                GPS_ANCHOR_TICK.store(burst_tick, Relaxed);
+        if let Some((sync_unix, sync_tick)) = crate::tasks::gps::latest_utc_sync() {
+            let diff = now_tick.wrapping_sub(sync_tick);
+            if diff < u32::MAX / 2 {
+                GPS_ANCHOR_UNIX.store(sync_unix, Relaxed);
+                GPS_ANCHOR_TICK.store(sync_tick, Relaxed);
                 GPS_ANCHOR_GRID.store(u32::from_le_bytes(grid_bytes), Relaxed);
-                let elapsed_ms = diff / 2; // 2 kHz HEXT tick driver -> 0.5 ms/tick
+                let cal = if let Some(h) = app.rad950_host_mut() {
+                    if h.clock_cal.observe_gps(sync_unix, sync_tick) {
+                        h.profile.hext_ppm_x10 = h.clock_cal.ppm_x10;
+                        h.profile.hext_cal_valid = h.clock_cal.valid;
+                        h.profile_dirty = true;
+                    }
+                    h.clock_cal
+                } else {
+                    ferrite_app::rad950::CrystalClockCal::new()
+                };
+                let (elapsed_ms, unc) = cal.holdover_elapsed_ms(diff);
                 let secs = elapsed_ms / 1000;
                 let ms = (elapsed_ms % 1000) as u16;
-                // 50 ms NMEA burst jitter + 50 ppm crystal drift budget (1 ms per 20 s)
-                let unc = 50u16.saturating_add((secs / 20).min(u16::MAX as u32) as u16);
-                (fix.unix.wrapping_add(secs), ms, unc, ClockSource::Gps, grid)
+                (sync_unix.wrapping_add(secs), ms, unc, ClockSource::Gps, grid)
             } else {
-                (fix.unix, 0, 500, ClockSource::Gps, grid)
+                (sync_unix, 0, 500, ClockSource::Gps, grid)
             }
         } else {
             (0, 0, u16::MAX, ClockSource::None, grid)
@@ -1827,11 +1894,13 @@ async fn rad950_step(
         let anchor_unix = GPS_ANCHOR_UNIX.load(Relaxed);
         let anchor_tick = GPS_ANCHOR_TICK.load(Relaxed);
         let diff = now_tick.wrapping_sub(anchor_tick);
+        let cal = app
+            .rad950_host()
+            .map_or(ferrite_app::rad950::CrystalClockCal::new(), |h| h.clock_cal);
         let holdover = if anchor_unix != 0 && anchor_tick != 0 && diff < u32::MAX / 2 {
-            let elapsed_ms = diff / 2;
+            let (elapsed_ms, unc) = cal.holdover_elapsed_ms(diff);
             let secs = elapsed_ms / 1000;
             let ms = (elapsed_ms % 1000) as u16;
-            let unc = 50u16.saturating_add((secs / 20).min(u16::MAX as u32) as u16);
             if unc <= MAX_TX_UNCERT_MS {
                 let grid_bytes = GPS_ANCHOR_GRID.load(Relaxed).to_le_bytes();
                 Some((anchor_unix.wrapping_add(secs), ms, unc, ClockSource::GpsHoldover, Some(grid_bytes)))
@@ -1843,6 +1912,8 @@ async fn rad950_step(
         };
         if let Some(h) = holdover {
             h
+        } else if let Some((sec, ms, unc)) = app.rad950_host().and_then(|h| h.wwv_clock(now_tick)) {
+            (sec, ms, unc, ClockSource::Wwv, None)
         } else {
             // Bench builds only: provide a monotonic UTC fallback indoors when no GPS fix or holdover is present,
             // enabling on-MCU `DspCmd::Rad950Finish` and conducted `Rad950Tx` testing.
@@ -1855,17 +1926,25 @@ async fn rad950_step(
             }
             #[cfg(not(feature = "bench"))]
             {
-                (0, 0, u16::MAX, ClockSource::None, None)
+                if let Some(h) = app.rad950_host_mut() {
+                    let cal = h.clock_cal;
+                    let (sec, ms, unc, src) = h.ota_sync.clock(now_tick, &cal);
+                    let cur_slot = sec / 10;
+                    if src == ClockSource::None && h.last_slot != u32::MAX && cur_slot > h.last_slot {
+                        // Start the new 10.60 s search slot with a clean DSP capture buffer
+                        let _ = crate::chan::DSP.try_send(DspCmd::Rad950Reset);
+                    }
+                    (sec, ms, unc, src, None)
+                } else {
+                    (0, 0, u16::MAX, ClockSource::None, None)
+                }
             }
         }
     };
     if let Some(h) = app.rad950_host_mut() {
         h.update_clock(utc_sec, ms_in_sec, uncert_ms, clock_src, gps_grid);
-        #[cfg(feature = "bench")]
-        {
-            for (dst, src) in h.diag.iter_mut().zip(&crate::tasks::dsp::RAD950_DIAG) {
-                *dst = src.load(Relaxed);
-            }
+        for (dst, src) in h.diag.iter_mut().zip(&crate::tasks::dsp::RAD950_DIAG) {
+            *dst = src.load(Relaxed);
         }
     }
 

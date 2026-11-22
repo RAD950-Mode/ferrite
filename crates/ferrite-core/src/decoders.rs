@@ -10,6 +10,7 @@ use uafsk::Demodulator as Afsk;
 use upocsag::Receiver as Pocsag;
 use urad950::Receiver as Rad950;
 use urad950::CompactReceiver60 as Rad950_60;
+use crate::wwv::{WwvReceiver, WwvStatus};
 
 /// Audio rate the DSP task feeds the decoders.
 pub const RATE_HZ: u32 = 24_000;
@@ -24,6 +25,7 @@ union DecoderInner {
     dsc: ManuallyDrop<Dsc>,
     rad950: ManuallyDrop<Rad950>,
     rad950_60: ManuallyDrop<Rad950_60>,
+    wwv: ManuallyDrop<WwvReceiver>,
 }
 
 /// Shared decoder slot: holds one active decoder at a time inside a single `<= 13 KB` union,
@@ -43,6 +45,7 @@ pub enum Found<'a> {
     Miss(&'a uafsk::Miss),
     Page(&'a upocsag::Message<'a>),
     Call(&'a udsc::Call<'a>),
+    Wwv(WwvStatus),
 }
 
 impl Decoder {
@@ -124,6 +127,12 @@ impl Decoder {
                     Rad950_60::init_in_place(core::ptr::addr_of_mut!(self.inner.rad950_60) as *mut Rad950_60);
                 }
                 self.kind = DecoderKind::Rad950_60;
+            }
+            DecoderKind::Wwv => {
+                unsafe {
+                    core::ptr::addr_of_mut!(self.inner.wwv).write(ManuallyDrop::new(WwvReceiver::new()));
+                }
+                self.kind = DecoderKind::Wwv;
             }
         }
     }
@@ -245,6 +254,12 @@ impl Decoder {
             DecoderKind::Rad950_60 => {
                 let d = unsafe { &mut *self.inner.rad950_60 };
                 d.push_samples(block);
+            }
+            DecoderKind::Wwv => {
+                let d = unsafe { &mut *self.inner.wwv };
+                if let Some(st) = d.feed(block) {
+                    found(Found::Wwv(st));
+                }
             }
         }
     }

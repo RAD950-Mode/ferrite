@@ -42,6 +42,9 @@ codegen-units = 1
 panic = "abort"       # the radio target's rustflags add -Cpanic=immediate-abort after this, which wins
 debug = true          # symbols only; not in the flashed image
 
+[profile.release.package.urad950]
+opt-level = 3
+
 # The web simulator (`cargo simweb`): release without debug info, stripped.
 [profile.wasm]
 inherits = "release"

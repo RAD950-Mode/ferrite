@@ -42,6 +42,8 @@ pub static ALERTS: Channel<M, SameDecoded, 2> = Channel::new();
 pub static RAD950_RX: Channel<M, ferrite_core::rad950::urad950::Decoded, 8> = Channel::new();
 /// Latest 24-bin packed 4-bit RAD950 waterfall slice (`200 ms` cadence) from DSP to UI.
 pub static RAD950_WF: Signal<M, [u8; 12]> = Signal::new();
+/// Latest WWV/CHU time-signal sync status (1 Hz + immediate `:00` minute lock) from DSP to UI.
+pub static WWV_STATUS: Signal<M, ferrite_core::wwv::WwvStatus> = Signal::new();
 /// Latest failed-CRC 92-byte soft candidate exported at end of slot for Cooperative RX capture.
 pub static RAD950_SOFT: Signal<M, ferrite_core::rad950::urad950::SoftCandidate> = Signal::new();
 /// A complete RAD950 receive slot, kept together so an external Cooperative RX host never joins a candidate to

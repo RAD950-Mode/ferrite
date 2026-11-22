@@ -18,6 +18,7 @@ pub mod clocktree;
 pub mod cmdq;
 pub mod sha256;
 pub mod rad950;
+pub mod wwv;
 pub mod ssb;
 pub mod stuck;
 pub mod dcs;

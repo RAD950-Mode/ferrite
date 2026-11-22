@@ -42,6 +42,7 @@ pub const PAGE_CHAT_MORE: u8 = 12;
 pub const PAGE_DISTRESS: u8 = 13;
 pub const PAGE_OPERATE_MENU: u8 = 14;
 pub const PAGE_RENDEZVOUS: u8 = 15;
+pub const PAGE_WWV_SYNC: u8 = 16;
 
 const OPERATE_ROWS: usize = 4;
 const LOG_ROWS: usize = 6;
@@ -118,6 +119,7 @@ pub fn page_id(s: &Rad950Scr) -> &'static str {
         PAGE_DISTRESS => "rad950.distress",
         PAGE_OPERATE_MENU => "rad950.menu",
         PAGE_RENDEZVOUS => "rad950.rendezvous",
+        PAGE_WWV_SYNC => "rad950.wwv",
         _ => "rad950.operate",
     }
 }
@@ -284,6 +286,7 @@ impl View for Rad950Scr {
             PAGE_DISTRESS => "RAD950 Distress",
             PAGE_OPERATE_MENU => "RAD950 Menu",
             PAGE_RENDEZVOUS => "RAD950 Rendezvous",
+            PAGE_WWV_SYNC => "WWV/CHU Time Sync",
             _ => "RAD950",
         }
     }
@@ -303,6 +306,7 @@ impl View for Rad950Scr {
             PAGE_DISTRESS => b"DISTRESS",
             PAGE_OPERATE_MENU => b"RAD MENU",
             PAGE_RENDEZVOUS => b"RENDEZV",
+            PAGE_WWV_SYNC => b"WWV SYNC",
             _ => b"RAD950",
         };
         b.set(t);
@@ -333,6 +337,7 @@ impl View for Rad950Scr {
             PAGE_DISTRESS => self.key_distress(app, e.key),
             PAGE_OPERATE_MENU => self.key_operate_menu(app, e.key),
             PAGE_RENDEZVOUS => self.key_rendezvous(app, e.key),
+            PAGE_WWV_SYNC => self.key_wwv_sync(app, e.key),
             _ => app.screen = Screen::Rad950(Rad950Scr::OPERATE),
         }
     }
@@ -472,6 +477,7 @@ impl View for Rad950Scr {
             PAGE_DISTRESS => self.draw_distress(app, lcd),
             PAGE_OPERATE_MENU => self.draw_operate_menu(app, lcd),
             PAGE_RENDEZVOUS => self.draw_rendezvous(app, lcd, cx.live),
+            PAGE_WWV_SYNC => self.draw_wwv_sync(app, lcd),
             _ => self.draw_operate(app, lcd, cx.live),
         }
     }
@@ -509,6 +515,7 @@ impl View for Rad950Scr {
             PAGE_CHAT_PREVIEW => Hints::new(&[("OK", "Send"), ("BACK", "Back")]),
             PAGE_DISTRESS => Hints::new(&[(ARROWS_LR, "Change"), ("OK", "Send"), ("BACK", "Cancel")]),
             PAGE_RENDEZVOUS => Hints::new(&[("OK", "Toggle"), ("1-4", "Bands"), ("BACK", "Back")]),
+            PAGE_WWV_SYNC => Hints::new(&[(ARROWS_LR, "Station"), ("BACK", "Cancel")]),
             _ => Hints::new(&[("BACK", "Back")]),
         }
     }
@@ -550,11 +557,16 @@ impl Rad950Scr {
                 }
                 if let Some(row) = rows.get(self.sel as usize).filter(|_| (self.sel as usize) < n) {
                     let peer = row.peer;
+                    let mut need_utc = false;
                     if let Some(h) = app.rad950_host_mut() {
                         let slot = if h.last_slot == u32::MAX { 0 } else { h.last_slot };
                         h.saved_ack = false;
                         h.target_peer = Some(peer);
                         h.engine.answer_peer(peer, slot);
+                        need_utc = !h.utc_ready();
+                    }
+                    if need_utc {
+                        app.show_toast(b"Need UTC to TX", b"GPS, OTA RX, or WWV sync", false);
                     }
                     app.screen = Screen::Rad950(Rad950Scr::ACTIVE);
                     return;
@@ -565,12 +577,17 @@ impl Rad950Scr {
                     app.show_toast(b"Coop Capture", b"RX only mode", false);
                     return;
                 }
+                let mut need_utc = false;
                 if let Some(h) = app.rad950_host_mut() {
                     // Transmit on the very next 10 s UTC slot boundary (`(last_slot + 1) & 1`).
                     let parity = if h.last_slot == u32::MAX { 0 } else { (h.last_slot.wrapping_add(1) & 1) as u8 };
                     h.saved_ack = false;
                     h.target_peer = None;
                     h.engine.start_cq(parity);
+                    need_utc = !h.utc_ready();
+                }
+                if need_utc {
+                    app.show_toast(b"Need UTC to TX", b"GPS, OTA RX, or WWV sync", false);
                 }
                 app.screen = Screen::Rad950(Rad950Scr::ACTIVE);
                 return;
@@ -909,8 +926,10 @@ impl Rad950Scr {
                         (true, ClockSource::Gps, true) => (" GPS PNT", true),
                         (true, ClockSource::Gps, false) => (" GPS CLK", true),
                         (true, ClockSource::GpsHoldover, _) => (" GPS HOLD", true),
+                        (true, ClockSource::Wwv, _) => (" WWV CLK", true),
+                        (true, ClockSource::Ota, _) => (" OTA CLK", true),
                         (true, ClockSource::Bench, _) => (" BENCH CLK", false),
-                        _ => (" NO GPS", false),
+                        _ => (" NO UTC", false),
                     };
                     let _ = uwrite!(line2, "{}{}", st, utc_s);
                     let col = if tx_now { AMBER } else if gps_ok && rx_ready { GREEN } else { AMBER };
@@ -2637,7 +2656,7 @@ impl Rad950Scr {
     }
 
     fn key_operate_menu(mut self, app: &mut App, k: Key) {
-        const ITEMS: u8 = 6;
+        const ITEMS: u8 = 7;
         match k {
             Key::Exit => {
                 app.screen = Screen::Rad950(Rad950Scr::OPERATE);
@@ -2657,6 +2676,17 @@ impl Rad950Scr {
                         app.screen = Screen::Rad950(Rad950Scr::LOG);
                     }
                     4 => app.screen = Screen::Rad950(Rad950Scr::GRIDS),
+                    5 => {
+                        if let Some(h) = app.rad950_host_mut() {
+                            h.wwv_preset = 0;
+                            h.wwv_active = true;
+                            h.wwv_status = None;
+                            let dial = h.active_dial();
+                            let corr = h.profile.rx_corr_hz;
+                            app.out.push(RadioCmd::Rad950Rx { dial, rx_corr_hz: corr, on: true });
+                        }
+                        app.screen = Screen::Rad950(Rad950Scr { page: PAGE_WWV_SYNC, sel: 0, top: 0, field: 0, sub: 0 });
+                    }
                     _ => {
                         app.screen = Screen::Rad950(Rad950Scr { page: PAGE_DISTRESS, sel: 0, top: 0, field: 0, sub: 0 });
                     }
@@ -2669,32 +2699,109 @@ impl Rad950Scr {
     }
 
     fn draw_operate_menu(self, app: &mut App, lcd: &mut impl Panel) {
-        const LABELS: [(&[u8], &[u8]); 6] = [
+        const LABELS: [(&[u8], &[u8]); 7] = [
             (b"Rendezvous", b"5"),
             (b"Active QSO", b""),
             (b"Setup", b"*"),
             (b"Contact log", b"2"),
             (b"Worked grids", b"4"),
+            (b"Sync WWV/CHU", b"RF"),
             (b"Send distress...", b"3x PTT"),
         ];
-        let y0 = TOP_Y + 6;
-        let row_h = 34;
+        let y0 = TOP_Y + 4;
+        let row_h = 30;
         for (i, &(label, tag)) in LABELS.iter().enumerate() {
             let selected = i == self.sel as usize;
             let rh = Mix::new().n(selected as u32).b(label).b(tag).get();
             if app.dirty(R_ROW + i, rh) {
                 let y = y0 + i as i32 * row_h;
                 let bg = if selected { BLUE } else { BG };
-                let fg = if selected { BLUE_FG } else if i == 5 { AMBER } else { TEXT };
+                let fg = if selected { BLUE_FG } else if i == 6 { AMBER } else { TEXT };
                 let dim = if selected { BLUE_FG } else { DIM };
                 redraw_box!(true, lcd, (0, y, W, row_h, bg), {
-                    lcd.text4(8, y + 22, label, &UI_14, fg, bg);
+                    lcd.text4(8, y + 20, label, &UI_14, fg, bg);
                     if !tag.is_empty() {
-                        lcd.text4(W - 60, y + 22, tag, &UI_12, dim, bg);
+                        lcd.text4(W - 60, y + 20, tag, &UI_12, dim, bg);
                     }
                 });
             }
         }
+    }
+
+    #[inline(never)]
+    fn key_wwv_sync(self, app: &mut App, k: Key) {
+        let n_presets = ferrite_core::wwv::WWV_PRESETS.len() as u8;
+        match k {
+            Key::Exit => {
+                if let Some(h) = app.rad950_host_mut() {
+                    h.wwv_active = false;
+                    h.wwv_status = None;
+                    let dial = h.active_dial();
+                    let corr = h.profile.rx_corr_hz;
+                    app.out.push(RadioCmd::Rad950Rx { dial, rx_corr_hz: corr, on: true });
+                }
+                app.screen = Screen::Rad950(Rad950Scr::OPERATE);
+            }
+            Key::Up | Key::Down => {
+                if let Some(h) = app.rad950_host_mut() {
+                    h.wwv_preset = if k == Key::Up {
+                        if h.wwv_preset == 0 { n_presets - 1 } else { h.wwv_preset - 1 }
+                    } else {
+                        (h.wwv_preset + 1) % n_presets
+                    };
+                    h.wwv_status = None;
+                    let dial = h.active_dial();
+                    let corr = h.profile.rx_corr_hz;
+                    app.out.push(RadioCmd::Rad950Rx { dial, rx_corr_hz: corr, on: true });
+                }
+            }
+            _ => {}
+        }
+    }
+
+    #[inline(never)]
+    fn draw_wwv_sync(self, app: &mut App, lcd: &mut impl Panel) {
+        let (preset, st) = app
+            .rad950_host()
+            .map_or((0u8, None), |h| (h.wwv_preset, h.wwv_status));
+        let presets = &ferrite_core::wwv::WWV_PRESETS;
+        let label = presets[preset as usize % presets.len()].1;
+        let secs = st.map_or(0u16, |s| s.secs);
+        let locked = st.is_some_and(|s| s.tick_locked);
+        let ratio = st.map_or(0u16, |s| s.ratio_x10);
+        let h = Mix::new()
+            .n(preset as u32)
+            .n(secs as u32)
+            .n(locked as u32)
+            .n(ratio as u32)
+            .get();
+        if !app.dirty(R_TOP, h) {
+            return;
+        }
+        let y0 = TOP_Y + 8;
+        redraw_box!(true, lcd, (0, TOP_Y, W, 252, BG), {
+            lcd.text4(8, y0 + 18, b"Shortwave Time Sync", &UI_14, CYAN, BG);
+            lcd.text4(8, y0 + 44, label, &UI_14, TEXT, BG);
+
+            let mut line = Buf::<32>::new();
+            let _ = uwrite!(line, "Listening: {}s  SNR {}.{}x", secs, ratio / 10, ratio % 10);
+            lcd.text4(8, y0 + 74, line.as_bytes(), &UI_12, DIM, BG);
+
+            let (status_txt, col) = if locked {
+                (b"1 Hz Tick: LOCKED".as_slice(), GREEN)
+            } else {
+                (b"1 Hz Tick: Searching...".as_slice(), AMBER)
+            };
+            lcd.text4(8, y0 + 104, status_txt, &UI_14, col, BG);
+
+            let sub_txt: &[u8] = if locked {
+                b"Waiting for :00 min beep..."
+            } else {
+                b"Use UP/DN to try 5/10/15 MHz"
+            };
+            lcd.text4(8, y0 + 132, sub_txt, &UI_12, TEXT, BG);
+            lcd.text4(8, y0 + 162, b"Auto-locks on :00 marker", &UI_12, DIM, BG);
+        });
     }
 
     fn key_rendezvous(mut self, app: &mut App, k: Key) {

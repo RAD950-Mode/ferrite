@@ -334,6 +334,7 @@ pub enum DecoderKind {
     Dsc,
     Rad950,
     Rad950_60,
+    Wwv,
 }
 
 /// Who announced it.
