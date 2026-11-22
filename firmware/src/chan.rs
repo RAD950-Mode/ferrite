@@ -44,6 +44,12 @@ pub static RAD950_RX: Channel<M, ferrite_core::rad950::urad950::Decoded, 8> = Ch
 pub static RAD950_WF: Signal<M, [u8; 12]> = Signal::new();
 /// Latest WWV/CHU time-signal sync status (1 Hz + immediate `:00` minute lock) from DSP to UI.
 pub static WWV_STATUS: Signal<M, ferrite_core::wwv::WwvStatus> = Signal::new();
+/// Decoded CW characters from DSP (`DecoderKind::Cw`) to UI.
+pub static RTCW_RX_CHAR: Channel<M, u8, 16> = Channel::new();
+/// Latest CW receive meter & zero-beat tuning indicator from DSP to UI.
+pub static RTCW_METER: Signal<M, ferrite_core::urtcw::CwMeter> = Signal::new();
+/// Lock-free RF CW key-down gate driven by the RTCW iambic keyer (`true` = ramp PA up, `false` = ramp PA down).
+pub static RTCW_KEY_DOWN: AtomicBool = AtomicBool::new(false);
 /// Latest failed-CRC 92-byte soft candidate exported at end of slot for Cooperative RX capture.
 pub static RAD950_SOFT: Signal<M, ferrite_core::rad950::urad950::SoftCandidate> = Signal::new();
 /// A complete RAD950 receive slot, kept together so an external Cooperative RX host never joins a candidate to

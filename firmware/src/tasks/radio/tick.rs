@@ -104,6 +104,15 @@ impl Radio {
             self.rad950_poll();
             return;
         }
+        if self.rtcw.is_some() {
+            #[cfg(feature = "tx")]
+            if self.rtcw.is_some_and(|c| c.tx_active) {
+                self.rtcw_step_key();
+                return;
+            }
+            self.rtcw_poll();
+            return;
+        }
         if self.hf.is_some() {
             // Keyed from HF mode (HF-23): the keyed tick as from home (TX-30 backstop, TX-31 duty limit, TX-32
             // battery under load); the HF receiver's report waits for the unkey (TX audit M5).

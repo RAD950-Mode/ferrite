@@ -468,6 +468,7 @@ pub async fn task() {
     app.rad950_attach(rad950_host()); // RAD950 10 m weak-signal mode host
     let mut rad950_journal = rad950_mount_flash(store, app);
     let mut rad950_dec_on = false;
+    let mut rtcw_dec_on = false;
     // The slots as they were saved (frequencies, VFO settings, the channel each is on, watch, Battery Save).
     store.restore(app);
     // After the self-test: setup on first boot (BOOT-12); MENU held: the settings reset (PIN-6, BOOT-14), which
@@ -1010,6 +1011,7 @@ pub async fn task() {
             gps.step(&mut app, store, dev); // PWR-26.15: fixes come once a second
         }
         own_frame(rad950_step(&mut app, store, &mut rad950_dec_on, &mut rad950_journal)).await;
+        rtcw_step(&mut app, &mut rtcw_dec_on);
         sec!(4); // gps
         // LINK-38: a redraw for live changes alone at most every FRAME_MIN_MS. During a scan the Radio task reports
         // every step and each scan page redraw is ~14 KB (12-17 ms): back to back they left the Link task (same
@@ -1199,6 +1201,9 @@ pub async fn task() {
         }
         if let Some(w) = app.rad950_next_wake_ms() {
             period = period.min(w as u64);
+        }
+        if app.rtcw_open() {
+            period = period.min(2);
         }
         if leds.next_ms != 0 {
             period = period.min(leds.next_ms as u64);
@@ -1966,5 +1971,108 @@ async fn rad950_step(
         crate::chan::RAD950_TX.signal(frame);
         let _ = crate::chan::RADIO.try_send(RadioCmd::TxPlan { tx: rf_freq, region, extend, confirmed: false });
         let _ = crate::chan::RADIO.try_send(RadioCmd::Rad950Tx { freq: rf_freq, power });
+    }
+}
+
+/// Drive RTCW ("Radtel CW") DSP decoder switching, raw `PF1`/`PF2` + passive K1 jack paddle
+/// polling, iambic keyer ticks, `DAC1` sidetone, and semi-break-in `DAC2`-shaped BK4829 TX.
+fn rtcw_step(app: &mut App, dec_on: &mut bool) {
+    use core::sync::atomic::{AtomicBool, AtomicU32, Ordering::Relaxed};
+    use ferrite_core::msg::{DecoderKind, DspCmd};
+    use ferrite_core::urtcw::PaddleSource;
+
+    static LAST_MS: AtomicU32 = AtomicU32::new(0);
+    static SIDETONE_ON: AtomicBool = AtomicBool::new(false);
+
+    let open = app.rtcw_open();
+    if open != *dec_on {
+        if open {
+            crate::hal::clock::AUDIO_RAISES.store(!app.settings().mcu_fixed, Relaxed);
+            if crate::hal::clock::is_low() && !crate::hal::audio::busy() {
+                crate::hal::clock::set_tree(crate::hal::clock::NORMAL);
+            }
+            LAST_MS.store(Instant::now().as_millis() as u32, Relaxed);
+        } else {
+            crate::chan::RTCW_KEY_DOWN.store(false, Relaxed);
+            if SIDETONE_ON.swap(false, Relaxed) {
+                crate::hal::tone::stop();
+            }
+        }
+        let cmd = if open {
+            DspCmd::Decoder(DecoderKind::Cw)
+        } else if app.aprs_on() {
+            DspCmd::Decoder(DecoderKind::Afsk)
+        } else {
+            DspCmd::Decoder(DecoderKind::Off)
+        };
+        if crate::chan::DSP.try_send(cmd).is_ok() {
+            *dec_on = open;
+        }
+    }
+    if !open {
+        return;
+    }
+
+    // Drain CW decoder meter & decoded characters from DSP.
+    if let Some(m) = crate::chan::RTCW_METER.try_take() {
+        app.rtcw.meter = m;
+    }
+    while let Ok(ch) = crate::chan::RTCW_RX_CHAR.try_receive() {
+        app.rtcw.push_rx_char(ch);
+    }
+
+    // Poll physical paddle pins directly (active-low):
+    // - Built-in pocket paddles: PF1 (`PE5` = KEY_DIRECT0) = Dit, PF2 (`PA12` = KEY_DIRECT1) = Dah
+    // - Passive Kenwood K1 jack: `PE6` (KEY_SIDE2 / K1 PTT) = Dit, `PC11` (UART4 RX) = Dah (in K1Jack/Auto)
+    app.rtcw.btn_dit = !crate::board::KEY_DIRECT0.read();
+    app.rtcw.btn_dah = !crate::board::KEY_DIRECT1.read();
+    let k1_dit = !crate::board::KEY_SIDE2.read();
+    let k1_dah = if app.rtcw.paddle_src == PaddleSource::K1Jack {
+        !crate::hal::gpio::pin(crate::hal::gpio::GPIOC, 11).read()
+    } else {
+        false
+    };
+    if app.rtcw.paddle_src != PaddleSource::Serial {
+        app.rtcw.ext_dit = k1_dit;
+        app.rtcw.ext_dah = k1_dah;
+    }
+
+    // Advance iambic keyer by exact elapsed milliseconds.
+    let now_ms = Instant::now().as_millis() as u32;
+    let prev = LAST_MS.swap(now_ms, Relaxed);
+    let dt = now_ms.wrapping_sub(prev).min(50) as u16;
+    if dt == 0 {
+        return;
+    }
+    let out = app.rtcw.tick_keyer(dt);
+
+    // Update lock-free RF key-down gate for Radio task's 4 ms DAC2 PA envelope ramp.
+    crate::chan::RTCW_KEY_DOWN.store(out.rf_key_down, Relaxed);
+
+    // Drive DAC1 sidetone oscillator (on key-down, muted on key-up).
+    let prev_tone = SIDETONE_ON.load(Relaxed);
+    if out.sidetone_on != prev_tone {
+        SIDETONE_ON.store(out.sidetone_on, Relaxed);
+        if out.sidetone_on {
+            crate::hal::tone::start(app.rtcw.pitch_hz as u32, 4);
+        } else {
+            crate::hal::tone::stop();
+        }
+    }
+
+    // Semi-break-in TX hold transitions (latch/release BK4829 & band relay).
+    #[cfg(feature = "tx")]
+    if out.tx_hold != app.rtcw.tx_hold {
+        app.rtcw.tx_hold = out.tx_hold;
+        if out.tx_hold {
+            let rf_freq = app.rtcw.vfo.tx_freq10;
+            let power = app.rtcw.tx_power;
+            let region = app.settings().region;
+            let extend = app.settings().extend_tx;
+            let _ = crate::chan::RADIO.try_send(RadioCmd::TxPlan { tx: rf_freq, region, extend, confirmed: false });
+            let _ = crate::chan::RADIO.try_send(RadioCmd::RtcwTx { freq: rf_freq, power, on: true });
+        } else {
+            let _ = crate::chan::RADIO.try_send(RadioCmd::RtcwTx { freq: 0, power: 0, on: false });
+        }
     }
 }

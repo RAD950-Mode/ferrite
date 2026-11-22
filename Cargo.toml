@@ -34,6 +34,7 @@ udsp = { path = "digimodes/udsp" }
 udsc = { path = "digimodes/udsc" }
 uaprs = { path = "digimodes/uaprs", default-features = false }
 urad950 = { path = "../rad950/crates/urad950" }
+urtcw = { path = "../rtcw/crates/urtcw" }
 
 [profile.release]
 opt-level = "z"

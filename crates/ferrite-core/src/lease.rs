@@ -24,9 +24,11 @@ pub enum Held {
     Sat,
     /// RAD950 10 m weak-signal mode.
     Rad950,
+    /// RTCW (Radtel CW) mode.
+    Rtcw,
 }
 
-const HELD: [Held; 8] = [Held::Scope, Held::Counter, Held::Broadcast, Held::Hf, Held::Crossband, Held::ToneSearch, Held::Sat, Held::Rad950];
+const HELD: [Held; 9] = [Held::Scope, Held::Counter, Held::Broadcast, Held::Hf, Held::Crossband, Held::ToneSearch, Held::Sat, Held::Rad950, Held::Rtcw];
 
 impl Held {
     /// The command that stops it, as the UI would send it.
@@ -40,6 +42,7 @@ impl Held {
             Held::ToneSearch => RadioCmd::ToneSearch { slot: 0, on: false },
             Held::Sat => RadioCmd::SatRx(0),
             Held::Rad950 => RadioCmd::Rad950Rx { dial: 0, rx_corr_hz: 0, on: false },
+            Held::Rtcw => RadioCmd::RtcwRx { dial: 0, rx_corr_hz: 0, bw_500hz: true, on: false },
         }
     }
 }
@@ -92,6 +95,8 @@ impl Lease {
             RadioCmd::SatRx(_) => self.start(Held::Sat, now),
             RadioCmd::Rad950Rx { on: true, .. } => self.start(Held::Rad950, now),
             RadioCmd::Rad950Rx { on: false, .. } => self.stop(Held::Rad950),
+            RadioCmd::RtcwRx { on: true, .. } => self.start(Held::Rtcw, now),
+            RadioCmd::RtcwRx { on: false, .. } => self.stop(Held::Rtcw),
             // The input task's, not the UI's: no sign the UI is running.
             RadioCmd::Accessory(_) => {}
             _ => self.renew(now),

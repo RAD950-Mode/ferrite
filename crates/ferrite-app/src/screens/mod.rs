@@ -88,6 +88,7 @@ pub mod samecodes;
 pub mod autoreply;
 pub mod sat;
 pub mod rad950;
+pub mod rtcw;
 pub mod scan;
 pub mod scanlists;
 pub mod scope;
@@ -182,6 +183,8 @@ pub enum Screen {
     Sat(sat::SatScr),
     /// RAD950 10 m weak-signal mode (MENU 0 3 7).
     Rad950(rad950::Rad950Scr),
+    /// RTCW ("Radtel CW") HF CW transceiver mode (MENU 0 3 8).
+    Rtcw(rtcw::RtcwScr),
 }
 
 /// Runs `$e` with `$s` bound to the screen's state: the one place that lists every variant.
@@ -243,6 +246,7 @@ macro_rules! each {
             Screen::Dtmf($s) => $e,
             Screen::Sat($s) => $e,
             Screen::Rad950($s) => $e,
+            Screen::Rtcw($s) => $e,
         }
     };
 }

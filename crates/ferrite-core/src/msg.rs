@@ -163,6 +163,11 @@ pub enum RadioCmd {
     Rad950Tx { freq: Freq10, power: u8 },
     /// Abort any active RAD950 transmission cleanly and return to SI4732 RX.
     Rad950Abort,
+    /// RTCW (Radtel CW) receive mode: enter/retune SI4732 USB at `dial` with `bw_500hz` (500 Hz vs 1.0 kHz filter),
+    /// signed BFO offset `rx_corr_hz`, or leave (`on = false`).
+    RtcwRx { dial: Freq10, rx_corr_hz: i16, bw_500hz: bool, on: bool },
+    /// RTCW semi-break-in TX hold: latch BK4829 on `freq` at `power` (`on = true`) or release back to SI4732 RX (`on = false`).
+    RtcwTx { freq: Freq10, power: u8, on: bool },
     /// A short tone from the BK4829's tone generator to the speaker (SND-11), e.g. a key refused at a limit
     /// (TEXT-5).
     Beep { hz: u16, ms: u16 },
@@ -335,6 +340,7 @@ pub enum DecoderKind {
     Rad950,
     Rad950_60,
     Wwv,
+    Cw,
 }
 
 /// Who announced it.
@@ -859,6 +865,8 @@ pub enum ModeLive {
     Sat { rssi: i16, open: bool },
     /// RAD950 10 m digital mode: SI4732 RX readiness, active BK4829 PLL TX, signal level (dBm), and SSB patch load (255 = ready).
     Rad950 { rx_ready: bool, tx_active: bool, rssi: i16, loading: u8 },
+    /// RTCW (Radtel CW) mode: SI4732 RX readiness, semi-break-in TX hold, signal level (dBm), and SSB patch load (255 = ready).
+    Rtcw { rx_ready: bool, tx_active: bool, rssi: i16, loading: u8 },
 }
 
 /// The SI4732's receive settings from the UI (BCR-32, HF-35; decision 292), packed to keep [`RadioCmd`] small.

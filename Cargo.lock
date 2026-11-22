@@ -430,6 +430,7 @@ dependencies = [
  "udsp",
  "upocsag",
  "urad950",
+ "urtcw",
 ]
 
 [[package]]
@@ -1395,6 +1396,10 @@ version = "0.1.1"
 
 [[package]]
 name = "uradio-bus"
+version = "0.1.0"
+
+[[package]]
+name = "urtcw"
 version = "0.1.0"
 
 [[package]]

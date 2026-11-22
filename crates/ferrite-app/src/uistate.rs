@@ -340,6 +340,7 @@ fn keyed_remote_mode(app: &App, live: &LiveAll, l: &mut Line) {
         Mode::Xb => b"xb",
         Mode::Sat => b"sat",
         Mode::Rad950 => b"rad950",
+        Mode::Rtcw => b"rtcw",
     });
 }
 
@@ -841,6 +842,23 @@ fn body<S: ChannelStore>(app: &App, cx: &Cx<S>, d: &mut Desc) {
                     let gs = core::str::from_utf8(&gb).unwrap_or("----");
                     let _ = ufmt::uwrite!(pl, "rad950_peer {} {} {}dB", cs, gs, r.snr_db);
                 }
+            }
+        }
+        Screen::Rtcw(_) => {
+            let r = &app.rtcw;
+            if let Some(l) = d.ln() {
+                let _ = ufmt::uwrite!(
+                    l,
+                    "rtcw freq10={} wpm={} prac={} bw500={} tx={} key={} rx_wpm={} tune={}",
+                    r.vfo.tx_freq10,
+                    r.keyer.cfg.wpm,
+                    r.keyer.cfg.practice as u8,
+                    r.bw_500hz as u8,
+                    r.tx_hold as u8,
+                    r.rf_key_down as u8,
+                    r.meter.wpm_est,
+                    r.meter.tune_err
+                );
             }
         }
         Screen::Pin(p) => {
@@ -1491,6 +1509,7 @@ pub fn id(s: Screen) -> &'static str {
         Screen::Dtmf(_) => "Dtmf",
         Screen::Sat(s) => screens::sat::page_id(&s),
         Screen::Rad950(s) => screens::rad950::page_id(&s),
+        Screen::Rtcw(_) => "rtcw",
     }
 }
 

@@ -11,6 +11,7 @@ use upocsag::Receiver as Pocsag;
 use urad950::Receiver as Rad950;
 use urad950::CompactReceiver60 as Rad950_60;
 use crate::wwv::{WwvReceiver, WwvStatus};
+use urtcw::{CwDecoder, CwMeter};
 
 /// Audio rate the DSP task feeds the decoders.
 pub const RATE_HZ: u32 = 24_000;
@@ -26,6 +27,7 @@ union DecoderInner {
     rad950: ManuallyDrop<Rad950>,
     rad950_60: ManuallyDrop<Rad950_60>,
     wwv: ManuallyDrop<WwvReceiver>,
+    cw: ManuallyDrop<CwDecoder>,
 }
 
 /// Shared decoder slot: holds one active decoder at a time inside a single `<= 13 KB` union,
@@ -46,6 +48,7 @@ pub enum Found<'a> {
     Page(&'a upocsag::Message<'a>),
     Call(&'a udsc::Call<'a>),
     Wwv(WwvStatus),
+    Cw { ch: Option<u8>, meter: CwMeter },
 }
 
 impl Decoder {
@@ -133,6 +136,12 @@ impl Decoder {
                     core::ptr::addr_of_mut!(self.inner.wwv).write(ManuallyDrop::new(WwvReceiver::new()));
                 }
                 self.kind = DecoderKind::Wwv;
+            }
+            DecoderKind::Cw => {
+                unsafe {
+                    core::ptr::addr_of_mut!(self.inner.cw).write(ManuallyDrop::new(CwDecoder::new(700)));
+                }
+                self.kind = DecoderKind::Cw;
             }
         }
     }
@@ -259,6 +268,25 @@ impl Decoder {
                 let d = unsafe { &mut *self.inner.wwv };
                 if let Some(st) = d.feed(block) {
                     found(Found::Wwv(st));
+                }
+            }
+            DecoderKind::Cw => {
+                let d = unsafe { &mut *self.inner.cw };
+                let mut chars = [0u8; 8];
+                let mut n = 0usize;
+                d.feed(block, |ch| {
+                    if n < chars.len() {
+                        chars[n] = ch;
+                        n += 1;
+                    }
+                });
+                let meter = d.meter;
+                if n == 0 {
+                    found(Found::Cw { ch: None, meter });
+                } else {
+                    for &ch in &chars[..n] {
+                        found(Found::Cw { ch: Some(ch), meter });
+                    }
                 }
             }
         }

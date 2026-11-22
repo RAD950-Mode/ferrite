@@ -179,6 +179,11 @@ impl Radio {
             #[cfg(not(feature = "tx"))]
             RadioCmd::Rad950Tx { .. } => {}
             RadioCmd::Rad950Abort => self.rad950_abort().await,
+            RadioCmd::RtcwRx { dial, rx_corr_hz, bw_500hz, on } => self.rtcw_rx(dial, rx_corr_hz, bw_500hz, on).await,
+            #[cfg(feature = "tx")]
+            RadioCmd::RtcwTx { freq, power, on } => self.rtcw_tx(freq, power, on).await,
+            #[cfg(not(feature = "tx"))]
+            RadioCmd::RtcwTx { .. } => {}
             RadioCmd::SiOpts(o) => {
                 // BCR-32, HF-35: kept for the next power-up, and applied now if the SI4732 runs
                 if o != self.si_opts {

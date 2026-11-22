@@ -110,6 +110,8 @@ pub enum Dest {
     Satellites,
     /// RAD950 10 m weak-signal mode (MENU 0 3 7).
     Rad950,
+    /// RTCW ("Radtel CW") HF CW transceiver mode (MENU 0 3 8).
+    Rtcw,
     /// B15: frequency counter (MENU 0 3 2).
     Counter,
     /// B17: an alert (SAME, DSC distress).
@@ -229,6 +231,7 @@ impl Dest {
             ToneSearch => ("Tone search", "22", "B14"),
             Satellites => ("Satellites", "28a", "B22"),
             Rad950 => ("RAD950", "20b", "B25"),
+            Rtcw => ("RTCW", "20c", "B26"),
             Counter => ("Frequency counter", "22", "B15"),
             Alert => ("Alert", "23", "B17"),
             Crossband => ("Crossband repeater", "19", "B18"),
@@ -321,7 +324,7 @@ pub const ALL: [Dest; 69] = {
 
 /// MENU 0 paths that open a screen or a third-level list (manual Appendix A). Every other path
 /// is a plain value, edited in its group's list.
-pub const MENU0: [(&[u8], Dest); 55] = [
+pub const MENU0: [(&[u8], Dest); 56] = [
     (&[1, 6], Dest::Sub(1, 6)),
     (&[1, 4], Dest::RangePresets),
     (&[1, 5], Dest::SkipList),
@@ -337,6 +340,7 @@ pub const MENU0: [(&[u8], Dest); 55] = [
     (&[3, 5], Dest::ToneSearch),
     (&[3, 6], Dest::Satellites), // SAT-1
     (&[3, 7], Dest::Rad950),
+    (&[3, 8], Dest::Rtcw),
     (&[4, 1], Dest::EventLog),
     (&[4, 2], Dest::Sub(4, 2)),
     (&[4, 5], Dest::Sub(4, 5)),
@@ -471,6 +475,7 @@ pub fn enter(dest: Dest, app: &mut App) -> Screen {
         Dest::HfMode => hf::open(app),
         Dest::Satellites => sat::open(app),
         Dest::Rad950 => rad950::open(app),
+        Dest::Rtcw => rtcw::open(app),
         Dest::Alert => Screen::Alert(super::alert::Alert { silenced: false }),
         // Every destination has its own screen now; a new one shows the placeholder until it is built.
         #[allow(unreachable_patterns)]

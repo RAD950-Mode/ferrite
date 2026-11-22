@@ -44,7 +44,7 @@ pub const PAGE_OPERATE_MENU: u8 = 14;
 pub const PAGE_RENDEZVOUS: u8 = 15;
 pub const PAGE_WWV_SYNC: u8 = 16;
 
-const OPERATE_ROWS: usize = 4;
+const OPERATE_ROWS: usize = 3;
 const LOG_ROWS: usize = 6;
 const SETUP_ROWS: usize = 16;
 const SETUP_VISIBLE: usize = 8;
@@ -950,8 +950,23 @@ impl Rad950Scr {
             });
         }
 
-        let list_y = TOP_Y + 46;
-        let row_h = 34;
+        // 1. Desktop-style vertical panafall (spectrum + downward-scrolling waterfall) right below header.
+        self.draw_panafall(app, lcd);
+
+        // 2. Band Activity pane header (`y = 144..158`) + 3 heard peer rows (`y = 158..227`).
+        let ba_h = Mix::new().n(n_rows as u32).n(dial).get();
+        if app.dirty(R_HELP, ba_h) {
+            let y = 144i32;
+            redraw_box!(true, lcd, (0, y, W, 14, 0x18E5), {
+                lcd.text4(6, y + 11, b"BAND ACTIVITY", &UI_12, CYAN, 0x18E5);
+                let mut rb = Buf::<10>::new();
+                let _ = uwrite!(rb, "RX:{}", n_rows);
+                lcd.text4(W - 42, y + 11, rb.as_bytes(), &UI_12, DIM, 0x18E5);
+            });
+        }
+
+        let list_y = 158i32;
+        let row_h = 23i32;
         for i in 0..OPERATE_ROWS {
             let idx = self.top as usize + i;
             let selected = idx == self.sel as usize && idx < n_rows;
@@ -994,8 +1009,7 @@ impl Rad950Scr {
                         let gb = decode_grid4(r.grid4).unwrap_or(*b"----");
                         let gs = core::str::from_utf8(&gb).unwrap_or("----");
 
-                        // 16x16 icon: green checkmark (worked), gold star (new grid), cyan plus (new band grid)
-                        draw_peer_icon(lcd, 8, y + 9, st, selected);
+                        draw_peer_icon(lcd, 6, y + 4, st, selected);
 
                         let call_col = if selected {
                             BLUE_FG
@@ -1015,10 +1029,9 @@ impl Rad950Scr {
                                 GridAward::None => DIM,
                             }
                         };
-                        lcd.text4(30, y + 22, call_disp.as_bytes(), &UI_14, call_col, bg);
-                        lcd.text4(104, y + 22, gs.as_bytes(), &UI_14, grid_col, bg);
+                        lcd.text4(26, y + 17, call_disp.as_bytes(), &UI_14, call_col, bg);
+                        lcd.text4(104, y + 17, gs.as_bytes(), &UI_12, grid_col, bg);
 
-                        // Compact badge tag (NEW / BND / WKD* / WKD+ / WKD)
                         let (tag, tcol): (&[u8], u16) = if st.worked {
                             match st.award {
                                 GridAward::NewGrid => (b"WKD*", if selected { BLUE_FG } else { AMBER }),
@@ -1033,24 +1046,107 @@ impl Rad950Scr {
                             }
                         };
                         if !tag.is_empty() {
-                            lcd.text4(150, y + 22, tag, &UI_12B, tcol, bg);
+                            lcd.text4(148, y + 17, tag, &UI_12B, tcol, bg);
                         }
 
                         let mut right = Buf::<12>::new();
                         let _ = uwrite!(right, "{}dB", r.snr_db);
-                        lcd.text4(W - 44, y + 22, right.as_bytes(), &UI_12, dim, bg);
+                        lcd.text4(W - 42, y + 17, right.as_bytes(), &UI_12, dim, bg);
                     } else if i == 0 && n_rows == 0 {
                         let mut empty = Buf::<28>::new();
                         let _ = uwrite!(empty, "Listening on {} USB...", band_label(dial));
-                        lcd.text4(8, y + 22, empty.as_bytes(), &UI_12, DIM, BG);
+                        lcd.text4(8, y + 16, empty.as_bytes(), &UI_12, DIM, BG);
                     }
                 });
             }
         }
-        self.draw_panafall(app, lcd);
+
+        // 3. My Activity pane (`y = 228..282`): operating status + last logged QSO.
+        let (qso_count, op_mode, target_raw, notice_buf, notice_len, last_qso) =
+            if let Some(h) = app.rad950_host() {
+                (
+                    h.store.count(),
+                    h.engine.mode(),
+                    h.target_peer.map_or(0, |p| p.raw()),
+                    h.notice,
+                    h.notice_len as usize,
+                    h.last_qso,
+                )
+            } else {
+                (0, OpMode::Monitor, 0, [0; 28], 0, None)
+            };
+        let mode_tag: &[u8] = match op_mode {
+            OpMode::Monitor => b"MON",
+            OpMode::AutoCq { .. } => b"CQ",
+            OpMode::Pounce => b"QSO",
+        };
+        let my_h = Mix::new()
+            .n(qso_count as u32)
+            .b(mode_tag)
+            .n(target_raw)
+            .n(tx_now as u32)
+            .b(&notice_buf[..notice_len])
+            .n(last_qso.map_or(0, |q| q.peer.raw()))
+            .get();
+        if app.dirty(R_LINE, my_h) {
+            let y = 228i32;
+            redraw_box!(true, lcd, (0, y, W, 54, BG), {
+                lcd.fill(0, y, W, 14, 0x18E5);
+                lcd.text4(6, y + 11, b"MY ACTIVITY", &UI_12, AMBER, 0x18E5);
+                let mut mb = Buf::<18>::new();
+                let _ = uwrite!(
+                    mb,
+                    "QSO:{} {}",
+                    qso_count,
+                    core::str::from_utf8(mode_tag).unwrap_or("MON")
+                );
+                lcd.text4(W - 84, y + 11, mb.as_bytes(), &UI_12, if tx_now { RED } else { TEXT }, 0x18E5);
+
+                // Line 1: Active notice or current TX/CQ/Monitor state
+                if notice_len > 0 {
+                    lcd.text4(6, y + 30, &notice_buf[..notice_len], &UI_12, AMBER, BG);
+                } else {
+                    let mut st_line = Buf::<32>::new();
+                    match op_mode {
+                        OpMode::Monitor => {
+                            let _ = uwrite!(st_line, "Monitor {} USB (1=CQ)", band_label(dial));
+                        }
+                        OpMode::AutoCq { .. } => {
+                            let _ = uwrite!(st_line, "Calling CQ on {}", band_label(dial));
+                        }
+                        OpMode::Pounce => {
+                            if let Some(peer) = Callsign::from_raw(target_raw).filter(|_| target_raw != 0) {
+                                let mut cb = [0u8; 6];
+                                let cn = peer.decode(&mut cb);
+                                let cs = core::str::from_utf8(&cb[..cn]).unwrap_or("?");
+                                let _ = uwrite!(st_line, "Working {}", cs);
+                            } else {
+                                let _ = uwrite!(st_line, "Working QSO on {}", band_label(dial));
+                            }
+                        }
+                    }
+                    lcd.text4(6, y + 30, st_line.as_bytes(), &UI_12, if tx_now { AMBER } else { TEXT }, BG);
+                }
+
+                // Line 2: Most recent logged QSO or quick tip
+                if let Some(q) = last_qso {
+                    let mut cb = [0u8; 6];
+                    let cn = q.peer.decode(&mut cb);
+                    let cs = core::str::from_utf8(&cb[..cn]).unwrap_or("?");
+                    let gb = decode_grid4(q.peer_grid4).unwrap_or(*b"----");
+                    let gs = core::str::from_utf8(&gb).unwrap_or("----");
+                    let mut ql = Buf::<32>::new();
+                    let _ = uwrite!(ql, "Last: {} {} {}dB", cs, gs, q.rcvd_snr);
+                    lcd.text4(6, y + 48, ql.as_bytes(), &UI_12, GREEN, BG);
+                } else {
+                    lcd.text4(6, y + 48, b"Knob:Band  OK:Ans  #:Menu", &UI_12, DIM, BG);
+                }
+            });
+        }
     }
 
-    /// Scrolling right-to-left horizontal panafall of the `586..2,344 Hz` RAD950 grid (`224 x 48 px`) along the bottom.
+    /// Desktop-style vertical panafall (`216 x 76 px` across `586..2,344 Hz`):
+    /// live spectrum graph on top, frequency axis, and downward-scrolling waterfall below.
     #[inline(never)]
     fn draw_panafall(self, app: &mut App, lcd: &mut impl Panel) {
         const WF_PALETTE: [u16; 16] = [
@@ -1067,53 +1163,81 @@ impl Rad950Scr {
         let slot_sec = if h.utc_sec == 0 { 0 } else { (h.utc_sec % 10) as u8 };
         let wf_h = Mix::new().n(seq).n(slot_sec as u32).n(tx_now as u32).get();
         if app.dirty(R_NOTE, wf_h) {
-            let y0 = 210i32;
+            let y0 = TOP_Y + 43; // 67..143 (76 px tall)
             let wf_x = 12i32;
-            let wf_y = y0 + 18; // 228..276 (48 px tall)
-            let wf_w = (WF_COLS * 2) as i32; // 224 px (x = 12..236)
-            let wf_ht = (WF_ROWS * 2) as i32; // 48 px
-            redraw_box!(false, lcd, (0, y0, W, 70, BG), {
-                lcd.fill(0, y0, W, 1, RULE);
-                lcd.fill(0, y0 + 1, W, 17, BG);
-                lcd.text4(6, y0 + 14, b"586-2344 Hz  225Hz", &UI_12, DIM, BG);
-                if tx_now {
-                    draw_tx_flag(lcd, W - 74, y0 + 1);
+            const BIN_W: usize = 9; // 24 bins * 9 px = 216 px (x = 12..228)
+            const WF_W: usize = WF_ROWS * BIN_W; // 216 px
+            const SPEC_H: i32 = 22;
+            const AXIS_H: i32 = 12;
+            const WATER_H: usize = 40;
+            let spec_y = y0 + 1;
+            let axis_y = spec_y + SPEC_H;
+            let water_y = axis_y + AXIS_H;
+
+            // Draw spectrum graph + frequency axis in a banded box (zero flicker)
+            let mut spec_lvls = [0u8; WF_ROWS];
+            let newest_col = WF_COLS - 1;
+            let newest_tx = if let Some(host) = app.rad950_host() {
+                for b in 0..WF_ROWS {
+                    spec_lvls[b] = host.wf.level(newest_col, b);
                 }
+                host.wf.is_tx_col(newest_col)
+            } else {
+                false
+            };
+
+            redraw_box!(false, lcd, (0, y0, W, SPEC_H + AXIS_H + 1, BG), {
+                lcd.fill(0, y0, W, 1, RULE);
+                // Spectrum background & subtle vertical 225 Hz subchannel gridlines
+                lcd.fill(wf_x, spec_y, WF_W as i32, SPEC_H, 0x0002);
+                for ch in 1..8usize {
+                    let gx = wf_x + (ch * 3 * BIN_W) as i32;
+                    lcd.fill(gx, spec_y, 1, SPEC_H, 0x1082);
+                }
+                // Live spectrum bars + bright top peak cap
+                for (b, &lvl) in spec_lvls.iter().enumerate() {
+                    let bar_h = ((lvl as i32 * (SPEC_H - 2)) / 15).max(1);
+                    let bx = wf_x + (b * BIN_W) as i32;
+                    let by = spec_y + SPEC_H - bar_h;
+                    let fill_col = if newest_tx { 0xA000 } else { 0x12D4 };
+                    let cap_col = if newest_tx { AMBER } else { CYAN };
+                    lcd.fill(bx + 1, by, (BIN_W - 2) as i32, bar_h, fill_col);
+                    lcd.fill(bx + 1, by, (BIN_W - 2) as i32, 2.min(bar_h), cap_col);
+                }
+                // Frequency axis labels + slot countdown
+                lcd.fill(0, axis_y, W, AXIS_H, BG);
+                lcd.text4(wf_x, axis_y + 10, b"600", &UI_12, DIM, BG);
+                lcd.text4(wf_x + 58, axis_y + 10, b"1.2k", &UI_12, DIM, BG);
+                lcd.text4(wf_x + 116, axis_y + 10, b"1.8k", &UI_12, DIM, BG);
                 let mut tr = Buf::<8>::new();
                 let _ = uwrite!(tr, "T+{}s", slot_sec);
-                lcd.text4(W - 40, y0 + 14, tr.as_bytes(), &UI_12, if tx_now { RED } else { AMBER }, BG);
-
-                // Subtle 225 Hz grid channel ticks along the left margin (every 3 rows ~ 220 Hz).
-                for ch in 0..8i32 {
-                    let ty = wf_y + ch * 6;
-                    lcd.fill(4, ty, 6, 1, RULE);
-                }
-                lcd.fill(wf_x - 1, wf_y - 1, wf_w + 2, 1, RULE);
-                lcd.fill(wf_x - 1, wf_y + wf_ht, wf_w + 2, 1, RULE);
-                lcd.fill(wf_x - 1, wf_y, 1, wf_ht, RULE);
-                lcd.fill(wf_x + wf_w, wf_y, 1, wf_ht, RULE);
+                lcd.text4(W - 38, axis_y + 10, tr.as_bytes(), &UI_12, if tx_now { RED } else { AMBER }, BG);
             });
 
-            // Stream the 224 x 48 panafall in one SPI window (inclusive x1/y1; high freq at top, newest at right).
+            // Stream the 216 x 40 downward-scrolling waterfall in one SPI window (newest row at top!).
             if let Some(host) = app.rad950_host() {
-                lcd.window(wf_x, wf_y, wf_x + wf_w - 1, wf_y + wf_ht - 1);
-                let mut line = [0u16; WF_COLS * 2];
-                for r_top in 0..WF_ROWS {
-                    let bin = WF_ROWS - 1 - r_top;
-                    let is_grid_line = r_top % 3 == 0 && r_top > 0;
-                    for col in 0..WF_COLS {
+                lcd.window(wf_x, water_y, wf_x + WF_W as i32 - 1, water_y + WATER_H as i32 - 1);
+                let mut line = [0u16; WF_W];
+                for dy in 0..WATER_H {
+                    // Map top row (dy=0) to newest column (WF_COLS - 1), scrolling down in time.
+                    let col = WF_COLS - 1 - dy.min(WF_COLS - 1);
+                    let is_tx = host.wf.is_tx_col(col);
+                    let is_slot = host.wf.is_slot_mark(col);
+                    for bin in 0..WF_ROWS {
                         let lvl = host.wf.level(col, bin) as usize;
-                        let is_tx = host.wf.is_tx_col(col);
                         let mut px = if is_tx { TX_PALETTE[lvl & 15] } else { WF_PALETTE[lvl & 15] };
-                        if host.wf.is_slot_mark(col) && lvl < 4 {
-                            px = if is_tx { 0x6000 } else { 0x2945 }; // vertical 10 s slot divider
-                        } else if is_grid_line && lvl < 2 {
-                            px = if is_tx { 0x2800 } else { 0x1082 }; // faint 225 Hz channel guide
+                        if is_slot && lvl < 4 {
+                            px = if is_tx { 0x6000 } else { 0x2945 }; // horizontal 10 s slot divider
                         }
-                        line[col * 2] = px;
-                        line[col * 2 + 1] = px;
+                        let base = bin * BIN_W;
+                        for k in 0..BIN_W {
+                            line[base + k] = px;
+                        }
+                        // Faint vertical 225 Hz subchannel guide every 3 bins
+                        if bin > 0 && bin % 3 == 0 && lvl < 2 && !is_slot {
+                            line[base] = if is_tx { 0x2800 } else { 0x1082 };
+                        }
                     }
-                    lcd.push_buf(&line);
                     lcd.push_buf(&line);
                 }
             }

@@ -26,6 +26,8 @@ pub enum Mode {
     Sat,
     /// RAD950 10 m weak-signal mode: SI4732 USB RX + BK4829 PLL TX.
     Rad950,
+    /// RTCW ("Radtel CW") HF CW mode: SI4732 narrow SSB RX + BK4829 DAC2-shaped CW TX.
+    Rtcw,
 }
 
 /// One remembered hit: what (a frequency, or a tone word), when it was last heard and when that stop began
@@ -276,14 +278,15 @@ impl App {
                 Screen::Scope(_) => Mode::Scope,
                 Screen::ToneSearch(_) => Mode::Tone,
                 Screen::Counter(_) => Mode::Counter,
-                Screen::Hf(_) | Screen::Crossband(_) | Screen::Rad950(_) if self.low_power() => continue,
+                Screen::Hf(_) | Screen::Crossband(_) | Screen::Rad950(_) | Screen::Rtcw(_) if self.low_power() => continue,
                 Screen::Hf(_) => Mode::Hf,
                 Screen::Sat(_) => Mode::Sat,
                 Screen::Rad950(_) => Mode::Rad950,
+                Screen::Rtcw(_) => Mode::Rtcw,
                 Screen::Crossband(_) if self.radio.xb_on => Mode::Xb,
                 _ => continue,
             };
-            return if keyed && !matches!(m, Mode::Hf | Mode::Xb | Mode::Sat | Mode::Rad950) { Mode::Off } else { m };
+            return if keyed && !matches!(m, Mode::Hf | Mode::Xb | Mode::Sat | Mode::Rad950 | Mode::Rtcw) { Mode::Off } else { m };
         }
         if keyed || self.low_power() {
             return Mode::Off; // TX-24: the broadcast stops before the key-up and starts again after; PWR-24.4
@@ -370,6 +373,7 @@ impl App {
             Mode::Hf => super::hf::send(self),
             Mode::Sat => self.sat_start(),
             Mode::Rad950 => self.rad950_start(),
+            Mode::Rtcw => self.rtcw_start(),
             Mode::Xb => {
                 super::xb::send_start(self);
                 self.radio.xb_log = Some(super::xb::XbLog { on: true, by: self.radio.xb_by, why: 0 }); // XB-20.6
@@ -397,6 +401,7 @@ impl App {
             Mode::Hf => self.out.push(RadioCmd::Hf { freq: self.set.hf.freq, mode: self.set.hf.mode, on: false }),
             Mode::Sat => self.out.push(RadioCmd::SatRx(0)),
             Mode::Rad950 => self.rad950_stop(),
+            Mode::Rtcw => self.rtcw_stop(),
             Mode::Xb => {
                 self.out.push(RadioCmd::Crossband(None));
                 if self.radio.xb_by & super::xb::LISTEN != 0 {

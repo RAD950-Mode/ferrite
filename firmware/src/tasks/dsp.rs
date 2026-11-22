@@ -450,6 +450,12 @@ fn feed(slot: &mut Decoder, x: &[i16], level: u16, heard: &mut bool, since_cap: 
         Found::Wwv(st) => {
             crate::chan::WWV_STATUS.signal(st);
         }
+        Found::Cw { ch, meter } => {
+            crate::chan::RTCW_METER.signal(meter);
+            if let Some(c) = ch {
+                let _ = crate::chan::RTCW_RX_CHAR.try_send(c);
+            }
+        }
     });
     let at = since_cap.map(|s| s * 1_000 / ferrite_core::decoders::RATE_HZ);
     if let Some(s) = since_cap {
