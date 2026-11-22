@@ -210,6 +210,9 @@ pub mod msg {
     /// Cooperative RX result for the just-finished RAD950 slot. Empty request, versioned fixed-width response.
     /// This carries decoded frames and one failed-CRC soft candidate to a local host over cable or Bluetooth.
     pub const COOP_RX: u8 = 0x64;
+    /// Immediate RAD950 4-FSK transmit over the cable: `rf_freq_10hz (u32 LE)` + `power (u8: 0..=2, 0xFF = radio default)`
+    /// + 28 bytes of packed 2-bit tones (110 symbols, LSB-first). Requires RAD950 mode open and TX build.
+    pub const RAD950_TX: u8 = 0x65;
 }
 
 /// `DATA_READ` and `DATA_WRITE` (LINK-59 – LINK-62, decision 333): their ops and limits. Both refuse calibration

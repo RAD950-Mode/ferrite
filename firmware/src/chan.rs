@@ -55,9 +55,9 @@ pub static RAD950_SOFT: Signal<M, ferrite_core::rad950::urad950::SoftCandidate> 
 /// A complete RAD950 receive slot, kept together so an external Cooperative RX host never joins a candidate to
 /// decoded frames from another UTC slot.
 pub static RAD950_COOP: Signal<M, ferrite_core::rad950::CoopRxReport> = Signal::new();
-/// RAD950 frame staged by the UI task before sending `RadioCmd::Rad950Tx` (keeps `RadioCmd <= 8 B`).
+/// RAD950 110-symbol tone burst staged by the UI task before sending `RadioCmd::Rad950Tx` (keeps `RadioCmd <= 8 B`).
 #[cfg(feature = "tx")]
-pub static RAD950_TX: Signal<M, ferrite_core::rad950::urad950::Frame> = Signal::new();
+pub static RAD950_TX: Signal<M, [u8; ferrite_core::rad950::urad950::N_SYMBOLS]> = Signal::new();
 /// RAD950 transmit completion from the Radio task to the UI task (`true` = all 110 symbols sent, `false` = aborted/refused).
 #[cfg(feature = "tx")]
 pub static RAD950_TX_DONE: Signal<M, bool> = Signal::new();

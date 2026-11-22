@@ -145,9 +145,9 @@ impl Radio {
 
 #[cfg(feature = "tx")]
 impl Radio {
-    /// Transmit the staged `chan::RAD950_TX` frame on 10 m (`freq`, `power`) via direct BK4829 PLL stepping.
+    /// Transmit the staged `chan::RAD950_TX` tones (`freq`, `power`) via direct BK4829 PLL stepping.
     pub(super) async fn rad950_tx(&mut self, freq: Freq10, power: u8) {
-        let Some(frame) = crate::chan::RAD950_TX.try_take() else {
+        let Some(tones) = crate::chan::RAD950_TX.try_take() else {
             crate::chan::RAD950_TX_DONE.signal(false);
             crate::chan::TERM_WAKE.signal(());
             return;
@@ -273,7 +273,6 @@ impl Radio {
         if let Some(r) = self.rad950.as_mut() {
             r.tx_active = true;
         }
-        let tones = ferrite_core::rad950::urad950::encode_tones(frame);
         self.rad950_live_start(n, tones);
         self.rad950_poll();
     }
@@ -309,6 +308,9 @@ impl Radio {
         let mut st = Steps::default();
         let _ = self.path.rx(Rx::Si, Cause::HfReceiver, now_ms() as u32, &mut st);
         self.run(&st).await;
+        // `Act::SiInput(false)` during TX cleared `PA7/PC5` to `1/0`; `Act::SiInput(true)` does not
+        // write `SI_IN` (`run.rs` assumes the mode sets it), so restore `PA7=PC5=1` (SW/SSB LNA path)!
+        si_input(SiMode::Ssb);
         let _ = self.si.mute(false, &mut BusyDelay);
     }
 }

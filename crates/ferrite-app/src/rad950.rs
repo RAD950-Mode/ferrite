@@ -1052,6 +1052,8 @@ pub struct Rad950Host {
     pub tx_in_flight: bool,
     /// Next frame staged by `Engine::on_slot_start` for the platform to hand to `RAD950_TX` + `RadioCmd::Rad950Tx`.
     pub pending_tx: Option<(Freq10, u8, Frame)>,
+    /// Immediate 110-symbol tone burst staged over the USB cable (`msg::RAD950_TX`) by `rad950-node --backend rt950`.
+    pub pending_link_tx: Option<(Freq10, u8, [u8; ferrite_core::rad950::urad950::N_SYMBOLS])>,
     /// True when the platform should send `DspCmd::Rad950Finish` at the end of the active RX slot.
     pub finish_due: bool,
     /// True when the platform should send `DspCmd::Rad950Reset` to clear muted TX-slot samples before RX.
@@ -1151,6 +1153,7 @@ impl Rad950Host {
             tx_slot: u32::MAX,
             tx_in_flight: false,
             pending_tx: None,
+            pending_link_tx: None,
             finish_due: false,
             reset_due: false,
             subslot_due: false,
@@ -1680,6 +1683,20 @@ impl App {
         let tx = h.pending_tx.take()?;
         h.tx_in_flight = true;
         Some(tx)
+    }
+
+    /// Take any pending TX burst (either immediate cable `msg::RAD950_TX` tones or slot-scheduled `Frame`)
+    /// as ready-to-key `(rf_freq, power, tones)`.
+    pub fn rad950_take_tx_tones(&mut self) -> Option<(Freq10, u8, [u8; ferrite_core::rad950::urad950::N_SYMBOLS])> {
+        let h = self.rad950d.as_deref_mut()?;
+        if let Some((rf_freq, power, tones)) = h.pending_link_tx.take() {
+            h.tx_in_flight = true;
+            h.tx_tones = tones;
+            return Some((rf_freq, power, tones));
+        }
+        let (rf_freq, power, frame) = h.pending_tx.take()?;
+        h.tx_in_flight = true;
+        Some((rf_freq, power, ferrite_core::rad950::urad950::encode_tones(frame)))
     }
 
     /// Take the `DspCmd::Rad950Finish` trigger at the end of a 10 s RX slot, preserving the slot identity for

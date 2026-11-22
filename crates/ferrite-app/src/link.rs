@@ -543,6 +543,8 @@ impl Session {
             }
             msg::CLOCK => clock(app, p, &mut o), // LINK-65
             msg::COOP_RX => coop_rx(app, p, &mut o),
+            msg::RAD950_TX if self.by != crate::remote::BY_CABLE => Status::Refused,
+            msg::RAD950_TX => rad950_tx_link(app, p),
             // LINK-60: raw writes from the cable only, not while the other port writes
             msg::DATA_WRITE if self.by != crate::remote::BY_CABLE => Status::Refused,
             msg::DATA_WRITE if self.other_writing => Status::Busy,
@@ -1021,6 +1023,30 @@ fn coop_rx(app: &App, p: &[u8], o: &mut Out) -> Status {
         o.put(&soft.sync_score.to_le_bytes());
         o.put(&soft.llrs_4bit);
     }
+    Status::Ok
+}
+
+/// `RAD950_TX` (`0x65`, cable-only): stage an immediate 110-symbol RAD950 4-FSK burst from a USB-connected
+/// `rad950-node --backend rt950` host. Payload: `rf_freq_10hz: u32 LE` + `power: u8` (`0..=2`, `0xFF` = radio
+/// default) + 28 bytes of packed 2-bit tones (LSB-first, 110 symbols).
+fn rad950_tx_link(app: &mut App, p: &[u8]) -> Status {
+    const PACKED_TONES: usize = ferrite_core::rad950::urad950::N_SYMBOLS.div_ceil(4); // 28 bytes
+    if p.len() != 5 + PACKED_TONES {
+        return Status::BadArg;
+    }
+    let Some(h) = app.rad950_host_mut() else {
+        return Status::Invalid;
+    };
+    if h.tx_in_flight || h.pending_link_tx.is_some() {
+        return Status::Busy;
+    }
+    let rf_freq = u32::from_le_bytes([p[0], p[1], p[2], p[3]]);
+    let power = if p[4] == 0xFF { h.profile.tx_power } else { p[4].min(2) };
+    let mut tones = [0u8; ferrite_core::rad950::urad950::N_SYMBOLS];
+    for (i, t) in tones.iter_mut().enumerate() {
+        *t = (p[5 + (i >> 2)] >> ((i & 3) * 2)) & 0x03;
+    }
+    h.pending_link_tx = Some((rf_freq, power, tones));
     Status::Ok
 }
 

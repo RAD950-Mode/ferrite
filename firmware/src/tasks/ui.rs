@@ -1965,10 +1965,10 @@ async fn rad950_step(
     }
 
     #[cfg(feature = "tx")]
-    if let Some((rf_freq, power, frame)) = app.rad950_take_tx() {
+    if let Some((rf_freq, power, tones)) = app.rad950_take_tx_tones() {
         let region = app.settings().region;
         let extend = app.settings().extend_tx;
-        crate::chan::RAD950_TX.signal(frame);
+        crate::chan::RAD950_TX.signal(tones);
         let _ = crate::chan::RADIO.try_send(RadioCmd::TxPlan { tx: rf_freq, region, extend, confirmed: false });
         let _ = crate::chan::RADIO.try_send(RadioCmd::Rad950Tx { freq: rf_freq, power });
     }

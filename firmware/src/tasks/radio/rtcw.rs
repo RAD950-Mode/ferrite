@@ -299,6 +299,8 @@ impl Radio {
         let mut s = Steps::default();
         let _ = self.path.rx(Rx::Si, Cause::HfReceiver, now_ms() as u32, &mut s);
         self.run(&s).await;
+        // Restore `PA7=PC5=1` (SI4732 SW/SSB LNA path) cleared to `1/0` by `Act::SiInput(false)` during TX.
+        si_input(SiMode::Ssb);
         let _ = self.si_ssb_rtcw(run.dial, run.rx_corr_hz, run.bw_500hz).await;
         speaker(true);
     }
