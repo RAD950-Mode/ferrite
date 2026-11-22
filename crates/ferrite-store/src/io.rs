@@ -32,7 +32,7 @@ pub struct Flash<N: Nor> {
 }
 
 impl<N: Nor> Flash<N> {
-    pub fn new(nor: N) -> Self {
+    pub const fn new(nor: N) -> Self {
         Flash { nor: RefCell::new(nor), redirect: Cell::new(None), scratch: Cell::new(0), pending: Cell::new(None), pend: RefCell::new([0xFF; PEND_MAX]), stale: Cell::new(u128::MAX) }
     }
 

@@ -236,7 +236,7 @@ pub struct FlashStore<N: Nor, D: Data> {
 
 impl<N: Nor, D: Data> FlashStore<N, D> {
     /// The store on `nor`, not mounted yet ([`FlashStore::mount_async`]).
-    pub fn new(nor: N, extra: D) -> Self {
+    pub const fn new(nor: N, extra: D) -> Self {
         FlashStore {
             f: Flash::new(nor),
             extra,
@@ -280,7 +280,7 @@ impl<N: Nor, D: Data> FlashStore<N, D> {
             contacts: Contacts::new(CONTACTS.start),
             aprs: Cell::new(AprsCfg::DEFAULT),
             aprs_changed: Cell::new(None),
-            draft: Cell::new(Draft::default()),
+            draft: Cell::new(Draft { to: ferrite_ui::text::Buf::new(), text: ferrite_ui::text::Buf::new() }),
             time0: Cell::new(TIME0),
             now_ms: Cell::new(0),
             utc: Cell::new(false),

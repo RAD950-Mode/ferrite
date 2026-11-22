@@ -1488,15 +1488,14 @@ fn init_app(set: &'static mut ferrite_app::settings::Settings) -> &'static mut A
     unsafe { (*core::ptr::addr_of_mut!(APP)).write(App::new(set, store::last_alert())) }
 }
 
-/// Static storage for the RAD950 runtime host (initialized once at boot by `ui::task`).
+/// Static storage for the RAD950 runtime host (const-initialized in static RAM, 0 B stack frame).
 #[inline(never)]
 fn rad950_host() -> &'static mut ferrite_app::rad950::Rad950Host {
-    use core::mem::MaybeUninit;
     use core::sync::atomic::AtomicBool;
     static TAKEN: AtomicBool = AtomicBool::new(false);
-    static mut HOST: MaybeUninit<ferrite_app::rad950::Rad950Host> = MaybeUninit::uninit();
+    static mut HOST: ferrite_app::rad950::Rad950Host = ferrite_app::rad950::Rad950Host::new();
     assert!(!TAKEN.swap(true, Relaxed));
-    unsafe { (*core::ptr::addr_of_mut!(HOST)).write(ferrite_app::rad950::Rad950Host::new()) }
+    unsafe { &mut *core::ptr::addr_of_mut!(HOST) }
 }
 
 /// Mount `RAD950_CFG` (A/B profile) and `RAD950_LOG` (64 KiB durable contact journal) at boot.

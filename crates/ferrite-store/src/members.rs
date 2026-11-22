@@ -44,7 +44,7 @@ impl Members {
 
     /// An empty list for `zone`, built as all zeros and then given its zone: copied from [`Members::EMPTY`] it was a
     /// 518-byte constant in slow flash (flash audit, Nov 1, 2026).
-    pub fn empty(zone: ZoneId) -> Members {
+    pub const fn empty(zone: ZoneId) -> Members {
         let mut m = Members { zone: 0, n: 0, over: false, nums: [0; ZONE_CAP as usize] };
         m.zone = zone;
         m

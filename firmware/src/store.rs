@@ -165,8 +165,13 @@ pub static WAKE: Signal<CriticalSectionRawMutex, ()> = Signal::new();
 
 /// Starts the flash and makes the store (not mounted yet: the caller awaits `mount_async`); the chip's JEDEC ID
 /// and size, or None when it didn't answer (the self-test's SPI flash check).
-#[inline(never)] // SBAR-23: the store is built on this frame's stack before it moves to its static
+#[inline(never)] // SBAR-23: const-initialized in static RAM without a ~10.5 KiB stack temporary
 pub fn make() -> (Option<(u32, u32)>, &'static Store) {
+    use core::sync::atomic::{AtomicBool, Ordering::Relaxed};
+    static TAKEN: AtomicBool = AtomicBool::new(false);
+    static mut STORE_MEM: Store = FlashStore::new(Chip { spi: None, size: 0, active: false }, RadioData::new());
+    assert!(!TAKEN.swap(true, Relaxed));
+
     let (spi, id) = match W25q::new(Flash::new(), &mut BusyDelay, WRITE_OK) {
         Ok(mut f) => {
             let id = (f.jedec_id(), f.size());
@@ -175,7 +180,12 @@ pub fn make() -> (Option<(u32, u32)>, &'static Store) {
         Err(_) => (None, None),
     };
     let size = id.map_or(0, |i| i.1);
-    let store: &'static Store = cortex_m::singleton!(: Store = FlashStore::new(Chip { spi, size, active: false }, RadioData::new())).unwrap();
+    let store: &'static Store = unsafe { &*core::ptr::addr_of!(STORE_MEM) };
+    {
+        let mut nor = store.nor();
+        nor.spi = spi;
+        nor.size = size;
+    }
     store.set_deferred(true);
     let _ = STORE.init(Shared(store));
     (id, store)

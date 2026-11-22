@@ -620,7 +620,7 @@ impl Rad950Profile {
         }
     }
 
-    pub fn dial(&self) -> Freq10 {
+    pub const fn dial(&self) -> Freq10 {
         RAD950_DIALS[self.dial_idx as usize % RAD950_DIALS.len()]
     }
 
@@ -871,10 +871,14 @@ impl Default for Rad950Host {
 }
 
 impl Rad950Host {
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         let profile = Rad950Profile::new();
+        let my_call = match Callsign::from_raw(0) {
+            Some(c) => c,
+            None => unreachable!(),
+        };
         let cfg = Config {
-            my_call: Callsign::from_raw(0).unwrap(),
+            my_call,
             my_suffix: 0,
             my_grid4: GRID_UNKNOWN,
             tx_pwr: 0,
