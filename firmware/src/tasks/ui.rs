@@ -168,7 +168,7 @@ fn read_calibration(store: &store::Store, flash: bool, cal_ok: bool, mcu_ok: boo
 
 /// SBAR-23: a future polled from a function never inlined, so its locals (a start-up step's buffers) live in that
 /// frame while it runs, not in the UI task's frame for the whole power-on.
-struct OwnFrame<F>(F);
+pub(crate) struct OwnFrame<F>(F);
 
 impl<F: core::future::Future> core::future::Future for OwnFrame<F> {
     type Output = F::Output;
@@ -179,7 +179,7 @@ impl<F: core::future::Future> core::future::Future for OwnFrame<F> {
     }
 }
 
-fn own_frame<F: core::future::Future>(f: F) -> OwnFrame<F> {
+pub(crate) fn own_frame<F: core::future::Future>(f: F) -> OwnFrame<F> {
     OwnFrame(f)
 }
 
@@ -216,11 +216,17 @@ static WAKES: [core::sync::atomic::AtomicU32; 4] = [const { core::sync::atomic::
 #[cfg(feature = "bench")]
 static UI_CYCLES: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
-#[embassy_executor::task]
-pub async fn task() {
-    ferrite_ui::prof::set_clock(crate::hal::time::cycles); // bench builds: the drawing profile
-    ferrite_ui::canvas::set_band_hook(crate::hal::clock::raise_for_audio); // decision 360
-    let mut lcd = Screen::new();
+struct BootOut {
+    flash: Option<(u32, u32)>,
+    store: &'static store::Store,
+    set: &'static mut ferrite_app::settings::Settings,
+    gauge: ferrite_core::txcal::Gauge,
+    ssb_ok: bool,
+    menu_held: bool,
+    key_seen: bool,
+}
+
+async fn boot_sequence(lcd: &mut Screen) -> BootOut {
     // Start-up as awaited steps (up to 150 ms each), then black, then the panel on.
     for &s in st7789::STARTUP {
         if let Some(ms) = lcd.0.step(s) {
@@ -348,14 +354,14 @@ pub async fn task() {
         let now = (boot::shows_card(&info), states);
         let ms = start.elapsed().as_millis() as u32;
         match shown {
-            Some((card_shown, _)) if card_shown == now.0 && shown != Some(now) => boot::update(&mut lcd, &info),
+            Some((card_shown, _)) if card_shown == now.0 && shown != Some(now) => boot::update(lcd, &info),
             Some(_) if shown == Some(now) => {}
-            _ if animating => boot::draw_at(&mut lcd, &info, ms),
-            _ => boot::draw(&mut lcd, &info),
+            _ if animating => boot::draw_at(lcd, &info, ms),
+            _ => boot::draw(lcd, &info),
         }
         // BOOT-18: the next frame (the last one, at ANIM_MS or after, is the still screen's logo and wordmark).
         if animating && shown.is_some() {
-            boot::frame(&mut lcd, &info, ms);
+            boot::frame(lcd, &info, ms);
             animating = ms < boot::ANIM_MS;
         }
         shown = Some(now);
@@ -388,7 +394,7 @@ pub async fn task() {
     }
     if checks.iter().any(|c| c.state == State::Fail) {
         // The failed check stays on screen until a key.
-        boot::draw(&mut lcd, &BootInfo { version: VERSION, callsign: set.boot_callsign(), line: set.boot_line(), owner: None, checks: &checks, note: None });
+        boot::draw(lcd, &BootInfo { version: VERSION, callsign: set.boot_callsign(), line: set.boot_line(), owner: None, checks: &checks, note: None });
         while !matches!(INPUT.receive().await, Input::Key(keypad::Event::Press(_))) {}
     }
 
@@ -415,7 +421,7 @@ pub async fn task() {
                     let failed = checks.iter().any(|c| c.state == State::Fail);
                     let owner = if failed { None } else { set.boot_owner() };
                     let note = Some(b"Installing SSB patch".as_slice());
-                    boot::update(&mut lcd, &BootInfo { version: VERSION, callsign: set.boot_callsign(), line: set.boot_line(), owner, checks: &checks, note });
+                    boot::update(lcd, &BootInfo { version: VERSION, callsign: set.boot_callsign(), line: set.boot_line(), owner, checks: &checks, note });
                     install.await
                 }
             };
@@ -439,6 +445,15 @@ pub async fn task() {
         // UPD-16: another layout's data, left alone for Console (the App shows D25 from its first tick)
         (false, ferrite_store::store::Mounted::Update(_)) => b"store: another layout's data: finish the update in Ferrite Console",
     });
+    BootOut { flash, store, set, gauge, ssb_ok, menu_held, key_seen }
+}
+
+#[embassy_executor::task]
+pub async fn task() {
+    ferrite_ui::prof::set_clock(crate::hal::time::cycles); // bench builds: the drawing profile
+    ferrite_ui::canvas::set_band_hook(crate::hal::clock::raise_for_audio); // decision 360
+    let mut lcd = Screen::new();
+    let BootOut { flash, store, set, gauge, ssb_ok, menu_held, key_seen } = own_frame(boot_sequence(&mut lcd)).await;
     // TERM-28: after the boot report the normal build logs only with Cable log on (0 9 9 5); the bring-up build
     // always. Either way the first byte from the PC ends it.
     let mut cable_log = cfg!(feature = "bringup") || set.cable_log;
@@ -490,7 +505,7 @@ pub async fn task() {
         }
     }
     // Radio-wide state for the status bar and Status page; GPS, battery and the link fill it in later.
-    let mut dev = Device { tx_built: cfg!(feature = "tx"), bench: cfg!(feature = "bench"), battery_pct: 100, ..Default::default() };
+    let UiState { dev, live, logged, gps } = init_ui_state();
     dev.ram_statics = crate::hal::sys::statics(); // SELF-9.2
     // SELF-9.1: the idle time counted by the thread executor's sleep, and when it was last read.
     let mut idle_mark = (crate::IDLE_US.load(Relaxed), Instant::now());
@@ -515,12 +530,9 @@ pub async fn task() {
         t.cal = if CHECK_STATE[CHECK_CAL as usize].load(Relaxed) == PASSED { ferrite_core::msg::CalState::Ok } else { ferrite_core::msg::CalState::Blank };
     }
     let mut live_rx = LIVE.receiver().unwrap();
-    let mut live = LiveAll::default();
     if let Some(l) = live_rx.try_get() {
-        live = l;
+        *live = l;
     }
-    // GPS (roadmap 5a): the fix into the store's GPS data, the status bar's GPS and clock, the arrival alarm.
-    let mut gps = crate::tasks::gps::GpsUi::new();
     // Key codes down (mapped ones only): the app is ticked often while any is held.
     let mut down = 0u32;
     #[cfg(feature = "bench")]
@@ -534,15 +546,13 @@ pub async fn task() {
     // ... and over Bluetooth (roadmap 3d): one terminal, held by one port at a time, and a link session on each
     // port (LINK-28). The link protocol on the cable (chapter 29) is trusted as the cable is (LINK-7); TERM-2
     // routes the bytes.
-    let mut ports = Ports::new();
+    let ports = init_ports();
     let fastest = ferrite_core::link::RATES.iter().copied().filter(|&r| crate::hal::uart::rate_ok(crate::report::UART_CPS, r)).max();
     ports.set_cable_max_baud(fastest.unwrap_or(115_200));
-    // Bring-up: the receiver on the cable log once a second while it changes.
-    let mut logged = (LiveAll::default(), Instant::now());
     // The APRS task (chapter 25): it feeds the App and the store, so it runs here.
-    let mut aprs = super::aprs::Aprs::new();
+    let aprs = init_aprs();
     // SAME and the pager decoder (roadmap 6b).
-    let mut decode = super::decode::Decode::new();
+    let decode = init_decode();
     // MODE-6: the command taken from the App that the Radio task's channel had no room for; it goes first.
     let mut held: Option<RadioCmd> = None;
     // LINK-38: when the screen was last drawn, and whether input since wants it drawn now.
@@ -781,7 +791,11 @@ pub async fn task() {
             // BACKUP-7 (decision 261): the way back to stock has the cable from here until it resets.
             if let Some(seq) = ports.take_restore() {
                 send_shutdown(&mut app, &mut held).await;
-                super::restore::run(store, &mut lcd, seq, app.settings().leds != 0).await; // DISP-30: LEDs per 0 7 6
+                store::wake(store);
+                while !store.idle() {
+                    Timer::after_millis(10).await;
+                }
+                super::restore::run(store, &mut lcd, seq, app.settings().leds != 0); // DISP-30: LEDs per 0 7 6
             }
             if ports.take_reboot() {
                 // LINK-24: the radio quiet, everything written (at most 3 s; 15 s after raw writes, whose queue
@@ -993,9 +1007,9 @@ pub async fn task() {
         }
         sec!(3); // radio cmds, store
         if house {
-            gps.step(&mut app, store, &mut dev); // PWR-26.15: fixes come once a second
+            gps.step(&mut app, store, dev); // PWR-26.15: fixes come once a second
         }
-        rad950_step(&mut app, store, &mut rad950_dec_on, &mut rad950_journal).await;
+        own_frame(rad950_step(&mut app, store, &mut rad950_dec_on, &mut rad950_journal)).await;
         sec!(4); // gps
         // LINK-38: a redraw for live changes alone at most every FRAME_MIN_MS. During a scan the Radio task reports
         // every step and each scan page redraw is ~14 KB (12-17 ms): back to back they left the Link task (same
@@ -1227,14 +1241,14 @@ pub async fn task() {
         let woke = loop {
             let wait = select(Timer::at(deadline), TERM_WAKE.wait());
             match select4(INPUT.receive(), live_rx.changed(), wait, ALERTS.ready_to_receive()).await {
-                Either4::Second(l) if l.levels_only(&live) => live = l,
+                Either4::Second(l) if l.levels_only(live) => *live = l,
                 w => break w,
             }
         };
         #[cfg(feature = "bench")]
         WAKES[match woke { Either4::First(_) => 0, Either4::Second(_) => 1, Either4::Third(_) => 2, Either4::Fourth(_) => 3 }].fetch_add(1, Relaxed);
         match woke {
-            Either4::Second(l) => live = l,
+            Either4::Second(l) => *live = l,
             // WX-4: a decoded SAME header opens the alert over any screen.
             Either4::Fourth(()) => {
                 urgent = true;
@@ -1486,6 +1500,62 @@ fn init_app(set: &'static mut ferrite_app::settings::Settings) -> &'static mut A
     static mut APP: MaybeUninit<App> = MaybeUninit::uninit();
     assert!(!TAKEN.swap(true, Relaxed));
     unsafe { (*core::ptr::addr_of_mut!(APP)).write(App::new(set, store::last_alert())) }
+}
+
+/// Static storage for `Ports`, `Aprs`, and `Decode` so their construction temporaries
+/// do not stay in `ui::task`'s steady-state poll stack frame.
+#[inline(never)]
+fn init_ports() -> &'static mut Ports {
+    use core::mem::MaybeUninit;
+    use core::sync::atomic::AtomicBool;
+    static TAKEN: AtomicBool = AtomicBool::new(false);
+    static mut PORTS: MaybeUninit<Ports> = MaybeUninit::uninit();
+    assert!(!TAKEN.swap(true, Relaxed));
+    unsafe { (*core::ptr::addr_of_mut!(PORTS)).write(Ports::new()) }
+}
+
+#[inline(never)]
+fn init_aprs() -> &'static mut super::aprs::Aprs {
+    use core::mem::MaybeUninit;
+    use core::sync::atomic::AtomicBool;
+    static TAKEN: AtomicBool = AtomicBool::new(false);
+    static mut APRS: MaybeUninit<super::aprs::Aprs> = MaybeUninit::uninit();
+    assert!(!TAKEN.swap(true, Relaxed));
+    unsafe { (*core::ptr::addr_of_mut!(APRS)).write(super::aprs::Aprs::new()) }
+}
+
+#[inline(never)]
+fn init_decode() -> &'static mut super::decode::Decode {
+    use core::mem::MaybeUninit;
+    use core::sync::atomic::AtomicBool;
+    static TAKEN: AtomicBool = AtomicBool::new(false);
+    static mut DECODE: MaybeUninit<super::decode::Decode> = MaybeUninit::uninit();
+    assert!(!TAKEN.swap(true, Relaxed));
+    unsafe { (*core::ptr::addr_of_mut!(DECODE)).write(super::decode::Decode::new()) }
+}
+
+struct UiState {
+    dev: Device,
+    live: LiveAll,
+    logged: (LiveAll, Instant),
+    gps: crate::tasks::gps::GpsUi,
+}
+
+#[inline(never)]
+fn init_ui_state() -> &'static mut UiState {
+    use core::mem::MaybeUninit;
+    use core::sync::atomic::AtomicBool;
+    static TAKEN: AtomicBool = AtomicBool::new(false);
+    static mut STATE: MaybeUninit<UiState> = MaybeUninit::uninit();
+    assert!(!TAKEN.swap(true, Relaxed));
+    unsafe {
+        (*core::ptr::addr_of_mut!(STATE)).write(UiState {
+            dev: Device { tx_built: cfg!(feature = "tx"), bench: cfg!(feature = "bench"), battery_pct: 100, ..Default::default() },
+            live: LiveAll::default(),
+            logged: (LiveAll::default(), Instant::now()),
+            gps: crate::tasks::gps::GpsUi::new(),
+        })
+    }
 }
 
 /// Static storage for the RAD950 runtime host (const-initialized in static RAM, 0 B stack frame).

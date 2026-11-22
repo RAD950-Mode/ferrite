@@ -1135,6 +1135,7 @@ impl App {
 
     // ---- inputs ----
 
+    #[inline(never)]
     pub fn key_down(&mut self, key: Key, now: u32, store: &impl ChannelStore) {
         self.tick_keys(now, store);
         // XB-20.5: a key (not PTT or SIDE1) stops a running crossband repeater, lit or dark, locked or not, and does
@@ -1209,6 +1210,7 @@ impl App {
         }
     }
 
+    #[inline(never)]
     pub fn key_up(&mut self, key: Key, now: u32, store: &impl ChannelStore) {
         self.tick_keys(now, store);
         self.lpm_combo_up(key);
@@ -1260,6 +1262,7 @@ impl App {
     }
 
     /// Time passes: long presses and repeats, toasts, undo, timeouts; and the latest snapshot.
+    #[inline(never)]
     pub fn tick(&mut self, now: u32, live: &LiveAll, store: &impl ChannelStore) {
         self.tick_keys(now, store);
         // Decision 333: the store keeps the member lists of the slots' zones (CHAN-36)

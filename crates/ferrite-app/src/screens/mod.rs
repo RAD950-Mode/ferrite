@@ -408,6 +408,7 @@ impl App {
     }
 
     /// Draws what changed since the last call: the status bar, the screen, then the hint bar or a toast.
+    #[inline(never)]
     pub fn render(&mut self, lcd: &mut impl Panel, live: &LiveAll, dev: &Device, store: &impl ChannelStore) {
         // LINK-19's readback counts the redraws that changed something (what was drawn, as the regions record it).
         let before = (self.drawn.screen, self.drawn.sbar, self.drawn.hash, self.drawn.meter, self.toast.is_some());

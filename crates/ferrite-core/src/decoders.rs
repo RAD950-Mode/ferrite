@@ -14,8 +14,8 @@ use urad950::CompactReceiver60 as Rad950_60;
 /// Audio rate the DSP task feeds the decoders.
 pub const RATE_HZ: u32 = 24_000;
 
-/// RAM the slot may take: FT8's or WSPR's footprint.
-pub const BUDGET: usize = 13 * 1024;
+/// RAM the slot may take: holds RAD950-60 dual-phase Layout B (`21,864 B`) alongside FT8/WSPR/APRS/POCSAG.
+pub const BUDGET: usize = 22 * 1024;
 
 union DecoderInner {
     off: (),

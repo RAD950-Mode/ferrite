@@ -85,9 +85,9 @@ const RECHECK_HALVES: u32 = 10_000 / HALF_MS;
 const PEAK_HALVES: u32 = 1_000 / HALF_MS;
 /// The miss log's level buckets (`lvl`), in capture halves: 64 ms each.
 const LVL_HALVES: u32 = 64 / HALF_MS;
-/// Decision 290: blocks waiting for room in `TERM_OUT`, at most this many (128 ms of 16 ms blocks, decision 330),
+/// Decision 290: blocks waiting for room in `TERM_OUT`, at most this many (64 ms of 16 ms blocks),
 /// each with what it was heard from.
-const AUDIO_QUEUE: usize = 8;
+const AUDIO_QUEUE: usize = 4;
 /// A keep-alive this many blocks apart while nothing is heard (about 1 s, LINK-13.4).
 const KEEPALIVE_BLOCKS: u8 = (ferrite_core::rxaudio::RATE_HZ as usize / ferrite_core::rxaudio::BLOCK) as u8;
 
@@ -244,13 +244,14 @@ enum Stream {
 }
 
 impl Stream {
-    fn new(mode: u8) -> Self {
-        match mode {
+    #[inline(never)]
+    fn set(&mut self, mode: u8) {
+        *self = match mode {
             0 => Stream::Off,
             #[cfg(feature = "bench")]
             m if ferrite_core::rawaudio::rate(m).is_some() => Stream::Raw(RawOut::new(m)),
             _ => Stream::Listen { pack: ferrite_core::rxaudio::Packer::new(), sender: AudioOut::new(), agc: ferrite_core::rxlevel::Agc::new() },
-        }
+        };
     }
 }
 
@@ -312,6 +313,108 @@ pub static WAKE_MAX_US: AtomicU32 = AtomicU32::new(0);
 pub static SQ_LAG_MS: AtomicU32 = AtomicU32::new(0);
 pub static TICK_PERIOD_MS: AtomicU32 = AtomicU32::new(0);
 pub static FIRST_DATA_MS: AtomicU32 = AtomicU32::new(0);
+
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+fn process_half(
+    half: u8,
+    halves: u32,
+    #[cfg(feature = "bench")] running: DecoderKind,
+    dec: &mut Decim,
+    #[cfg(feature = "bench")] meter: &mut Option<ferrite_core::rxmeter::Meter>,
+    peak: &mut i32,
+    lvl: &mut (u16, u16),
+    stream: &mut Stream,
+    slot: &mut Decoder,
+    heard: &mut bool,
+    since_cap: &mut Option<u32>,
+    #[cfg(feature = "bench")] t0: u32,
+    #[cfg(feature = "bench")] mhz: u32,
+) {
+    let base = half as usize * BLOCK_IN;
+    let mut out = [0i16; BLOCK_OUT];
+    let mut n = 0;
+    let mut clips = 0;
+    for s in &audio::ADC_BUF[base..base + BLOCK_IN] {
+        let s = s.load(Relaxed);
+        clips += ferrite_core::rxlevel::at_rail(s) as u32; // TERM-32.1
+        dec.push(s, |x| {
+            if n < BLOCK_OUT {
+                out[n] = x;
+                n += 1;
+            }
+        });
+    }
+    #[cfg(feature = "bench")]
+    if let Some(m) = meter {
+        for s in &audio::ADC_BUF[base..base + BLOCK_IN] {
+            if m.push(s.load(Relaxed)) {
+                let r = m.report;
+                METER.lock(|c| c.set(r));
+            }
+        }
+    }
+    if clips != 0 {
+        AUDIO_CLIPS.fetch_add(clips, Relaxed);
+    }
+    *peak = out[..n].iter().fold(*peak, |p, &x| p.max((x as i32).abs()));
+    lvl.0 = out[..n].iter().fold(lvl.0, |p, &x| p.max(x.unsigned_abs()));
+    if halves.is_multiple_of(LVL_HALVES) {
+        *lvl = (0, lvl.0);
+    }
+    if halves.is_multiple_of(PEAK_HALVES) {
+        AUDIO_PEAK.store(*peak as u32, Relaxed);
+        *peak = 0;
+    }
+    match stream {
+        Stream::Off => {}
+        Stream::Listen { pack, sender, agc } => {
+            // LINK-13.8: scaled for the PC only, held while nothing is heard
+            let open = ferrite_core::rxaudio::unpack_source(crate::chan::AUDIO_SRC.load(Relaxed)).1 & ferrite_core::rxaudio::SQ_OPEN != 0;
+            let mut y = out;
+            // the AGC's steps are per 2 ms chunk (its release rate), whatever the half
+            for c in y[..n].chunks_mut(ferrite_core::rxlevel::CHUNK) {
+                agc.chunk(c, open);
+            }
+            AUDIO_GAIN.store(agc.gain() as u32, Relaxed);
+            let mut made = false;
+            for &x in &y[..n] {
+                pack.push(x, |b| {
+                    AUDIO_MADE.fetch_add(1, Relaxed);
+                    sender.block(b);
+                    made = true;
+                });
+            }
+            if !made {
+                sender.drain(false); // decision 331: blocks left waiting go as soon as there's room
+            }
+        }
+        // LINK-13.9: the decoders' samples as they are (no gain)
+        #[cfg(feature = "bench")]
+        Stream::Raw(r) => r.chunk(&out[..n]),
+    }
+    #[cfg(feature = "bench")]
+    let late_in0 = crate::hal::audio::ADC_LATE.load(Relaxed);
+    feed(slot, &out[..n], lvl.0.max(lvl.1), heard, since_cap);
+    if let Some(wf_col) = slot.rad950_take_wf() {
+        crate::chan::RAD950_WF.signal(wf_col);
+    }
+    #[cfg(feature = "bench")]
+    {
+        let work_us = crate::hal::time::cycles().wrapping_sub(t0) / mhz;
+        WORK_MAX_US.fetch_max(work_us, Relaxed);
+        if running == DecoderKind::Rad950_60 {
+            RAD950_SYM_BLOCKS.fetch_add(1, Relaxed);
+            if mhz <= 24 {
+                RAD950_WORK_MAX_US_24M.fetch_max(work_us, Relaxed);
+            } else {
+                RAD950_WORK_MAX_US_HI.fetch_max(work_us, Relaxed);
+            }
+            let late_in1 = crate::hal::audio::ADC_LATE.load(Relaxed);
+            RAD950_INGEST_OVERRUNS.fetch_add(late_in1.wrapping_sub(late_in0), Relaxed);
+        }
+    }
+}
 
 /// Decoder samples through the slot's decoder: what it finds to the APRS task, the pager's to the UI task, and the
 /// demodulator's carrier detect counted (APRS-56.4). `level`: the miss log's peak; `since_cap`: decoder samples since
@@ -425,7 +528,7 @@ pub async fn task() {
                     DspCmd::Pager(on) => pager = on,
                     DspCmd::Audio(mode) => {
                         if mode != listen {
-                            stream = Stream::new(mode);
+                            stream.set(mode);
                             dec = decim(mode); // the raw stream takes the data path (decision 316)
                         }
                         listen = mode;
@@ -594,89 +697,25 @@ pub async fn task() {
                     audio::capture_start();
                     continue;
                 }
-                let base = half as usize * BLOCK_IN;
-                let mut out = [0i16; BLOCK_OUT];
-                let mut n = 0;
-                let mut clips = 0;
-                for s in &audio::ADC_BUF[base..base + BLOCK_IN] {
-                    let s = s.load(Relaxed);
-                    clips += ferrite_core::rxlevel::at_rail(s) as u32; // TERM-32.1
-                    dec.push(s, |x| {
-                        if n < BLOCK_OUT {
-                            out[n] = x;
-                            n += 1;
-                        }
-                    });
-                }
-                #[cfg(feature = "bench")]
-                if let Some(m) = &mut meter {
-                    for s in &audio::ADC_BUF[base..base + BLOCK_IN] {
-                        if m.push(s.load(Relaxed)) {
-                            let r = m.report;
-                            METER.lock(|c| c.set(r));
-                        }
-                    }
-                }
-                if clips != 0 {
-                    AUDIO_CLIPS.fetch_add(clips, Relaxed);
-                }
-                peak = out[..n].iter().fold(peak, |p, &x| p.max((x as i32).abs()));
-                lvl.0 = out[..n].iter().fold(lvl.0, |p, &x| p.max(x.unsigned_abs()));
-                if halves.is_multiple_of(LVL_HALVES) {
-                    lvl = (0, lvl.0);
-                }
-                if halves.is_multiple_of(PEAK_HALVES) {
-                    AUDIO_PEAK.store(peak as u32, Relaxed);
-                    peak = 0;
-                }
-                match &mut stream {
-                    Stream::Off => {}
-                    Stream::Listen { pack, sender, agc } => {
-                        // LINK-13.8: scaled for the PC only, held while nothing is heard
-                        let open = ferrite_core::rxaudio::unpack_source(crate::chan::AUDIO_SRC.load(Relaxed)).1 & ferrite_core::rxaudio::SQ_OPEN != 0;
-                        let mut y = out;
-                        // the AGC's steps are per 2 ms chunk (its release rate), whatever the half
-                        for c in y[..n].chunks_mut(ferrite_core::rxlevel::CHUNK) {
-                            agc.chunk(c, open);
-                        }
-                        AUDIO_GAIN.store(agc.gain() as u32, Relaxed);
-                        let mut made = false;
-                        for &x in &y[..n] {
-                            pack.push(x, |b| {
-                                AUDIO_MADE.fetch_add(1, Relaxed);
-                                sender.block(b);
-                                made = true;
-                            });
-                        }
-                        if !made {
-                            sender.drain(false); // decision 331: blocks left waiting go as soon as there's room
-                        }
-                    }
-                    // LINK-13.9: the decoders' samples as they are (no gain)
+                process_half(
+                    half,
+                    halves,
                     #[cfg(feature = "bench")]
-                    Stream::Raw(r) => r.chunk(&out[..n]),
-                }
-                #[cfg(feature = "bench")]
-                let late_in0 = crate::hal::audio::ADC_LATE.load(Relaxed);
-                feed(&mut slot, &out[..n], lvl.0.max(lvl.1), &mut heard, &mut since_cap);
-                if let Some(wf_col) = slot.rad950_take_wf() {
-                    crate::chan::RAD950_WF.signal(wf_col);
-                }
-                #[cfg(feature = "bench")]
-                {
-                    let work_us = crate::hal::time::cycles().wrapping_sub(t0) / mhz;
-                    WORK_MAX_US.fetch_max(work_us, Relaxed);
-                    if running == DecoderKind::Rad950_60 {
-                        RAD950_SYM_BLOCKS.fetch_add(1, Relaxed);
-                        if mhz <= 24 {
-                            RAD950_WORK_MAX_US_24M.fetch_max(work_us, Relaxed);
-                        } else {
-                            RAD950_WORK_MAX_US_HI.fetch_max(work_us, Relaxed);
-                        }
-                        let late_in1 = crate::hal::audio::ADC_LATE.load(Relaxed);
-                        RAD950_INGEST_OVERRUNS.fetch_add(late_in1.wrapping_sub(late_in0), Relaxed);
-                    }
-                }
+                    running,
+                    &mut dec,
+                    #[cfg(feature = "bench")]
+                    &mut meter,
+                    &mut peak,
+                    &mut lvl,
+                    &mut stream,
+                    &mut slot,
+                    &mut heard,
+                    &mut since_cap,
+                    #[cfg(feature = "bench")]
+                    t0,
+                    #[cfg(feature = "bench")]
+                    mhz,
+                );
             }
             Either4::Fourth(None) => {} // a stop with nothing playing
             #[cfg(not(all(feature = "tx", feature = "bench")))]
@@ -686,7 +725,7 @@ pub async fn task() {
                 if capturing {
                     audio::capture_stop();
                 }
-                play_test(g, eq).await;
+                super::ui::own_frame(play_test(g, eq)).await;
                 if capturing {
                     clock::for_audio().await;
                     dec = decim(listen);
@@ -697,7 +736,7 @@ pub async fn task() {
                 if capturing {
                     audio::capture_stop();
                 }
-                play(&frame).await;
+                super::ui::own_frame(play(&frame)).await;
                 // PWR-26.9.1: a digipeater's copy comes back before the squelch's open reaches here (Alex, Nov 4,
                 // clear: the speaker broke squelch on the echo, nothing framed): capture now, whatever the squelch.
                 if running == DecoderKind::Afsk {

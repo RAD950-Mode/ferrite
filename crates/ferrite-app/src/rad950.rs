@@ -326,7 +326,8 @@ pub trait Rad950Store {
     fn save_contact(&mut self, c: &SavedContact) -> SaveOutcome;
 }
 
-pub const MEM_LOG_CAP: usize = 32;
+/// In-RAM recent-contact mirror capacity (the durable 64 KiB SPI flash journal holds the full log).
+pub const MEM_LOG_CAP: usize = 16;
 
 /// Compact in-memory store (used as default in simulator/tests and RAM cache when flash backend isn't attached).
 pub struct MemRad950Store {

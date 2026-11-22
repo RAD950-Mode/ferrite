@@ -7,7 +7,8 @@
 use crate::board::{LED_ACTIVE_HIGH, LED_GREEN};
 use crate::chan::{TERM_IN, TERM_OUT};
 use crate::store::{self, Store};
-use embassy_time::Timer;
+use embassy_futures::block_on;
+use embassy_time::{block_for, Duration};
 use ferrite_core::link::{self as wire, msg, Status, MAX_PAYLOAD, MAX_WIRE};
 use ferrite_app::lights::{xfer_flash, XFER_LINGER_MS};
 use ferrite_core::VERSION;
@@ -27,11 +28,12 @@ fn screen(lcd: &mut impl Panel, note: &[u8]) {
 }
 
 /// One answer out on the cable, whole (the ring has room for it: answers are short and the PC waits for each).
-async fn send(ty: u8, seq: u8, ans: &[u8]) {
+#[inline(never)]
+fn send(ty: u8, seq: u8, ans: &[u8]) {
     let mut w = [0u8; MAX_WIRE];
     let Some(k) = wire::build(ty | wire::ANSWER, seq, ans, &mut w) else { return };
     while (TERM_OUT.room() as usize) < k {
-        Timer::after_millis(1).await;
+        block_for(Duration::from_millis(1));
     }
     for &c in &w[..k] {
         TERM_OUT.put(c);
@@ -40,21 +42,16 @@ async fn send(ty: u8, seq: u8, ans: &[u8]) {
 }
 
 /// Serves the restore from the accepted `START` (its seq) on; never returns.
-#[allow(clippy::await_holding_refcell_ref)] // see the idle wait: no other borrower is left
+/// Kept synchronous (`#[inline(never)]`) so its 3+ KiB wire buffers do not inflate `ui::task`'s
+/// async state machine or steady-state poll stack frame; caller drains `store.idle()` first.
 /// `leds`: 0 7 6 isn't Off, so the green LED flashes while frames come (DISP-30).
-pub async fn run(store: &'static Store, lcd: &mut impl Panel, seq: u8, leds: bool) -> ! {
-    // Whatever Ferrite had queued is written first (the restore overwrites it anyway), so the chip is free.
-    store::wake(store);
-    // Until the Storage task is idle: from here on nothing queues another job (only the UI task does, and it
-    // never leaves this function), so the chip borrowed below across awaits is borrowed by no one else.
-    while !store.idle() {
-        Timer::after_millis(10).await;
-    }
+#[inline(never)]
+pub fn run(store: &'static Store, lcd: &mut impl Panel, seq: u8, leds: bool) -> ! {
     screen(lcd, b"Restoring: keep the cable in");
     let (chip, ranges, uid) = (store.nor().size(), store::WRITE_OK, crate::hal::sys::uid());
     let mut ans = [0u8; MAX_PAYLOAD];
-    let n = start(&mut *store.nor(), chip, ranges, uid, &mut ans).await;
-    send(msg::STOCK_RESTORE, seq, &ans[..n]).await;
+    let n = block_on(start(&mut *store.nor(), chip, ranges, uid, &mut ans));
+    send(msg::STOCK_RESTORE, seq, &ans[..n]);
 
     let mut rx = [0u8; MAX_WIRE];
     let mut rn = 0usize;
@@ -66,7 +63,7 @@ pub async fn run(store: &'static Store, lcd: &mut impl Panel, seq: u8, leds: boo
             let now = now_ms();
             let on = leds && now.wrapping_sub(last) < XFER_LINGER_MS && xfer_flash(now).0;
             LED_GREEN.write(on == LED_ACTIVE_HIGH);
-            Timer::after_millis(1).await;
+            block_for(Duration::from_millis(1));
             continue;
         };
         if b != 0 {
@@ -97,20 +94,20 @@ pub async fn run(store: &'static Store, lcd: &mut impl Panel, seq: u8, leds: boo
                 let mut p = [0u8; MAX_PAYLOAD];
                 let pl = f.payload.len();
                 p[..pl].copy_from_slice(f.payload);
-                let (n, after) = serve(&mut *store.nor(), chip, ranges, uid, &p[..pl], &mut ans).await;
+                let (n, after) = block_on(serve(&mut *store.nor(), chip, ranges, uid, &p[..pl], &mut ans));
                 (ty, seq, n, after)
             }
         };
-        send(ty, seq, &ans[..n]).await;
+        send(ty, seq, &ans[..n]);
         last = now_ms();
         if after == After::Reset {
             screen(lcd, b"Done: restarting");
             while TERM_OUT.count() > 0 {
-                Timer::after_millis(1).await;
+                block_for(Duration::from_millis(1));
             }
             // The answer's last bytes leave the UART, and the PC has its probes going before the bootloader's
             // ~200 ms window opens: a missed window would start Ferrite over the restored data.
-            Timer::after_millis(300).await;
+            block_for(Duration::from_millis(300));
             cortex_m::peripheral::SCB::sys_reset();
         }
     }
