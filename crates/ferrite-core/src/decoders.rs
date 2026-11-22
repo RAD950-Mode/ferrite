@@ -163,18 +163,26 @@ impl Decoder {
         out: &mut [urad950::Decoded; urad950::MAX_DECODED],
         soft: Option<&mut Option<urad950::SoftCandidate>>,
     ) -> usize {
+        self.rad950_finish_with_stats(out, soft).0
+    }
+
+    pub fn rad950_finish_with_stats(
+        &mut self,
+        out: &mut [urad950::Decoded; urad950::MAX_DECODED],
+        soft: Option<&mut Option<urad950::SoftCandidate>>,
+    ) -> (usize, Option<urad950::FinishStats>) {
         if self.kind == DecoderKind::Rad950 {
             let d = unsafe { &mut *self.inner.rad950 };
             let n = d.finish_slot_with_soft(out, soft);
             d.reset();
-            n
+            (n, None)
         } else if self.kind == DecoderKind::Rad950_60 {
             let d = unsafe { &mut *self.inner.rad950_60 };
-            let n = d.finish_minute(out);
+            let stats = d.finish_minute_with_stats(out);
             d.reset();
-            n
+            (stats.total_decoded as usize, Some(stats))
         } else {
-            0
+            (0, None)
         }
     }
 

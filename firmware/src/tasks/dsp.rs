@@ -362,6 +362,26 @@ fn feed(slot: &mut Decoder, x: &[i16], level: u16, heard: &mut bool, since_cap: 
 /// Bench diagnostic counters for `DspCmd::Rad950Finish`: `[finishes, last_syms, last_tracks, total_decoded]`.
 #[cfg(feature = "bench")]
 pub static RAD950_DIAG: [AtomicU32; 4] = [AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0)];
+/// Step 1 RAD950-60 timing, overrun, and LDPC instrumentation (bench builds only).
+#[cfg(feature = "bench")]
+pub static RAD950_WORK_MAX_US_24M: AtomicU32 = AtomicU32::new(0);
+#[cfg(feature = "bench")]
+pub static RAD950_WORK_MAX_US_HI: AtomicU32 = AtomicU32::new(0);
+#[cfg(feature = "bench")]
+pub static RAD950_SYM_BLOCKS: AtomicU32 = AtomicU32::new(0);
+#[cfg(feature = "bench")]
+pub static RAD950_INGEST_OVERRUNS: AtomicU32 = AtomicU32::new(0);
+#[cfg(feature = "bench")]
+pub static RAD950_FINISH_OVERRUNS: AtomicU32 = AtomicU32::new(0);
+#[cfg(feature = "bench")]
+pub static RAD950_FINISH_US: AtomicU32 = AtomicU32::new(0);
+#[cfg(feature = "bench")]
+pub static RAD950_FINISH_MAX_US: AtomicU32 = AtomicU32::new(0);
+#[cfg(feature = "bench")]
+pub static RAD950_FINISH_MHZ: AtomicU32 = AtomicU32::new(0);
+/// `[prim_attempts, prim_iters, prim_decoded, comp_attempts, comp_iters, comp_decoded]` for the last minute-end decode.
+#[cfg(feature = "bench")]
+pub static RAD950_STATS: [AtomicU32; 6] = [const { AtomicU32::new(0) }; 6];
 #[cfg(feature = "bench")]
 pub static WORK_MAX_US: AtomicU32 = AtomicU32::new(0);
 
@@ -461,6 +481,12 @@ pub async fn task() {
             }
             Either4::First(DspCmd::Rad950Finish { utc_slot, dial_hz, coop_capture }) => {
                 if matches!(running, DecoderKind::Rad950 | DecoderKind::Rad950_60) {
+                    #[cfg(feature = "bench")]
+                    let (fin_t0, fin_mhz, late_before) = (
+                        embassy_time::Instant::now(),
+                        crate::hal::clock::mhz(),
+                        crate::hal::audio::ADC_LATE.load(Relaxed),
+                    );
                     let captured = capturing;
                     if capturing {
                         audio::capture_stop();
@@ -470,7 +496,7 @@ pub async fn task() {
                     let (d_syms, d_trk, _d_acq) = slot.rad950_diag();
                     let mut out = [Decoded::EMPTY; MAX_DECODED];
                     let mut soft: Option<SoftCandidate> = None;
-                    let n = slot.rad950_finish_with_soft(&mut out, Some(&mut soft));
+                    let (n, fin_stats) = slot.rad950_finish_with_stats(&mut out, Some(&mut soft));
                     if let Some(sc) = soft {
                         crate::chan::RAD950_SOFT.signal(sc);
                     }
@@ -485,11 +511,25 @@ pub async fn task() {
                     }
                     #[cfg(feature = "bench")]
                     {
+                        let fin_us = fin_t0.elapsed().as_micros().min(u32::MAX as u64) as u32;
+                        RAD950_FINISH_US.store(fin_us, Relaxed);
+                        RAD950_FINISH_MAX_US.fetch_max(fin_us, Relaxed);
+                        RAD950_FINISH_MHZ.store(fin_mhz, Relaxed);
+                        if let Some(st) = fin_stats {
+                            RAD950_STATS[0].store(st.primary_attempts as u32, Relaxed);
+                            RAD950_STATS[1].store(st.primary_iters as u32, Relaxed);
+                            RAD950_STATS[2].store(st.primary_decoded as u32, Relaxed);
+                            RAD950_STATS[3].store(st.compact_attempts as u32, Relaxed);
+                            RAD950_STATS[4].store(st.compact_iters as u32, Relaxed);
+                            RAD950_STATS[5].store(st.compact_decoded as u32, Relaxed);
+                        }
                         RAD950_DIAG[0].fetch_add(1, Relaxed);
                         RAD950_DIAG[1].store(d_syms as u32, Relaxed);
                         RAD950_DIAG[2].store(d_trk as u32, Relaxed);
                         RAD950_DIAG[3].fetch_add(n as u32, Relaxed);
                     }
+                    #[cfg(not(feature = "bench"))]
+                    let _ = fin_stats;
                     for d in &out[..n] {
                         if crate::chan::RAD950_RX.try_send(*d).is_err() {
                             DROPPED.fetch_add(1, Relaxed);
@@ -502,6 +542,11 @@ pub async fn task() {
                         clock::for_audio().await;
                         dec = decim(listen);
                         audio::capture_start();
+                    }
+                    #[cfg(feature = "bench")]
+                    {
+                        let late_after = crate::hal::audio::ADC_LATE.load(Relaxed);
+                        RAD950_FINISH_OVERRUNS.fetch_add(late_after.wrapping_sub(late_before), Relaxed);
                     }
                 }
             }
@@ -611,12 +656,27 @@ pub async fn task() {
                     #[cfg(feature = "bench")]
                     Stream::Raw(r) => r.chunk(&out[..n]),
                 }
+                #[cfg(feature = "bench")]
+                let late_in0 = crate::hal::audio::ADC_LATE.load(Relaxed);
                 feed(&mut slot, &out[..n], lvl.0.max(lvl.1), &mut heard, &mut since_cap);
                 if let Some(wf_col) = slot.rad950_take_wf() {
                     crate::chan::RAD950_WF.signal(wf_col);
                 }
                 #[cfg(feature = "bench")]
-                WORK_MAX_US.fetch_max(crate::hal::time::cycles().wrapping_sub(t0) / mhz, Relaxed);
+                {
+                    let work_us = crate::hal::time::cycles().wrapping_sub(t0) / mhz;
+                    WORK_MAX_US.fetch_max(work_us, Relaxed);
+                    if running == DecoderKind::Rad950_60 {
+                        RAD950_SYM_BLOCKS.fetch_add(1, Relaxed);
+                        if mhz <= 24 {
+                            RAD950_WORK_MAX_US_24M.fetch_max(work_us, Relaxed);
+                        } else {
+                            RAD950_WORK_MAX_US_HI.fetch_max(work_us, Relaxed);
+                        }
+                        let late_in1 = crate::hal::audio::ADC_LATE.load(Relaxed);
+                        RAD950_INGEST_OVERRUNS.fetch_add(late_in1.wrapping_sub(late_in0), Relaxed);
+                    }
+                }
             }
             Either4::Fourth(None) => {} // a stop with nothing playing
             #[cfg(not(all(feature = "tx", feature = "bench")))]

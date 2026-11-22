@@ -664,6 +664,34 @@ pub async fn task() {
                     bringup::linef(|b| {
                         let _ = ufmt::uwrite!(b, "ui woke: input {} live {} timer {} alert {}", wk[0], wk[1], wk[2], wk[3]);
                     });
+                    if crate::tasks::dsp::RAD950_SYM_BLOCKS.load(Relaxed) != 0
+                        || crate::tasks::dsp::RAD950_DIAG[0].load(Relaxed) != 0
+                    {
+                        use crate::tasks::dsp::{
+                            RAD950_DIAG, RAD950_FINISH_MAX_US, RAD950_FINISH_MHZ,
+                            RAD950_FINISH_OVERRUNS, RAD950_FINISH_US, RAD950_INGEST_OVERRUNS,
+                            RAD950_STATS, RAD950_WORK_MAX_US_24M, RAD950_WORK_MAX_US_HI,
+                        };
+                        let st = RAD950_STATS.each_ref().map(|a| a.load(Relaxed));
+                        bringup::linef(|b| {
+                            let _ = ufmt::uwrite!(
+                                b,
+                                "rad950-60: work24={}us workHi={}us lateIn={} lateFin={} | fin={}ms max={}ms @{}MHz n={} p={}/{}/{} c={}/{}/{} | ram={}B stack={}B",
+                                RAD950_WORK_MAX_US_24M.load(Relaxed),
+                                RAD950_WORK_MAX_US_HI.load(Relaxed),
+                                RAD950_INGEST_OVERRUNS.load(Relaxed),
+                                RAD950_FINISH_OVERRUNS.load(Relaxed),
+                                RAD950_FINISH_US.load(Relaxed) / 1000,
+                                RAD950_FINISH_MAX_US.load(Relaxed) / 1000,
+                                RAD950_FINISH_MHZ.load(Relaxed),
+                                RAD950_DIAG[0].load(Relaxed),
+                                st[0], st[1], st[2],
+                                st[3], st[4], st[5],
+                                crate::hal::sys::statics(),
+                                dev.stack_free,
+                            );
+                        });
+                    }
                     // PWR-26.16: the BK4829 bus's reads, writes and writes skipped by the shadow, in these 10 s
                     static BK_LAST: [AtomicU32; 3] = [const { AtomicU32::new(0) }; 3];
                     let bk = core::array::from_fn::<u32, 3, _>(|i| {
