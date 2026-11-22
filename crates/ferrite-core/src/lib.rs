@@ -84,6 +84,8 @@ pub const VERSION: &str = concat!("v", env!("CARGO_PKG_VERSION"));
 
 /// The build (SELF-5): the git commit, short, "+" when built from uncommitted changes (build.rs).
 pub const BUILD: &str = env!("FERRITE_BUILD");
+/// The pinned sibling `rad950` (`urad950`) git commit this firmware was built against (build.rs).
+pub const RAD950_BUILD: &str = env!("RAD950_BUILD");
 
 /// Set by the simulators' screenshot tests, so pictures don't change with every commit: [`build`] then reads
 /// "0000000".
