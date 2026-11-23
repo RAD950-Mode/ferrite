@@ -194,7 +194,7 @@ impl RtcwHost {
             }),
             paddle_src: PaddleSource::Auto,
             pitch_hz: 700,
-            sidetone_vol: 9,
+            sidetone_vol: 11,
             rx_corr_hz: 0,
             bw_idx: 0, // 500 Hz default CW passband
             shift_hz: 0,
@@ -498,6 +498,24 @@ impl App {
             let rx_corr_hz = self.rtcw.rx_corr_hz.saturating_add(self.rtcw.shift_hz);
             let bw_on = self.rtcw.pack_bw_on();
             self.out.push(RadioCmd::RtcwRx { dial, rx_corr_hz, bw_on });
+        }
+    }
+
+    /// Latch or release semi-break-in CW TX through the ordered `app.out` command queue.
+    pub fn rtcw_set_tx_hold(&mut self, on: bool) {
+        if on == self.rtcw.tx_hold {
+            return;
+        }
+        self.rtcw.tx_hold = on;
+        if on {
+            let rf_freq = self.rtcw.vfo.tx_freq10;
+            let power = self.rtcw.tx_power;
+            let region = self.settings().region;
+            let extend = self.settings().extend_tx;
+            self.out.push(RadioCmd::TxPlan { tx: rf_freq, region, extend, confirmed: false });
+            self.out.push(RadioCmd::RtcwTx { freq: rf_freq, power, on: true });
+        } else {
+            self.out.push(RadioCmd::RtcwTx { freq: 0, power: 0, on: false });
         }
     }
 }

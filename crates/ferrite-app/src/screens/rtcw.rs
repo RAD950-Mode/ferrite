@@ -115,6 +115,13 @@ impl View for RtcwScr {
         app.screen = Screen::Rtcw(self);
     }
 
+    fn ptt(self, app: &mut App, down: bool) {
+        // Never exit RTCW or key FM voice (which triggers the HF split refusal alert) when PTT is pressed.
+        if down {
+            app.show_toast(b"RTCW active", b"Use PF1/PF2 or K1", false);
+        }
+    }
+
     fn render(self, app: &mut App, lcd: &mut impl Panel, cx: &Cx<impl ChannelStore>) {
         match self.page {
             PAGE_OPERATE => self.draw_operate(app, lcd, cx.live),
@@ -765,8 +772,8 @@ impl RtcwScr {
             return;
         }
 
-        redraw_box!(true, lcd, (0, TOP_Y, W, 272, BG), {
-            lcd.text4(8, TOP_Y + 14, b"RTCW SETTINGS", &UI_12, CYAN, BG);
+        redraw_box!(true, lcd, (0, TOP_Y, W, 272, 0x0000), {
+            lcd.text4(8, TOP_Y + 15, b"RTCW SETTINGS", &UI_14, CYAN, 0x0000);
 
             let mode_s = match kmode {
                 KeyerMode::IambicB => "Iambic B",
@@ -788,10 +795,17 @@ impl RtcwScr {
             };
 
             for i in 0..9usize {
-                let y = TOP_Y + 20 + (i as i32) * 27;
+                let y = TOP_Y + 21 + (i as i32) * 27;
                 let active = i == self.sel as usize;
-                let (bg, fg, vfg) = if active { (BANNER_BG, BG, BG) } else { (CARD, TEXT, CYAN) };
-                lcd.fill(6, y, W - 12, 23, bg);
+                let (bg, fg, vfg) = if active {
+                    (BANNER_BG, 0x0000u16, 0x0000u16)
+                } else {
+                    (0x0000u16, 0xFFFFu16, BANNER_BG)
+                };
+                lcd.fill(4, y, W - 8, 25, bg);
+                if !active {
+                    lcd.fill(4, y + 25, W - 8, 1, 0x2945);
+                }
                 let mut vb = Buf::<16>::new();
                 let label: &[u8] = match i {
                     0 => {
@@ -835,8 +849,8 @@ impl RtcwScr {
                         b"Memories"
                     }
                 };
-                lcd.text4(12, y + 16, label, &UI_12, fg, bg);
-                lcd.text4(134, y + 16, vb.as_bytes(), &UI_12, vfg, bg);
+                lcd.text4(10, y + 17, label, &UI_12, fg, bg);
+                lcd.text4(132, y + 17, vb.as_bytes(), &UI_12, vfg, bg);
             }
         });
     }
@@ -850,17 +864,20 @@ impl RtcwScr {
             return;
         }
         let presets = app.rtcw.mem_preset;
-        redraw_box!(true, lcd, (0, TOP_Y, W, 272, BG), {
-            lcd.text4(8, TOP_Y + 16, b"MEMORIES (1-9) <>:Preset", &UI_12, CYAN, BG);
+        redraw_box!(true, lcd, (0, TOP_Y, W, 272, 0x0000), {
+            lcd.text4(8, TOP_Y + 15, b"MEMORIES (1-9) <>:Preset", &UI_12, CYAN, 0x0000);
             for i in 0..9usize {
-                let y = TOP_Y + 24 + (i as i32) * 26;
+                let y = TOP_Y + 22 + (i as i32) * 27;
                 let active = i == self.sel as usize;
-                let (bg, fg) = if active { (BANNER_BG, BG) } else { (CARD, TEXT) };
-                lcd.fill(4, y, W - 8, 22, bg);
+                let (bg, fg) = if active { (BANNER_BG, 0x0000u16) } else { (0x0000u16, 0xFFFFu16) };
+                lcd.fill(4, y, W - 8, 25, bg);
+                if !active {
+                    lcd.fill(4, y + 25, W - 8, 1, 0x2945);
+                }
                 let mut line = Buf::<32>::new();
                 let tmpl = crate::rtcw::MEM_PRESETS[i][(presets[i] as usize).min(2)];
                 let _ = uwrite!(line, "{}: {}", i + 1, core::str::from_utf8(tmpl).unwrap_or(""));
-                lcd.text4(8, y + 15, line.as_bytes(), &UI_12, fg, bg);
+                lcd.text4(8, y + 17, line.as_bytes(), &UI_12, fg, bg);
             }
         });
     }

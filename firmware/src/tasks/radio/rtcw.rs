@@ -36,11 +36,11 @@ impl Radio {
     /// Enter, retune, or exit RTCW mode on the SI4732 narrow USB receiver.
     pub(super) async fn rtcw_rx(&mut self, dial: Freq10, rx_corr_hz: i16, bw_idx: u8, agc_idx: u8, nr_idx: u8, on: bool) {
         self.seek_cancel();
+        #[cfg(feature = "tx")]
+        if self.rtcw.is_some_and(|r| r.tx_active) {
+            self.rtcw_tx_stop().await;
+        }
         if !on {
-            #[cfg(feature = "tx")]
-            if self.rtcw.is_some_and(|r| r.tx_active) {
-                self.rtcw_tx_stop().await;
-            }
             if self.rtcw.take().is_some() {
                 let _ = broadcast(&mut self.si, BroadcastCmd::Off, self.si_opts).await;
                 self.tuned = [None; 2];

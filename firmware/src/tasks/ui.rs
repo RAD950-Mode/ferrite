@@ -2078,19 +2078,7 @@ fn rtcw_step(app: &mut App, dec_on: &mut bool) {
         }
     }
 
-    // Semi-break-in TX hold transitions (latch/release BK4829 & band relay).
+    // Semi-break-in TX hold transitions (latch/release BK4829 & band relay via ordered `app.out` queue).
     #[cfg(feature = "tx")]
-    if out.tx_hold != app.rtcw.tx_hold {
-        app.rtcw.tx_hold = out.tx_hold;
-        if out.tx_hold {
-            let rf_freq = app.rtcw.vfo.tx_freq10;
-            let power = app.rtcw.tx_power;
-            let region = app.settings().region;
-            let extend = app.settings().extend_tx;
-            let _ = crate::chan::RADIO.try_send(RadioCmd::TxPlan { tx: rf_freq, region, extend, confirmed: false });
-            let _ = crate::chan::RADIO.try_send(RadioCmd::RtcwTx { freq: rf_freq, power, on: true });
-        } else {
-            let _ = crate::chan::RADIO.try_send(RadioCmd::RtcwTx { freq: 0, power: 0, on: false });
-        }
-    }
+    app.rtcw_set_tx_hold(out.tx_hold);
 }
