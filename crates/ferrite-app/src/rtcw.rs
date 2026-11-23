@@ -99,18 +99,14 @@ impl CwNr {
 pub enum KnobMode {
     Freq = 0,
     Step = 1,
-    Bw = 2,
-    Shift = 3,
-    Wpm = 4,
+    Wpm = 2,
 }
 
 impl KnobMode {
     pub const fn next(self) -> Self {
         match self {
             Self::Freq => Self::Step,
-            Self::Step => Self::Bw,
-            Self::Bw => Self::Shift,
-            Self::Shift => Self::Wpm,
+            Self::Step => Self::Wpm,
             Self::Wpm => Self::Freq,
         }
     }
@@ -511,14 +507,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn knob_mode_cycles_all_five_targets() {
+    fn knob_mode_cycles_all_three_targets() {
         let mut m = KnobMode::Freq;
         m = m.next();
         assert_eq!(m, KnobMode::Step);
-        m = m.next();
-        assert_eq!(m, KnobMode::Bw);
-        m = m.next();
-        assert_eq!(m, KnobMode::Shift);
         m = m.next();
         assert_eq!(m, KnobMode::Wpm);
         m = m.next();
