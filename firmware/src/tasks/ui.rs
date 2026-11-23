@@ -2022,10 +2022,10 @@ fn rtcw_step(app: &mut App, dec_on: &mut bool) {
     }
     if let Some(wf_col) = crate::chan::RAD950_WF.try_take() {
         if app.rtcw.tx_hold || app.rtcw.sidetone_on {
-            // Paint a clean synthetic TX carrier line at the CW pitch bin (`700 Hz` = bin 6).
+            // Paint a clean synthetic TX carrier line at the CW pitch bin (`0..3,000 Hz`, 125 Hz/bin).
             let mut tx_col = [0u8; 12];
             if app.rtcw.rf_key_down || app.rtcw.sidetone_on {
-                let bin = ((app.rtcw.pitch_hz as usize).saturating_sub(50) / 100).min(23);
+                let bin = ((app.rtcw.pitch_hz as usize) / 125).min(23);
                 if bin & 1 == 0 {
                     tx_col[bin >> 1] = 0xF0;
                 } else {
@@ -2066,12 +2066,13 @@ fn rtcw_step(app: &mut App, dec_on: &mut bool) {
     // Update lock-free RF key-down gate for Radio task's 4 ms DAC2 PA envelope ramp.
     crate::chan::RTCW_KEY_DOWN.store(out.rf_key_down, Relaxed);
 
-    // Drive DAC1 sidetone oscillator (on key-down, muted on key-up).
+    // Drive DAC1 sidetone oscillator (on key-down, muted on key-up) using user's pitch & volume (0..=11).
     let prev_tone = SIDETONE_ON.load(Relaxed);
-    if out.sidetone_on != prev_tone {
-        SIDETONE_ON.store(out.sidetone_on, Relaxed);
-        if out.sidetone_on {
-            crate::hal::tone::start(app.rtcw.pitch_hz as u32, 5);
+    let want_tone = out.sidetone_on && app.rtcw.sidetone_vol > 0;
+    if want_tone != prev_tone {
+        SIDETONE_ON.store(want_tone, Relaxed);
+        if want_tone {
+            crate::hal::tone::start(app.rtcw.pitch_hz as u32, app.rtcw.sidetone_vol.min(11));
         } else {
             crate::hal::tone::stop();
         }

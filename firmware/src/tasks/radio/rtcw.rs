@@ -24,6 +24,7 @@ pub(super) struct RtcwRun {
     pub dial: Freq10,
     pub rx_corr_hz: i16,
     pub bw_idx: u8,
+    pub agc_idx: u8,
     pub rx_ready: bool,
     pub tx_active: bool,
     pub pa_target: u8,
@@ -32,7 +33,7 @@ pub(super) struct RtcwRun {
 
 impl Radio {
     /// Enter, retune, or exit RTCW mode on the SI4732 narrow USB receiver.
-    pub(super) async fn rtcw_rx(&mut self, dial: Freq10, rx_corr_hz: i16, bw_idx: u8, on: bool) {
+    pub(super) async fn rtcw_rx(&mut self, dial: Freq10, rx_corr_hz: i16, bw_idx: u8, agc_idx: u8, on: bool) {
         self.seek_cancel();
         if !on {
             #[cfg(feature = "tx")]
@@ -57,7 +58,7 @@ impl Radio {
         let mut s = Steps::default();
         let _ = self.path.rx(Rx::Si, Cause::HfReceiver, now_ms() as u32, &mut s);
         self.run(&s).await;
-        let ok = self.si_ssb_rtcw(dial, rx_corr_hz, bw_idx).await;
+        let ok = self.si_ssb_rtcw(dial, rx_corr_hz, bw_idx, agc_idx).await;
         if ok.is_ok() {
             speaker(true);
         }
@@ -65,6 +66,7 @@ impl Radio {
             dial,
             rx_corr_hz,
             bw_idx,
+            agc_idx,
             rx_ready: ok.is_ok(),
             tx_active: false,
             pa_target: 0,
@@ -73,7 +75,7 @@ impl Radio {
         self.rtcw_poll();
     }
 
-    async fn si_ssb_rtcw(&mut self, dial: Freq10, rx_corr_hz: i16, bw_idx: u8) -> Result<(), si4732::Error> {
+    async fn si_ssb_rtcw(&mut self, dial: Freq10, rx_corr_hz: i16, bw_idx: u8, agc_idx: u8) -> Result<(), si4732::Error> {
         use si4732::prop;
         let d = &mut BusyDelay;
         let (khz, _usb, base_bfo) = ferrite_core::ssb::tune(dial, true, false);
@@ -104,18 +106,25 @@ impl Radio {
             }
             self.si.volume(SI_VOLUME, d)?;
         }
+        // CW AGC speed: 0 = FAST, 1 = MED, 2 = SLOW
+        let (avc_div, avc_gain) = match agc_idx {
+            0 => (0u8, 0x7800u16), // FAST
+            1 => (1u8, 0x5800u16), // MED
+            _ => (3u8, 0x4000u16), // SLOW
+        };
         let cfg = si4732::SsbConfig {
             audio_bw: SI_CW_BW_CODES[(bw_idx as usize).min(SI_CW_BW_CODES.len() - 1)],
             sideband_cutoff: 1,
-            avc_divider: 0,
+            avc_divider: avc_div,
             avc: true,
             soft_mute_snr: false,
             afc_off: true,
         };
         self.si.set_property(prop::SSB_MODE, cfg.bits(), d)?;
-        self.si.set_property(prop::AM_AVC_MAX_GAIN, 0x7800, d)?;
+        self.si.set_property(prop::AM_AVC_MAX_GAIN, avc_gain, d)?;
         self.si.set_property(prop::AM_SOFT_MUTE_MAX_ATTENUATION, 0, d)?;
         self.si.agc(SiOpts::agc_index(self.si_opts.am_agc, 37), d)?;
+        self.si.volume(SI_VOLUME, d)?;
         self.si.mute(false, d)?;
         if self.ssb_at != Some((khz, true)) {
             self.si.tune_start(khz, Sideband::Usb, d)?;
@@ -191,26 +200,33 @@ impl Radio {
             (self.tx.cal, self.tx.gauge) = c;
         }
         let Some((plan_f, region, extend, _)) = self.tx.plan.take() else {
+            self.refuse(RTCW_SLOT, Refusal::Locked);
             return;
         };
         let f = if plan_f != 0 { plan_f } else { freq };
         if !self.ptt_seen_released() {
+            self.refuse(RTCW_SLOT, Refusal::PttAtBoot);
             return;
         }
         let power = power.min(2);
         let n = Sel::tx(f).chip();
         if !self.has(n) {
+            self.refuse(RTCW_SLOT, Refusal::Locked);
             return;
         }
         let Some(pa) = self.tx.cal.and_then(|c| c.dac(f, power)) else {
+            self.refuse(RTCW_SLOT, Refusal::NotCalibrated);
             return;
         };
         let _ = self.si.mute(true, &mut BusyDelay);
+        let _ = self.si.volume(0, &mut BusyDelay);
         speaker(false);
         let mut st = Steps::default();
         if self.path.rx(Rx::Bk(Sel::HfRx), Cause::HfReceiver, now, &mut st).is_err() {
+            let _ = self.si.volume(SI_VOLUME, &mut BusyDelay);
             let _ = self.si.mute(false, &mut BusyDelay);
             speaker(true);
+            self.refuse(RTCW_SLOT, Refusal::Locked);
             return;
         }
         self.run(&st).await;
@@ -233,8 +249,9 @@ impl Radio {
             batt_ok: self.battery_ok(),
             power,
         };
-        if self.tx.seq.check(&req, &self.path, now_ms() as u32).is_err() {
+        if let Err(why) = self.tx.seq.check(&req, &self.path, now_ms() as u32) {
             self.rtcw_restore_rx().await;
+            self.refuse(RTCW_SLOT, why);
             return;
         }
 
@@ -306,7 +323,7 @@ impl Radio {
         self.run(&s).await;
         // Restore `PA7=PC5=1` (SI4732 SW/SSB LNA path) cleared to `1/0` by `Act::SiInput(false)` during TX.
         si_input(SiMode::Ssb);
-        let _ = self.si_ssb_rtcw(run.dial, run.rx_corr_hz, run.bw_idx).await;
+        let _ = self.si_ssb_rtcw(run.dial, run.rx_corr_hz, run.bw_idx, run.agc_idx).await;
         speaker(true);
     }
 }

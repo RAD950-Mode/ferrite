@@ -19,11 +19,11 @@ pub const RATE_HZ: u32 = 24_000;
 /// RAM the slot may take: holds RAD950-60 dual-phase Layout B (`21,864 B`) alongside FT8/WSPR/APRS/POCSAG.
 pub const BUDGET: usize = 22 * 1024;
 
-/// Exact Q14 `round(2 * cos(2*pi*k/60) * 16384)` for `k = 1..=24` (`100..2,400 Hz` @ `6,000 Hz`, 100 Hz/bin).
+/// Exact Q14 `round(2 * cos(2*pi*((k+0.5)*125)/6000) * 16384)` for `k = 0..24` (`0..3,000 Hz` @ `6,000 Hz`, 125 Hz/bin).
 const CW_SPEC_COEFF_Q14: [i32; 24] = [
-    32588, 32052, 31164, 29935, 28378, 26510, 24351, 21926,
-    19261, 16384, 13328, 10126,  6813,  3425,     0, -3425,
-    -6813, -10126, -13328, -16384, -19261, -21926, -24351, -26510,
+    32698, 32138, 31029, 29389, 27246, 24636, 21605, 18205,
+    14493, 10533,  6393,  2143, -2143, -6393,-10533,-14493,
+   -18205,-21605,-24636,-27246,-29389,-31029,-32138,-32698,
 ];
 
 /// Lightweight 24-bin CW audio spectrum (`100..2,400 Hz`, 100 Hz/bin, 10 Hz waterfall cadence).
@@ -69,15 +69,15 @@ impl CwSpectrum {
                     self.s1[i] = s0;
                 }
                 self.samp_n += 1;
-                if self.samp_n == 60 {
+                if self.samp_n == 48 {
                     self.samp_n = 0;
-                    self.finish_10ms();
+                    self.finish_8ms();
                 }
             }
         }
     }
 
-    fn finish_10ms(&mut self) {
+    fn finish_8ms(&mut self) {
         for i in 0..24 {
             let a = self.s1[i] as i64;
             let b = self.s2[i] as i64;
@@ -90,7 +90,7 @@ impl CwSpectrum {
             }
         }
         self.blocks += 1;
-        if self.blocks >= 10 {
+        if self.blocks >= 12 {
             self.blocks = 0;
             // Estimate noise floor from 25th-percentile bin (6th smallest of 24).
             let mut sorted = self.peak;
