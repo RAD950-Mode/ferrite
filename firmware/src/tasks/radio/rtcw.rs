@@ -25,6 +25,7 @@ pub(super) struct RtcwRun {
     pub rx_corr_hz: i16,
     pub bw_idx: u8,
     pub agc_idx: u8,
+    pub nr_idx: u8,
     pub rx_ready: bool,
     pub tx_active: bool,
     pub pa_target: u8,
@@ -33,7 +34,7 @@ pub(super) struct RtcwRun {
 
 impl Radio {
     /// Enter, retune, or exit RTCW mode on the SI4732 narrow USB receiver.
-    pub(super) async fn rtcw_rx(&mut self, dial: Freq10, rx_corr_hz: i16, bw_idx: u8, agc_idx: u8, on: bool) {
+    pub(super) async fn rtcw_rx(&mut self, dial: Freq10, rx_corr_hz: i16, bw_idx: u8, agc_idx: u8, nr_idx: u8, on: bool) {
         self.seek_cancel();
         if !on {
             #[cfg(feature = "tx")]
@@ -58,7 +59,7 @@ impl Radio {
         let mut s = Steps::default();
         let _ = self.path.rx(Rx::Si, Cause::HfReceiver, now_ms() as u32, &mut s);
         self.run(&s).await;
-        let ok = self.si_ssb_rtcw(dial, rx_corr_hz, bw_idx, agc_idx).await;
+        let ok = self.si_ssb_rtcw(dial, rx_corr_hz, bw_idx, agc_idx, nr_idx).await;
         if ok.is_ok() {
             speaker(true);
         }
@@ -67,6 +68,7 @@ impl Radio {
             rx_corr_hz,
             bw_idx,
             agc_idx,
+            nr_idx,
             rx_ready: ok.is_ok(),
             tx_active: false,
             pa_target: 0,
@@ -75,7 +77,7 @@ impl Radio {
         self.rtcw_poll();
     }
 
-    async fn si_ssb_rtcw(&mut self, dial: Freq10, rx_corr_hz: i16, bw_idx: u8, agc_idx: u8) -> Result<(), si4732::Error> {
+    async fn si_ssb_rtcw(&mut self, dial: Freq10, rx_corr_hz: i16, bw_idx: u8, agc_idx: u8, nr_idx: u8) -> Result<(), si4732::Error> {
         use si4732::prop;
         let d = &mut BusyDelay;
         let (khz, _usb, base_bfo) = ferrite_core::ssb::tune(dial, true, false);
@@ -112,17 +114,24 @@ impl Radio {
             1 => (1u8, 0x5800u16), // MED
             _ => (3u8, 0x4000u16), // SLOW
         };
+        // SI4732 hardware SNR-based Noise Reduction (soft-mute attenuation: 0 / 6 / 12 / 18 dB)
+        let nr_atten: u16 = match nr_idx {
+            0 => 0,
+            1 => 6,
+            2 => 12,
+            _ => 18,
+        };
         let cfg = si4732::SsbConfig {
             audio_bw: SI_CW_BW_CODES[(bw_idx as usize).min(SI_CW_BW_CODES.len() - 1)],
             sideband_cutoff: 1,
             avc_divider: avc_div,
             avc: true,
-            soft_mute_snr: false,
+            soft_mute_snr: nr_atten > 0,
             afc_off: true,
         };
         self.si.set_property(prop::SSB_MODE, cfg.bits(), d)?;
         self.si.set_property(prop::AM_AVC_MAX_GAIN, avc_gain, d)?;
-        self.si.set_property(prop::AM_SOFT_MUTE_MAX_ATTENUATION, 0, d)?;
+        self.si.set_property(prop::AM_SOFT_MUTE_MAX_ATTENUATION, nr_atten, d)?;
         self.si.agc(SiOpts::agc_index(self.si_opts.am_agc, 37), d)?;
         self.si.volume(SI_VOLUME, d)?;
         self.si.mute(false, d)?;
@@ -323,7 +332,7 @@ impl Radio {
         self.run(&s).await;
         // Restore `PA7=PC5=1` (SI4732 SW/SSB LNA path) cleared to `1/0` by `Act::SiInput(false)` during TX.
         si_input(SiMode::Ssb);
-        let _ = self.si_ssb_rtcw(run.dial, run.rx_corr_hz, run.bw_idx, run.agc_idx).await;
+        let _ = self.si_ssb_rtcw(run.dial, run.rx_corr_hz, run.bw_idx, run.agc_idx, run.nr_idx).await;
         speaker(true);
     }
 }

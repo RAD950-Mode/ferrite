@@ -84,7 +84,7 @@ impl View for RtcwScr {
             return;
         }
         if self.page == PAGE_SETTINGS {
-            self.sel = (self.sel as i32 + delta).rem_euclid(7) as u8;
+            self.sel = (self.sel as i32 + delta).rem_euclid(8) as u8;
             app.screen = Screen::Rtcw(self);
             return;
         }
@@ -110,6 +110,13 @@ impl View for RtcwScr {
                 let next = (cur + delta).clamp(0, max) as u8;
                 if next != app.rtcw.bw_idx {
                     app.rtcw.bw_idx = next;
+                    retune = true;
+                }
+            }
+            KnobMode::Shift => {
+                let next = (app.rtcw.shift_hz as i32 + delta * 50).clamp(-600, 600) as i16;
+                if next != app.rtcw.shift_hz {
+                    app.rtcw.shift_hz = next;
                     retune = true;
                 }
             }
@@ -219,8 +226,8 @@ impl RtcwScr {
                 return;
             }
             Key::Side(_) => {}
-            Key::Up => self.sel = (self.sel + 6) % 7,
-            Key::Down => self.sel = (self.sel + 1) % 7,
+            Key::Up => self.sel = (self.sel + 7) % 8,
+            Key::Down => self.sel = (self.sel + 1) % 8,
             Key::Left | Key::Right | Key::Menu => {
                 let dir: i32 = if key == Key::Left { -1 } else { 1 };
                 match self.sel {
@@ -239,6 +246,10 @@ impl RtcwScr {
                         retune = true;
                     }
                     3 => {
+                        app.rtcw.nr = if dir < 0 { app.rtcw.nr.prev() } else { app.rtcw.nr.next() };
+                        retune = true;
+                    }
+                    4 => {
                         app.rtcw.keyer.cfg.mode = match (app.rtcw.keyer.cfg.mode, dir > 0) {
                             (KeyerMode::IambicB, true) => KeyerMode::IambicA,
                             (KeyerMode::IambicA, true) => KeyerMode::Ultimatic,
@@ -252,7 +263,7 @@ impl RtcwScr {
                             (KeyerMode::Bug, false) => KeyerMode::Straight,
                         };
                     }
-                    4 => {
+                    5 => {
                         app.rtcw.paddle_src = match app.rtcw.paddle_src {
                             PaddleSource::Auto => PaddleSource::SideButtons,
                             PaddleSource::SideButtons => PaddleSource::K1Jack,
@@ -260,7 +271,7 @@ impl RtcwScr {
                             PaddleSource::Serial => PaddleSource::Auto,
                         };
                     }
-                    5 => {
+                    6 => {
                         app.rtcw.tx_power = (app.rtcw.tx_power as i32 + dir).clamp(0, 2) as u8;
                     }
                     _ => {
@@ -284,7 +295,7 @@ impl RtcwScr {
         match key {
             Key::Exit => {
                 self.page = PAGE_SETTINGS;
-                self.sel = 6;
+                self.sel = 7;
                 app.redraw_all();
                 app.screen = Screen::Rtcw(self);
                 return;
@@ -348,7 +359,9 @@ impl RtcwScr {
             practice,
             bw_idx,
             bw_lbl,
+            shift_hz,
             agc,
+            nr,
             knob_mode,
             meter,
             key_now,
@@ -373,7 +386,9 @@ impl RtcwScr {
                 r.keyer.cfg.practice,
                 r.bw_idx,
                 r.bw_label(),
+                r.shift_hz,
                 r.agc,
+                r.nr,
                 r.knob_mode,
                 r.meter,
                 r.rf_key_down || r.sidetone_on,
@@ -388,10 +403,11 @@ impl RtcwScr {
             )
         };
 
-        // 1. Top status strip (`y = 24..44`): Band, AGC (FAST/MED/SLOW), and true Radio TX/PRAC/RX badge
+        // 1. Top status strip (`y = 24..44`): Band, AGC (FAST/MED/SLOW), NR, and true Radio TX/PRAC/RX badge
         let hdr_h = Mix::new()
             .n(band_idx as u32)
             .n(agc as u32)
+            .n(nr as u32)
             .n(practice as u32)
             .n(tx_active as u32)
             .n(key_now as u32)
@@ -399,13 +415,16 @@ impl RtcwScr {
             .get();
         if app.dirty(R_HDR, hdr_h) {
             redraw_box!(true, lcd, (0, TOP_Y, W, 20, CARD), {
-                let mut left = Buf::<28>::new();
+                let mut left = Buf::<32>::new();
                 let _ = uwrite!(
                     left,
-                    "{}  AGC:{}",
+                    "{} AGC:{}",
                     core::str::from_utf8(band.name).unwrap_or("HF"),
                     core::str::from_utf8(agc.label()).unwrap_or("FAST")
                 );
+                if nr != crate::rtcw::CwNr::Off {
+                    let _ = uwrite!(left, " NR:{}", core::str::from_utf8(nr.label()).unwrap_or(""));
+                }
                 lcd.text4(6, TOP_Y + 14, left.as_bytes(), &UI_12, TEXT, CARD);
                 let (badge, bfg, bbg): (&[u8], u16, u16) = if loading <= 100 {
                     (b"PATCH", BG, AMBER)
@@ -464,6 +483,7 @@ impl RtcwScr {
             .n(knob_mode as u32)
             .n(step_hz as u32)
             .n(bw_idx as u32)
+            .n(shift_hz as u32)
             .n(wpm as u32)
             .n(pitch_hz as u32)
             .n(mode as u32)
@@ -487,6 +507,15 @@ impl RtcwScr {
                     KnobMode::Bw => {
                         let _ = uwrite!(vb, "BW {}", core::str::from_utf8(bw_lbl).unwrap_or("500Hz"));
                     }
+                    KnobMode::Shift => {
+                        if shift_hz > 0 {
+                            let _ = uwrite!(vb, "SHIFT +{}Hz", shift_hz);
+                        } else if shift_hz < 0 {
+                            let _ = uwrite!(vb, "SHIFT -{}Hz", shift_hz.unsigned_abs());
+                        } else {
+                            let _ = uwrite!(vb, "SHIFT 0 Hz");
+                        }
+                    }
                     KnobMode::Wpm => {
                         let _ = uwrite!(vb, "SPEED {} WPM", wpm);
                     }
@@ -509,7 +538,7 @@ impl RtcwScr {
         }
 
         // 4. FULL 0–3.0 kHz PANAFALL with PASSBAND vs STOPBAND COLORING (`y = 106..180`, 74 px)
-        self.draw_panafall(app, lcd, wf_seq, bw_idx, pitch_hz, tx_active, meter.tone_on);
+        self.draw_panafall(app, lcd, wf_seq, bw_idx, shift_hz, pitch_hz, tx_active, meter.tone_on);
 
         // 5. Rolling decoded RX CW text (2 lines of 24 chars, `y = 182..220`)
         let rx_slice = &rx_buf[..rx_len];
@@ -585,6 +614,7 @@ impl RtcwScr {
         lcd: &mut impl Panel,
         wf_seq: u32,
         bw_idx: u8,
+        shift_hz: i16,
         pitch_hz: u16,
         tx_now: bool,
         tone_on: bool,
@@ -607,6 +637,7 @@ impl RtcwScr {
         let pana_h = Mix::new()
             .n(wf_seq)
             .n(bw_idx as u32)
+            .n(shift_hz as u32)
             .n(pitch_hz as u32)
             .n(tx_now as u32)
             .n(tone_on as u32)
@@ -718,15 +749,16 @@ impl RtcwScr {
     }
 
     fn draw_settings(self, app: &mut App, lcd: &mut impl Panel) {
-        let (pitch_hz, sidetone_vol, agc, kmode, psrc, pwr) = {
+        let (pitch_hz, sidetone_vol, agc, nr, kmode, psrc, pwr) = {
             let r = &app.rtcw;
-            (r.pitch_hz, r.sidetone_vol, r.agc, r.keyer.cfg.mode, r.paddle_src, r.tx_power)
+            (r.pitch_hz, r.sidetone_vol, r.agc, r.nr, r.keyer.cfg.mode, r.paddle_src, r.tx_power)
         };
         let h = Mix::new()
             .n(self.sel as u32)
             .n(pitch_hz as u32)
             .n(sidetone_vol as u32)
             .n(agc as u32)
+            .n(nr as u32)
             .n(kmode as u32)
             .n(psrc as u32)
             .n(pwr as u32)
@@ -736,7 +768,7 @@ impl RtcwScr {
         }
 
         redraw_box!(true, lcd, (0, TOP_Y, W, 272, BG), {
-            lcd.text4(8, TOP_Y + 18, b"RTCW SETTINGS", &UI_14, CYAN, BG);
+            lcd.text4(8, TOP_Y + 16, b"RTCW SETTINGS", &UI_14, CYAN, BG);
 
             let mode_s = match kmode {
                 KeyerMode::IambicB => "Iambic B",
@@ -757,11 +789,11 @@ impl RtcwScr {
                 _ => "HIGH (5W)",
             };
 
-            for i in 0..7usize {
-                let y = TOP_Y + 28 + (i as i32) * 33;
+            for i in 0..8usize {
+                let y = TOP_Y + 24 + (i as i32) * 30;
                 let active = i == self.sel as usize;
                 let (bg, fg, vfg) = if active { (BANNER_BG, BG, BG) } else { (CARD, TEXT, CYAN) };
-                lcd.fill(6, y, W - 12, 28, bg);
+                lcd.fill(6, y, W - 12, 26, bg);
                 let mut vb = Buf::<16>::new();
                 let label: &[u8] = match i {
                     0 => {
@@ -781,14 +813,18 @@ impl RtcwScr {
                         b"CW AGC"
                     }
                     3 => {
+                        let _ = uwrite!(vb, "{}", core::str::from_utf8(nr.label()).unwrap_or("OFF"));
+                        b"Noise Reduc"
+                    }
+                    4 => {
                         let _ = uwrite!(vb, "{}", mode_s);
                         b"Keyer Mode"
                     }
-                    4 => {
+                    5 => {
                         let _ = uwrite!(vb, "{}", pad_s);
                         b"Paddle Src"
                     }
-                    5 => {
+                    6 => {
                         let _ = uwrite!(vb, "{}", pwr_s);
                         b"TX Power"
                     }
@@ -797,8 +833,8 @@ impl RtcwScr {
                         b"Memories"
                     }
                 };
-                lcd.text4(12, y + 19, label, &UI_12, fg, bg);
-                lcd.text4(134, y + 19, vb.as_bytes(), &UI_12, vfg, bg);
+                lcd.text4(12, y + 18, label, &UI_12, fg, bg);
+                lcd.text4(134, y + 18, vb.as_bytes(), &UI_12, vfg, bg);
             }
         });
     }

@@ -181,10 +181,10 @@ impl Radio {
             RadioCmd::Rad950Abort => self.rad950_abort().await,
             RadioCmd::RtcwRx { dial, rx_corr_hz, bw_on } => {
                 if bw_on == 0 {
-                    self.rtcw_rx(dial, rx_corr_hz, 0, 0, false).await
+                    self.rtcw_rx(dial, rx_corr_hz, 0, 0, 0, false).await
                 } else {
                     let v = bw_on - 1;
-                    self.rtcw_rx(dial, rx_corr_hz, v % 6, (v / 6).min(2), true).await
+                    self.rtcw_rx(dial, rx_corr_hz, v % 6, (v / 6) % 3, (v / 18).min(3), true).await
                 }
             }
             #[cfg(feature = "tx")]

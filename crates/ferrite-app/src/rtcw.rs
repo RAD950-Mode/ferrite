@@ -54,6 +54,45 @@ impl CwAgc {
     }
 }
 
+/// SI4732 hardware SNR-based Noise Reduction level (`OFF`, `LOW`, `MED`, `HIGH`).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum CwNr {
+    Off = 0,
+    Low = 1,
+    Med = 2,
+    High = 3,
+}
+
+impl CwNr {
+    pub const fn next(self) -> Self {
+        match self {
+            Self::Off => Self::Low,
+            Self::Low => Self::Med,
+            Self::Med => Self::High,
+            Self::High => Self::Off,
+        }
+    }
+
+    pub const fn prev(self) -> Self {
+        match self {
+            Self::Off => Self::High,
+            Self::Low => Self::Off,
+            Self::Med => Self::Low,
+            Self::High => Self::Med,
+        }
+    }
+
+    pub const fn label(self) -> &'static [u8] {
+        match self {
+            Self::Off => b"OFF",
+            Self::Low => b"LOW",
+            Self::Med => b"MED",
+            Self::High => b"HIGH",
+        }
+    }
+}
+
 /// What the top rotary encoder adjusts on the RTCW screen (cycled by Key `0`).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 #[repr(u8)]
@@ -61,7 +100,8 @@ pub enum KnobMode {
     Freq = 0,
     Step = 1,
     Bw = 2,
-    Wpm = 3,
+    Shift = 3,
+    Wpm = 4,
 }
 
 impl KnobMode {
@@ -69,7 +109,8 @@ impl KnobMode {
         match self {
             Self::Freq => Self::Step,
             Self::Step => Self::Bw,
-            Self::Bw => Self::Wpm,
+            Self::Bw => Self::Shift,
+            Self::Shift => Self::Wpm,
             Self::Wpm => Self::Freq,
         }
     }
@@ -101,8 +142,12 @@ pub struct RtcwHost {
     pub rx_corr_hz: i16,
     /// SI4732 SSB hardware filter index (`0..=5`: 500 Hz, 1.0k, 1.2k, 2.2k, 3.0k, 4.0k).
     pub bw_idx: u8,
+    /// Passband shift in Hz (`-600..=+600`, step 50 Hz; shifts RX passband without moving TX).
+    pub shift_hz: i16,
     /// CW AGC speed (`FAST`, `MED`, `SLOW`).
     pub agc: CwAgc,
+    /// SI4732 hardware SNR-based Noise Reduction (`OFF`, `LOW`, `MED`, `HIGH`).
+    pub nr: CwNr,
     /// Active top-knob function (toggled by Key `0`).
     pub knob_mode: KnobMode,
     /// TX power index: `0` = Low (1 W), `1` = Mid (2.5 W), `2` = High (5 W).
@@ -156,7 +201,9 @@ impl RtcwHost {
             sidetone_vol: 9,
             rx_corr_hz: 0,
             bw_idx: 0, // 500 Hz default CW passband
+            shift_hz: 0,
             agc: CwAgc::Fast,
+            nr: CwNr::Off,
             knob_mode: KnobMode::Freq,
             tx_power: 1,
             mem_preset: [0; 9],
@@ -212,9 +259,9 @@ impl RtcwHost {
         MEM_PRESETS[slot][p]
     }
 
-    /// Pack `(bw_idx, agc, on)` into `RadioCmd::RtcwRx.bw_on`.
+    /// Pack `(bw_idx, agc, nr, on)` into `RadioCmd::RtcwRx.bw_on` (`1..=72`).
     pub fn pack_bw_on(&self) -> u8 {
-        1 + self.bw_idx.min(5) + (self.agc as u8).min(2) * 6
+        1 + self.bw_idx.min(5) + (self.agc as u8).min(2) * 6 + (self.nr as u8).min(3) * 18
     }
 
     /// Push one 24-bin packed 4-bit spectrum slice onto the top of the vertical panafall.
@@ -244,16 +291,20 @@ impl RtcwHost {
         self.wf_tx[idx]
     }
 
-    /// True if panafall bin `b` (`0..24`, center `(b + 0.5) * 125 Hz`) falls inside the active passband.
+    /// True if panafall bin `b` (`0..24`, center `(b + 0.5) * 125 Hz`) falls inside the active shifted passband.
     pub fn bin_in_passband(&self, b: usize) -> bool {
-        let f = (b as u16) * 125 + 62;
-        let bw = self.bw_hz();
+        let f = (b as i32) * 125 + 62;
+        let bw = self.bw_hz() as i32;
+        let shift = self.shift_hz as i32;
         if bw <= 1200 {
-            let lo = self.pitch_hz.saturating_sub(bw / 2).max(100);
-            let hi = lo.saturating_add(bw);
+            let center = (self.pitch_hz as i32 + shift).clamp(150, 2850);
+            let lo = (center - bw / 2).max(0);
+            let hi = (lo + bw).min(3000);
             f >= lo && f <= hi
         } else {
-            f >= 100 && f <= bw
+            let lo = (100 + shift).clamp(0, 2500);
+            let hi = (lo + bw).min(3000);
+            f >= lo && f <= hi
         }
     }
 
@@ -425,7 +476,7 @@ impl App {
         self.rtcw.tx_hold = false;
         self.rtcw.keyer.abort_macro();
         let dial = self.rtcw.rx_dial10();
-        let rx_corr_hz = self.rtcw.rx_corr_hz;
+        let rx_corr_hz = self.rtcw.rx_corr_hz.saturating_add(self.rtcw.shift_hz);
         let bw_on = self.rtcw.pack_bw_on();
         self.out.push(RadioCmd::RtcwRx { dial, rx_corr_hz, bw_on });
     }
@@ -444,11 +495,11 @@ impl App {
         self.out.push(RadioCmd::RtcwRx { dial: 0, rx_corr_hz: 0, bw_on: 0 });
     }
 
-    /// Retune the SI4732 USB receiver for RTCW (after VFO/band/pitch/filter/AGC change).
+    /// Retune the SI4732 USB receiver for RTCW (after VFO/band/pitch/filter/shift/AGC/NR change).
     pub(crate) fn rtcw_retune(&mut self) {
         if self.radio.mode == crate::screens::activity::Mode::Rtcw {
             let dial = self.rtcw.rx_dial10();
-            let rx_corr_hz = self.rtcw.rx_corr_hz;
+            let rx_corr_hz = self.rtcw.rx_corr_hz.saturating_add(self.rtcw.shift_hz);
             let bw_on = self.rtcw.pack_bw_on();
             self.out.push(RadioCmd::RtcwRx { dial, rx_corr_hz, bw_on });
         }
@@ -460,12 +511,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn knob_mode_cycles_all_four_targets() {
+    fn knob_mode_cycles_all_five_targets() {
         let mut m = KnobMode::Freq;
         m = m.next();
         assert_eq!(m, KnobMode::Step);
         m = m.next();
         assert_eq!(m, KnobMode::Bw);
+        m = m.next();
+        assert_eq!(m, KnobMode::Shift);
         m = m.next();
         assert_eq!(m, KnobMode::Wpm);
         m = m.next();
