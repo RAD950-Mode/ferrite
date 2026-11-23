@@ -853,7 +853,7 @@ fn body<S: ChannelStore>(app: &App, cx: &Cx<S>, d: &mut Desc) {
                     r.vfo.tx_freq10,
                     r.keyer.cfg.wpm,
                     r.keyer.cfg.practice as u8,
-                    r.bw_500hz as u8,
+                    r.bw_idx,
                     r.tx_hold as u8,
                     r.rf_key_down as u8,
                     r.meter.wpm_est,

@@ -1542,7 +1542,7 @@ fn stops(m: Mode, c: &RadioCmd) -> bool {
         Mode::Xb => matches!(c, RadioCmd::Crossband(None)),
         Mode::Sat => matches!(c, RadioCmd::SatRx(0)),
         Mode::Rad950 => matches!(c, RadioCmd::Rad950Rx { on: false, .. }),
-        Mode::Rtcw => matches!(c, RadioCmd::RtcwRx { on: false, .. }),
+        Mode::Rtcw => matches!(c, RadioCmd::RtcwRx { bw_on: 0, .. }),
         Mode::Off => false,
     }
 }
@@ -1879,7 +1879,7 @@ fn random_use_keeps_modes_in_step() {
             RadioCmd::Hf { on, .. } => (Kind::Hf, *on),
             RadioCmd::Crossband(x) => (Kind::Xb, x.is_some()),
             RadioCmd::SatRx(f) => (Kind::Sat, *f != 0),
-            RadioCmd::RtcwRx { on, .. } => (Kind::Rtcw, *on),
+            RadioCmd::RtcwRx { bw_on, .. } => (Kind::Rtcw, *bw_on != 0),
             _ => return None,
         })
     }

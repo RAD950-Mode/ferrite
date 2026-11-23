@@ -163,9 +163,9 @@ pub enum RadioCmd {
     Rad950Tx { freq: Freq10, power: u8 },
     /// Abort any active RAD950 transmission cleanly and return to SI4732 RX.
     Rad950Abort,
-    /// RTCW (Radtel CW) receive mode: enter/retune SI4732 USB at `dial` with `bw_500hz` (500 Hz vs 1.0 kHz filter),
-    /// signed BFO offset `rx_corr_hz`, or leave (`on = false`).
-    RtcwRx { dial: Freq10, rx_corr_hz: i16, bw_500hz: bool, on: bool },
+    /// RTCW (Radtel CW) receive mode: enter/retune SI4732 USB at `dial` with signed BFO offset `rx_corr_hz`
+    /// and `bw_on` (`0` = off, `1..=6` = on with `bw_idx = bw_on - 1`).
+    RtcwRx { dial: Freq10, rx_corr_hz: i16, bw_on: u8 },
     /// RTCW semi-break-in TX hold: latch BK4829 on `freq` at `power` (`on = true`) or release back to SI4732 RX (`on = false`).
     RtcwTx { freq: Freq10, power: u8, on: bool },
     /// A short tone from the BK4829's tone generator to the speaker (SND-11), e.g. a key refused at a limit

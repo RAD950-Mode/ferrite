@@ -179,7 +179,9 @@ impl Radio {
             #[cfg(not(feature = "tx"))]
             RadioCmd::Rad950Tx { .. } => {}
             RadioCmd::Rad950Abort => self.rad950_abort().await,
-            RadioCmd::RtcwRx { dial, rx_corr_hz, bw_500hz, on } => self.rtcw_rx(dial, rx_corr_hz, bw_500hz, on).await,
+            RadioCmd::RtcwRx { dial, rx_corr_hz, bw_on } => {
+                self.rtcw_rx(dial, rx_corr_hz, bw_on.saturating_sub(1), bw_on != 0).await
+            }
             #[cfg(feature = "tx")]
             RadioCmd::RtcwTx { freq, power, on } => self.rtcw_tx(freq, power, on).await,
             #[cfg(not(feature = "tx"))]

@@ -19,6 +19,135 @@ pub const RATE_HZ: u32 = 24_000;
 /// RAM the slot may take: holds RAD950-60 dual-phase Layout B (`21,864 B`) alongside FT8/WSPR/APRS/POCSAG.
 pub const BUDGET: usize = 22 * 1024;
 
+/// Exact Q14 `round(2 * cos(2*pi*k/60) * 16384)` for `k = 1..=24` (`100..2,400 Hz` @ `6,000 Hz`, 100 Hz/bin).
+const CW_SPEC_COEFF_Q14: [i32; 24] = [
+    32588, 32052, 31164, 29935, 28378, 26510, 24351, 21926,
+    19261, 16384, 13328, 10126,  6813,  3425,     0, -3425,
+    -6813, -10126, -13328, -16384, -19261, -21926, -24351, -26510,
+];
+
+/// Lightweight 24-bin CW audio spectrum (`100..2,400 Hz`, 100 Hz/bin, 10 Hz waterfall cadence).
+struct CwSpectrum {
+    dec_acc: i32,
+    dec_cnt: u8,
+    samp_n: u8,
+    blocks: u8,
+    s1: [i32; 24],
+    s2: [i32; 24],
+    peak: [u32; 24],
+    floor_ema: u32,
+    pending: Option<[u8; 12]>,
+}
+
+impl CwSpectrum {
+    const fn new() -> Self {
+        Self {
+            dec_acc: 0,
+            dec_cnt: 0,
+            samp_n: 0,
+            blocks: 0,
+            s1: [0; 24],
+            s2: [0; 24],
+            peak: [0; 24],
+            floor_ema: 32,
+            pending: None,
+        }
+    }
+
+    fn push_24k(&mut self, samples: &[i16]) {
+        for &s in samples {
+            self.dec_acc += s as i32;
+            self.dec_cnt += 1;
+            if self.dec_cnt == 4 {
+                let x = self.dec_acc >> 6; // average of 4 samples, scaled >> 4 (-2048..2047)
+                self.dec_acc = 0;
+                self.dec_cnt = 0;
+                for i in 0..24 {
+                    let s1 = self.s1[i];
+                    let s0 = x + (((CW_SPEC_COEFF_Q14[i] as i64 * s1 as i64) >> 14) as i32) - self.s2[i];
+                    self.s2[i] = s1;
+                    self.s1[i] = s0;
+                }
+                self.samp_n += 1;
+                if self.samp_n == 60 {
+                    self.samp_n = 0;
+                    self.finish_10ms();
+                }
+            }
+        }
+    }
+
+    fn finish_10ms(&mut self) {
+        for i in 0..24 {
+            let a = self.s1[i] as i64;
+            let b = self.s2[i] as i64;
+            let p = a * a + b * b - (((CW_SPEC_COEFF_Q14[i] as i64 * a) >> 14) * b);
+            self.s1[i] = 0;
+            self.s2[i] = 0;
+            let mag = if p <= 0 { 0 } else { isqrt64(p as u64) as u32 };
+            if mag > self.peak[i] {
+                self.peak[i] = mag;
+            }
+        }
+        self.blocks += 1;
+        if self.blocks >= 10 {
+            self.blocks = 0;
+            // Estimate noise floor from 25th-percentile bin (6th smallest of 24).
+            let mut sorted = self.peak;
+            for i in 0..6 {
+                let mut min_j = i;
+                for j in (i + 1)..24 {
+                    if sorted[j] < sorted[min_j] {
+                        min_j = j;
+                    }
+                }
+                sorted.swap(i, min_j);
+            }
+            let obs_floor = sorted[5].max(16);
+            self.floor_ema = ((self.floor_ema as u64 * 7 + obs_floor as u64) >> 3).max(16) as u32;
+
+            let mut packed = [0u8; 12];
+            for i in 0..24 {
+                // Map peak/floor ratio to 4-bit level (0..=15, ~2 dB per step above noise floor).
+                let r = (self.peak[i].saturating_mul(8) / self.floor_ema.max(1)).max(1);
+                let msb = 31 - r.leading_zeros();
+                let frac = if msb >= 2 { (r >> (msb - 2)) & 3 } else { 0 };
+                let q = (msb * 4 + frac).saturating_sub(11); // r=8 -> ~1, r=16 -> ~5, r=64 -> ~13
+                let lvl = q.min(15) as u8;
+                if i & 1 == 0 {
+                    packed[i >> 1] = lvl << 4;
+                } else {
+                    packed[i >> 1] |= lvl;
+                }
+                self.peak[i] = 0;
+            }
+            self.pending = Some(packed);
+        }
+    }
+
+    fn take(&mut self) -> Option<[u8; 12]> {
+        self.pending.take()
+    }
+}
+
+fn isqrt64(n: u64) -> u64 {
+    if n == 0 {
+        return 0;
+    }
+    let mut x = n;
+    let mut y = (x + 1) >> 1;
+    while y < x {
+        x = y;
+        y = (x + n / x) >> 1;
+    }
+    x
+}
+
+struct CwSlot {
+    dec: CwDecoder,
+    spec: CwSpectrum,
+}
+
 union DecoderInner {
     off: (),
     afsk: ManuallyDrop<Afsk>,
@@ -27,7 +156,7 @@ union DecoderInner {
     rad950: ManuallyDrop<Rad950>,
     rad950_60: ManuallyDrop<Rad950_60>,
     wwv: ManuallyDrop<WwvReceiver>,
-    cw: ManuallyDrop<CwDecoder>,
+    cw: ManuallyDrop<CwSlot>,
 }
 
 /// Shared decoder slot: holds one active decoder at a time inside a single `<= 13 KB` union,
@@ -139,7 +268,10 @@ impl Decoder {
             }
             DecoderKind::Cw => {
                 unsafe {
-                    core::ptr::addr_of_mut!(self.inner.cw).write(ManuallyDrop::new(CwDecoder::new(700)));
+                    core::ptr::addr_of_mut!(self.inner.cw).write(ManuallyDrop::new(CwSlot {
+                        dec: CwDecoder::new(700),
+                        spec: CwSpectrum::new(),
+                    }));
                 }
                 self.kind = DecoderKind::Cw;
             }
@@ -160,7 +292,7 @@ impl Decoder {
         }
     }
 
-    /// Take the latest 24-bin packed 4-bit RAD950 panafall column (`200 ms` cadence).
+    /// Take the latest 24-bin packed 4-bit panafall column (RAD950 200 ms or RTCW CW 100 ms cadence).
     pub fn rad950_take_wf(&mut self) -> Option<[u8; 12]> {
         if self.kind == DecoderKind::Rad950 {
             let d = unsafe { &mut *self.inner.rad950 };
@@ -168,6 +300,9 @@ impl Decoder {
         } else if self.kind == DecoderKind::Rad950_60 {
             let d = unsafe { &mut *self.inner.rad950_60 };
             d.take_waterfall_col()
+        } else if self.kind == DecoderKind::Cw {
+            let d = unsafe { &mut *self.inner.cw };
+            d.spec.take()
         } else {
             None
         }
@@ -272,15 +407,16 @@ impl Decoder {
             }
             DecoderKind::Cw => {
                 let d = unsafe { &mut *self.inner.cw };
+                d.spec.push_24k(block);
                 let mut chars = [0u8; 8];
                 let mut n = 0usize;
-                d.feed(block, |ch| {
+                d.dec.feed(block, |ch| {
                     if n < chars.len() {
                         chars[n] = ch;
                         n += 1;
                     }
                 });
-                let meter = d.meter;
+                let meter = d.dec.meter;
                 if n == 0 {
                     found(Found::Cw { ch: None, meter });
                 } else {

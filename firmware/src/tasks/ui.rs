@@ -2013,12 +2013,29 @@ fn rtcw_step(app: &mut App, dec_on: &mut bool) {
         return;
     }
 
-    // Drain CW decoder meter & decoded characters from DSP.
+    // Drain CW decoder meter, decoded characters, and 24-bin audio spectrum from DSP.
     if let Some(m) = crate::chan::RTCW_METER.try_take() {
         app.rtcw.meter = m;
     }
     while let Ok(ch) = crate::chan::RTCW_RX_CHAR.try_receive() {
         app.rtcw.push_rx_char(ch);
+    }
+    if let Some(wf_col) = crate::chan::RAD950_WF.try_take() {
+        if app.rtcw.tx_hold || app.rtcw.sidetone_on {
+            // Paint a clean synthetic TX carrier line at the CW pitch bin (`700 Hz` = bin 6).
+            let mut tx_col = [0u8; 12];
+            if app.rtcw.rf_key_down || app.rtcw.sidetone_on {
+                let bin = ((app.rtcw.pitch_hz as usize).saturating_sub(50) / 100).min(23);
+                if bin & 1 == 0 {
+                    tx_col[bin >> 1] = 0xF0;
+                } else {
+                    tx_col[bin >> 1] = 0x0F;
+                }
+            }
+            app.rtcw.push_wf(tx_col, true);
+        } else {
+            app.rtcw.push_wf(wf_col, false);
+        }
     }
 
     // Poll physical paddle pins directly (active-low):
@@ -2054,7 +2071,7 @@ fn rtcw_step(app: &mut App, dec_on: &mut bool) {
     if out.sidetone_on != prev_tone {
         SIDETONE_ON.store(out.sidetone_on, Relaxed);
         if out.sidetone_on {
-            crate::hal::tone::start(app.rtcw.pitch_hz as u32, 4);
+            crate::hal::tone::start(app.rtcw.pitch_hz as u32, 5);
         } else {
             crate::hal::tone::stop();
         }

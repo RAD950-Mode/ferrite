@@ -42,7 +42,7 @@ impl Held {
             Held::ToneSearch => RadioCmd::ToneSearch { slot: 0, on: false },
             Held::Sat => RadioCmd::SatRx(0),
             Held::Rad950 => RadioCmd::Rad950Rx { dial: 0, rx_corr_hz: 0, on: false },
-            Held::Rtcw => RadioCmd::RtcwRx { dial: 0, rx_corr_hz: 0, bw_500hz: true, on: false },
+            Held::Rtcw => RadioCmd::RtcwRx { dial: 0, rx_corr_hz: 0, bw_on: 0 },
         }
     }
 }
@@ -51,7 +51,7 @@ impl Held {
 /// decision 115), so two can be held at once; one renewal covers both.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Lease {
-    held: u8,
+    held: u16,
     at: u32,
 }
 
@@ -95,8 +95,8 @@ impl Lease {
             RadioCmd::SatRx(_) => self.start(Held::Sat, now),
             RadioCmd::Rad950Rx { on: true, .. } => self.start(Held::Rad950, now),
             RadioCmd::Rad950Rx { on: false, .. } => self.stop(Held::Rad950),
-            RadioCmd::RtcwRx { on: true, .. } => self.start(Held::Rtcw, now),
-            RadioCmd::RtcwRx { on: false, .. } => self.stop(Held::Rtcw),
+            RadioCmd::RtcwRx { bw_on: 0, .. } => self.stop(Held::Rtcw),
+            RadioCmd::RtcwRx { .. } => self.start(Held::Rtcw, now),
             // The input task's, not the UI's: no sign the UI is running.
             RadioCmd::Accessory(_) => {}
             _ => self.renew(now),
